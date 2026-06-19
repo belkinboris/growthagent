@@ -1,37 +1,37 @@
 """
 Пример endpoint /api/internal/metrics для TruePost.
 
-Это НЕ часть Growth Agent -- это код, который нужно добавить в проект
-TruePost (АвтоПост), чтобы Growth Agent мог получать от него метрики.
+Это код для добавления в проект TruePost (АвтоПост), чтобы Growth Agent мог
+получать от него метрики. Написан строго под реальную схему database.py
+TruePost (модели User, Channel, Post, Payment) -- не абстрактный пример.
 
-Скопируйте этот код (или возьмите как образец) в TruePost и подключите
-роутер к основному FastAPI-приложению TruePost.
+Подтверждённые значения статусов (из реального проекта):
+- Payment.status == "paid"        -- успешная оплата через YooKassa
+- Post.status == "published"      -- пост реально опубликован в канале
 
-Что обязательно нужно от вас в TruePost:
-1. Модели User, Channel, Post, Payment (используются здесь как пример --
-   замените на реальные импорты из database.py вашего проекта).
-2. Переменная окружения TRUEPOST_INTERNAL_API_TOKEN -- секретный токен,
-   который Growth Agent будет передавать в заголовке Authorization.
-   Тот же токен нужно прописать в Growth Agent как
-   PROJECT_INTERNAL_API_TOKEN.
-3. Поле "as_of" в ответе ОБЯЗАТЕЛЬНО -- без него Growth Agent отклонит
-   ответ как невалидный (см. app/connectors/truepost.py в Growth Agent).
-   Это защита от того, чтобы агент не интерпретировал "зависшие" данные
-   как актуальные.
+Что нужно сделать в TruePost:
+1. Сохранить этот файл как internal_metrics.py в корне проекта TruePost
+   (туда же, где лежит database.py).
+2. Подключить роутер в основном файле приложения (см. инструкцию в самом
+   низу этого файла).
+3. Добавить переменную окружения TRUEPOST_INTERNAL_API_TOKEN -- секретный
+   токен, который Growth Agent будет передавать в заголовке Authorization.
+   Тот же токен нужно прописать в Growth Agent как PROJECT_INTERNAL_API_TOKEN.
+4. Передеплоить TruePost.
 
-Формат ответа -- см. CONTRACT.md в репозитории Growth Agent, раздел
-"Контракт: Growth Agent <-> Project Metrics API".
+Поле "as_of" в ответе ОБЯЗАТЕЛЬНО -- без него Growth Agent отклонит ответ
+как невалидный (см. app/connectors/truepost.py в Growth Agent). Это защита
+от того, чтобы агент не интерпретировал "зависшие" данные как актуальные.
 """
 
 import os
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, HTTPException
-from sqlmodel import Session, select, func
+from sqlmodel import select, func
 
-# Замените на реальные импорты из вашего database.py / models.py
-# from database import get_session
-# from models import User, Channel, Post, Payment
+import database
+from database import User, Channel, Post, Payment
 
 
 router = APIRouter()
@@ -46,7 +46,7 @@ def _check_auth(authorization: str | None) -> None:
     app/connectors/truepost.py: headers = {"Authorization": f"Bearer {api_token}"}).
     """
     if not INTERNAL_API_TOKEN:
-        raise HTTPException(status_code=503, detail="Internal API token not configured on this server")
+        raise HTTPException(status_code=503, detail="TRUEPOST_INTERNAL_API_TOKEN not configured on this server")
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -60,83 +60,83 @@ def _check_auth(authorization: str | None) -> None:
 async def get_internal_metrics(
     period_hours: int,
     authorization: str | None = Header(default=None),
-    # session: Session = Depends(get_session),  # раскомментируйте и используйте свою сессию
 ):
     """
-    Growth Agent вызывает этот endpoint с period_hours = 3, 24 или 168 (7 дней)
-    -- три отдельных запроса за один цикл наблюдения, не один запрос со всеми
-    окнами сразу. Каждый запрос независим и не должен иметь побочных эффектов
-    (никаких "пересчётов" в БД, только чтение).
+    Growth Agent вызывает этот endpoint с period_hours = 3, 24 или 168
+    (7 дней) -- три отдельных запроса за один цикл наблюдения. Каждый
+    запрос независим, только чтение, без побочных эффектов в БД.
+
+    database.py использует datetime.utcnow() как default_factory для всех
+    created_at -- то есть в БД хранятся НАИВНЫЕ datetime без timezone, в UTC.
+    Поэтому period_start здесь тоже наивный UTC, без tzinfo -- иначе
+    сравнение datetime с tzinfo и без него в SQL упадёт с ошибкой.
     """
     _check_auth(authorization)
 
-    now = datetime.now(timezone.utc)
-    period_start = now - timedelta(hours=period_hours)
+    now_aware = datetime.now(timezone.utc)
+    now_naive = now_aware.replace(tzinfo=None)
+    period_start = now_naive - timedelta(hours=period_hours)
 
-    # --- Пример агрегации. Замените на реальные запросы к вашей БД. ---
-    #
-    # with get_session() as session:
-    #     users_created = session.exec(
-    #         select(func.count(User.id)).where(User.created_at >= period_start)
-    #     ).one()
-    #
-    #     channels_created = session.exec(
-    #         select(func.count(Channel.id)).where(Channel.created_at >= period_start)
-    #     ).one()
-    #
-    #     channels_verified = session.exec(
-    #         select(func.count(Channel.id)).where(
-    #             Channel.created_at >= period_start, Channel.is_verified == True
-    #         )
-    #     ).one()
-    #
-    #     posts_generated = session.exec(
-    #         select(func.count(Post.id)).where(Post.created_at >= period_start)
-    #     ).one()
-    #
-    #     posts_published = session.exec(
-    #         select(func.count(Post.id)).where(
-    #             Post.created_at >= period_start, Post.status == "published"
-    #         )
-    #     ).one()
-    #
-    #     payments_started = session.exec(
-    #         select(func.count(Payment.id)).where(Payment.created_at >= period_start)
-    #     ).one()
-    #
-    #     payments_success = session.exec(
-    #         select(func.count(Payment.id)).where(
-    #             Payment.created_at >= period_start, Payment.status == "succeeded"
-    #         )
-    #     ).one()
-    #
-    #     revenue_rub = session.exec(
-    #         select(func.coalesce(func.sum(Payment.amount), 0)).where(
-    #             Payment.created_at >= period_start, Payment.status == "succeeded"
-    #         )
-    #     ).one()
-    #
-    #     pending_payments = session.exec(
-    #         select(func.count(Payment.id)).where(Payment.status == "pending")
-    #     ).one()
+    with database.session() as s:
+        users_created = s.exec(
+            select(func.count(User.id)).where(User.created_at >= period_start)
+        ).one()
 
-    # Заглушка для примера -- в реальном коде замените на запросы выше
-    users_created = 0
-    channels_created = 0
-    channels_verified = 0
-    posts_generated = 0
-    posts_published = 0
-    payments_started = 0
-    payments_success = 0
-    revenue_rub = 0
-    pending_payments = 0
+        channels_created = s.exec(
+            select(func.count(Channel.id)).where(Channel.created_at >= period_start)
+        ).one()
+
+        # В схеме TruePost поле называется "verified", не "is_verified".
+        channels_verified = s.exec(
+            select(func.count(Channel.id)).where(
+                Channel.created_at >= period_start, Channel.verified == True  # noqa: E712
+            )
+        ).one()
+
+        posts_generated = s.exec(
+            select(func.count(Post.id)).where(Post.created_at >= period_start)
+        ).one()
+
+        # Post.status == "published" -- подтверждённое значение из реального проекта.
+        posts_published = s.exec(
+            select(func.count(Post.id)).where(
+                Post.created_at >= period_start, Post.status == "published"
+            )
+        ).one()
+
+        payments_started = s.exec(
+            select(func.count(Payment.id)).where(Payment.created_at >= period_start)
+        ).one()
+
+        # Payment.status == "paid" -- подтверждённое значение из реального проекта,
+        # не "succeeded", как можно было бы предположить по аналогии с YooKassa API.
+        payments_success = s.exec(
+            select(func.count(Payment.id)).where(
+                Payment.created_at >= period_start, Payment.status == "paid"
+            )
+        ).one()
+
+        revenue_rub = s.exec(
+            select(func.coalesce(func.sum(Payment.rub), 0)).where(
+                Payment.created_at >= period_start, Payment.status == "paid"
+            )
+        ).one()
+
+        # "Зависшие" платежи -- не ограничены периодом, потому что зависший
+        # платёж может быть создан раньше period_start, но всё ещё актуален
+        # как проблема прямо сейчас.
+        pending_payments = s.exec(
+            select(func.count(Payment.id)).where(Payment.status == "pending")
+        ).one()
 
     return {
         "period_hours": period_hours,
-        # "as_of" -- момент, на который ПОСЧИТАНЫ данные (обычно сейчас, но
-        # если у вас есть задержка репликации БД или кэш, укажите реальный
-        # момент актуальности данных, не время ответа на запрос).
-        "as_of": now.isoformat().replace("+00:00", "Z"),
+        # "as_of" -- момент, на который ПОСЧИТАНЫ данные. Здесь это "сейчас",
+        # потому что запрос идёт напрямую в БД без кэша и без задержки
+        # репликации. Если в будущем появится кэш или read-replica с
+        # задержкой -- здесь нужно будет передавать реальный момент
+        # актуальности данных, не время ответа на запрос.
+        "as_of": now_aware.isoformat().replace("+00:00", "Z"),
         "users_created": users_created,
         "channels_created": channels_created,
         "channels_verified": channels_verified,
@@ -144,18 +144,23 @@ async def get_internal_metrics(
         "posts_published": posts_published,
         "payments_started": payments_started,
         "payments_success": payments_success,
-        "revenue_rub": revenue_rub,
+        "revenue_rub": float(revenue_rub),
         "pending_payments": pending_payments,
     }
 
 
-# В основном файле приложения TruePost (main.py) подключите роутер:
+# Чтобы подключить роутер, добавьте в основной файл приложения TruePost
+# (там, где создаётся FastAPI app, обычно main.py или app.py):
 #
 #   from internal_metrics import router as internal_metrics_router
 #   app.include_router(internal_metrics_router)
 #
-# И добавьте переменную окружения в TruePost:
-#   TRUEPOST_INTERNAL_API_TOKEN=какой-то-длинный-случайный-секрет
+# И добавьте переменную окружения в TruePost (Railway → Variables):
+#   TRUEPOST_INTERNAL_API_TOKEN=придумайте-длинный-случайный-секрет
 #
 # Тот же секрет пропишите в Growth Agent (.env):
 #   PROJECT_INTERNAL_API_TOKEN=тот-же-самый-секрет
+#
+# Проверка после деплоя (замените значения на свои):
+#   curl -H "Authorization: Bearer ваш-секрет" \
+#     "https://autopost26.up.railway.app/api/internal/metrics?period_hours=24"
