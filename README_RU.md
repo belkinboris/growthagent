@@ -124,25 +124,32 @@ growth-agent-watchtower/
 Growth Agent не имеет прямого доступа к базе данных TruePost — только по
 HTTP. Нужно добавить один endpoint в сам TruePost.
 
-1. Откройте `examples/truepost_internal_metrics_patch.py` — это готовый
-   пример кода.
-2. Скопируйте код в новый файл внутри проекта TruePost (например
-   `internal_metrics.py`).
-3. Замените заглушки на реальные запросы к вашей базе данных — в файле
-   есть закомментированные примеры SQL-запросов через SQLModel, их нужно
-   раскомментировать и подключить к вашим реальным моделям `User`,
-   `Channel`, `Post`, `Payment`.
-4. В главном файле приложения TruePost подключите роутер:
+`examples/truepost_internal_metrics_patch.py` написан строго под реальную
+схему `database.py` TruePost (модели `User`, `Channel`, `Post`, `Payment`,
+статусы `Payment.status == "paid"` и `Post.status == "published"`) — это
+не абстрактный пример, его можно вставить почти без изменений.
+
+1. Скопируйте `examples/truepost_internal_metrics_patch.py` в проект
+   TruePost как `internal_metrics.py` (в ту же папку, где лежит
+   `database.py`).
+2. В главном файле приложения TruePost подключите роутер:
    ```python
    from internal_metrics import router as internal_metrics_router
    app.include_router(internal_metrics_router)
    ```
-5. В переменных окружения TruePost добавьте:
+3. В переменных окружения TruePost (Railway → Variables) добавьте:
    ```
    TRUEPOST_INTERNAL_API_TOKEN=придумайте-длинный-случайный-секрет
    ```
-6. Тот же самый секрет впишите в Growth Agent как `PROJECT_INTERNAL_API_TOKEN`.
-7. Передеплойте TruePost.
+4. Тот же самый секрет впишите в Growth Agent как `PROJECT_INTERNAL_API_TOKEN`.
+5. Передеплойте TruePost.
+6. Проверьте вручную (замените секрет и адрес на свои):
+   ```bash
+   curl -H "Authorization: Bearer ваш-секрет" \
+     "https://autopost26.up.railway.app/api/internal/metrics?period_hours=24"
+   ```
+   Должен вернуться JSON с полями `users_created`, `channels_created`,
+   `posts_published`, `payments_success`, `revenue_rub` и так далее.
 
 Важно: поле `as_of` в ответе обязательно. Это момент, на который посчитаны
 данные. Без него Growth Agent откажется принимать ответ — это защита от
