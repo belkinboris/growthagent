@@ -1,0 +1,115 @@
+"""
+Конфигурация Growth Agent.
+
+Важно: здесь нет ничего специфичного для TruePost/АвтоПоста, кроме
+значений по умолчанию в .env (которые человек заполняет сам при деплое).
+Сам код конфигурации универсален — он просто читает переменные окружения
+для "текущего подключённого проекта", какой бы он ни был.
+"""
+
+from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Соответствие нормализованных ключей воронки названиям целей в Яндекс.Метрике.
+# Это словарь по умолчанию для проекта, у которого нет собственного mapping
+# в Project.settings_json. Хранится здесь как fallback, а не как единственный
+# источник правды -- per-project mapping в БД имеет приоритет.
+DEFAULT_METRIKA_GOAL_MAPPING = {
+    "signup": "register_success",
+    "activation_1": "channel_created",
+    "activation_2": "post_generated",
+    "payment_started": "payment_started",
+    "payment_success": "payment_success",
+}
+
+# Нормализованные ключи воронки, которые ядро (analyzer.py, rules.py,
+# health_score.py) понимает. Список не закрытый -- per-project mapping
+# может содержать дополнительные activation_3, activation_4 и т.д.,
+# но эти пять/семь ключей считаются базовыми и всегда проверяются.
+CORE_FUNNEL_KEYS = [
+    "traffic",
+    "signup",
+    "activation_1",
+    "activation_2",
+    "payment_started",
+    "payment_success",
+    "revenue",
+]
+
+ANALYSIS_WINDOWS_HOURS = {
+    "3h": 3,
+    "24h": 24,
+    "7d": 168,
+}
+
+# Пороги для правила "низкая конверсия в регистрацию" (low_signup_conversion).
+# Не P1, потому что это не "проблема подтверждена", а "стоит присмотреться".
+# Живут в config.py как дефолты; per-project override -- через
+# Project.settings_json["thresholds"], если когда-нибудь понадобится разный
+# порог для разных проектов (например, у Зари будет другая норма конверсии).
+MIN_CLICKS_FOR_CONVERSION_CHECK = 100
+MIN_SIGNUP_CONVERSION_WARN_PERCENT = 2.0
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # --- Инфраструктура ---
+    database_url: str = "sqlite:///./growth_agent.db"
+    public_url: Optional[str] = None
+
+    # --- Telegram ---
+    bot_token: Optional[str] = None
+    bot_admin_chat_ids: str = ""  # список через запятую, парсится в telegram_bot.py
+
+    # --- LLM (опционально) ---
+    llm_provider: str = "none"  # none | openai | anthropic
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4o-mini"
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-sonnet-4-6"
+
+    # --- Текущий подключённый проект ---
+    # В v1 сервис обслуживает один активный проект. Project как модель в БД
+    # универсален (на будущее), но эти переменные описывают единственную
+    # текущую интеграцию, которая будет создана/обновлена в БД при старте.
+    project_name: str = "Проект"
+    project_type: str = "telegram_saas"
+    project_connector: str = "truepost"  # имя модуля в connectors/, не хардкод в core
+    project_base_url: Optional[str] = None
+    project_internal_api_token: Optional[str] = None
+
+    # --- Яндекс.Метрика ---
+    yandex_oauth_token: Optional[str] = None
+    metrika_counter_id: Optional[str] = None
+
+    # --- Яндекс.Директ ---
+    direct_client_login: Optional[str] = None
+    direct_campaign_ids: str = ""  # список через запятую
+
+    # --- YooKassa ---
+    yookassa_shop_id: Optional[str] = None
+    yookassa_secret_key: Optional[str] = None
+
+    # --- Планировщик ---
+    watch_interval_seconds: int = 10800  # 3 часа
+    default_mode: str = "watch_only"
+
+    # --- Пороги для свежести данных интеграций ---
+    integration_stale_minutes: int = 180  # если as_of старше -- алерт integration_down
+
+    @property
+    def admin_chat_ids_list(self) -> list[str]:
+        return [c.strip() for c in self.bot_admin_chat_ids.split(",") if c.strip()]
+
+    @property
+    def direct_campaign_ids_list(self) -> list[str]:
+        return [c.strip() for c in self.direct_campaign_ids.split(",") if c.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
