@@ -71,12 +71,17 @@ async def _fetch_product_metrics(project: Project, period_hours: int) -> tuple[d
 async def _fetch_metrika_metrics(project: Project, period_hours: int) -> tuple[dict | None, str | None]:
     settings = get_settings()
     goal_mapping = project.settings_json.get("metrika_goal_mapping", {})
+    # Приоритет: per-project goal_ids в settings_json, иначе -- из .env
+    # (METRIKA_GOAL_IDS_JSON). per-project позволяет в будущем настроить
+    # разные goal_id для разных проектов без правки .env.
+    goal_ids = project.settings_json.get("metrika_goal_ids") or settings.metrika_goal_ids
     try:
         result = await metrika_connector.fetch_metrics(
             oauth_token=settings.yandex_oauth_token,
             counter_id=settings.metrika_counter_id,
             period_hours=period_hours,
             goal_mapping=goal_mapping,
+            goal_ids=goal_ids,
         )
         return result, None
     except metrika_connector.NotConfiguredError:
@@ -89,10 +94,11 @@ async def _fetch_direct_metrics(period_hours: int) -> tuple[dict | None, str | N
     settings = get_settings()
     try:
         result = await direct_connector.fetch_metrics(
-            oauth_token=settings.yandex_oauth_token,
+            oauth_token=settings.effective_direct_oauth_token,
             client_login=settings.direct_client_login,
             campaign_ids=settings.direct_campaign_ids_list,
             period_hours=period_hours,
+            sandbox=settings.direct_sandbox,
         )
         return result, None
     except direct_connector.NotConfiguredError:

@@ -337,7 +337,7 @@ def make_low_signup_conversion_rule(
         condition=condition,
         hypothesis_template=(
             "{clicks} кликов дали {signup} регистраций -- конверсия {conversion_percent}%, "
-            "это ниже ожидаемого уровня. Данных уже немного, вывод осторожный."
+            "это ниже ожидаемого уровня."
         ),
         check_action_template=(
             "Проверить соответствие рекламного объявления, первого экрана лендинга "

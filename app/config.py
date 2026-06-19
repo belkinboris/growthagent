@@ -85,10 +85,13 @@ class Settings(BaseSettings):
     # --- Яндекс.Метрика ---
     yandex_oauth_token: Optional[str] = None
     metrika_counter_id: Optional[str] = None
+    metrika_goal_ids_json: str = "{}"  # JSON-строка: {"signup": 123456, "activation_1": 123457, ...}
 
     # --- Яндекс.Директ ---
     direct_client_login: Optional[str] = None
     direct_campaign_ids: str = ""  # список через запятую
+    direct_oauth_token: Optional[str] = None
+    direct_sandbox: bool = False
 
     # --- YooKassa ---
     yookassa_shop_id: Optional[str] = None
@@ -108,6 +111,31 @@ class Settings(BaseSettings):
     @property
     def direct_campaign_ids_list(self) -> list[str]:
         return [c.strip() for c in self.direct_campaign_ids.split(",") if c.strip()]
+
+    @property
+    def metrika_goal_ids(self) -> dict[str, int]:
+        """
+        Парсит METRIKA_GOAL_IDS_JSON в dict {normalized_key: goal_id}.
+        Возвращает пустой dict при отсутствии/невалидном JSON -- это не
+        ошибка конфигурации сама по себе (Метрика просто не будет давать
+        данные по целям), обработка отсутствия -- на стороне connector.
+        """
+        import json
+        try:
+            parsed = json.loads(self.metrika_goal_ids_json)
+            return {k: int(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+
+    @property
+    def effective_direct_oauth_token(self) -> Optional[str]:
+        """
+        DIRECT_OAUTH_TOKEN, если задан отдельно, иначе общий
+        YANDEX_OAUTH_TOKEN -- реалистично, что один и тот же OAuth-токен
+        Яндекса используется и для Метрики, и для Директа. Отдельная
+        переменная даёт гибкость, если потребуется разделить токены позже.
+        """
+        return self.direct_oauth_token or self.yandex_oauth_token
 
 
 @lru_cache
