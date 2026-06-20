@@ -183,38 +183,9 @@ def _aggregate_rows(data_rows: list) -> dict:
     }
 
 
-async def fetch_metrics(
-    oauth_token: Optional[str],
-    client_login: Optional[str],
-    campaign_ids: list,
-    period_hours: int,
-    sandbox: bool = False,
-    timeout_seconds: float = 30.0,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-) -> dict:
-    """
-    Возвращает dict: spend, clicks, impressions, ctr, cpc, campaigns_count,
-    "_diagnostics" (raw status codes по попыткам, период, кол-во строк).
-
-    campaign_ids может быть пустым списком -- тогда отчёт строится по ВСЕМ
-    кампаниям аккаунта (без фильтра CampaignId). Это сознательное
-    поведение: если DIRECT_CAMPAIGN_IDS_JSON не задан, агент видит всю
-    рекламную активность аккаунта, не "ничего".
-
-    Бросает NotConfiguredError, если токен/client_login отсутствуют.
-    Бросает DirectConnectorError при сетевой ошибке/таймауте/401/403/
-    invalid report spec/превышении max_retries при "отчёт всё ещё формируется".
-    """
-    if not oauth_token or not client_login:
-        raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
-
-    url = SANDBOX_API_URL if sandbox else REPORTS_API_URL
-    date_from, date_to = _period_to_dates(period_hours)
-    report_definition = _build_report_definition(campaign_ids, date_from, date_to)
-
+def _build_headers(oauth_token: str, client_login: Optional[str]) -> dict:
     headers = {
         "Authorization": f"Bearer {oauth_token}",
-        "Client-Login": client_login,
         "Accept-Language": "ru",
         "processingMode": "auto",  # сервер сам решает: сразу отдать или поставить в очередь
         "returnMoneyInMicros": "true",  # явно фиксируем единицы Cost, не полагаемся на дефолт
@@ -222,6 +193,33 @@ async def fetch_metrics(
         "skipReportSummary": "true",  # без summary-секции в начале, чище парсинг TSV
         "skipColumnHeader": "false",
     }
+    if client_login:
+        # Client-Login нужен только для агентских аккаунтов, управляющих
+        # чужими рекламными кабинетами. Для прямого рекламодателя (обычный
+        # случай) этот заголовок не обязателен -- передаём его только если
+        # значение реально задано, не пустую строку.
+        headers["Client-Login"] = client_login
+    return headers
+
+
+async def _execute_report_request(
+    report_definition: dict,
+    oauth_token: str,
+    client_login: Optional[str],
+    sandbox: bool,
+    timeout_seconds: float,
+    max_retries: int,
+) -> tuple[str, list]:
+    """
+    Общий retry-цикл для любого типа отчёта Reports Service (campaign,
+    ad_group, query). Возвращает (response_text, attempt_statuses) при
+    успехе (200), бросает DirectConnectorError при ошибке/превышении
+    max_retries -- одна реализация retry-логики для всех уровней
+    granular-диагностики, чтобы три копии этого кода не разошлись при
+    будущих правках.
+    """
+    url = SANDBOX_API_URL if sandbox else REPORTS_API_URL
+    headers = _build_headers(oauth_token, client_login)
 
     attempt_statuses = []
 
@@ -237,7 +235,7 @@ async def fetch_metrics(
         attempt_statuses.append(response.status_code)
 
         if response.status_code == 200:
-            return _handle_success(response.text, attempt_statuses, date_from, date_to)
+            return response.text, attempt_statuses
 
         if response.status_code in (201, 202):
             retry_in = response.headers.get("retryIn") or response.headers.get("RetryIn")
@@ -249,15 +247,46 @@ async def fetch_metrics(
             await asyncio.sleep(wait_seconds)
             continue
 
-        # 4xx/5xx -- разбираем тело ошибки, если оно JSON (Директ обычно
-        # возвращает {"error": {"error_code": ..., "error_string": ...,
-        # "error_detail": ...}} для ошибок отчёта).
         error_message = _parse_error_body(response.status_code, response.text)
         raise DirectConnectorError(error_message)
 
     raise DirectConnectorError(
         f"Report still processing after {max_retries} attempts (statuses: {attempt_statuses})"
     )
+
+
+async def fetch_metrics(
+    oauth_token: Optional[str],
+    client_login: Optional[str],
+    campaign_ids: list,
+    period_hours: int,
+    sandbox: bool = False,
+    timeout_seconds: float = 30.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict:
+    """
+    Campaign-level summary (как было). Возвращает dict: spend, clicks,
+    impressions, ctr, cpc, campaigns_count, "_diagnostics".
+
+    campaign_ids может быть пустым списком -- тогда отчёт строится по ВСЕМ
+    кампаниям аккаунта (без фильтра CampaignId). Это сознательное
+    поведение: если DIRECT_CAMPAIGN_IDS не задан, агент видит всю
+    рекламную активность аккаунта, не "ничего".
+
+    Бросает NotConfiguredError, если токен/client_login отсутствуют.
+    Бросает DirectConnectorError при сетевой ошибке/таймауте/401/403/
+    invalid report spec/превышении max_retries при "отчёт всё ещё формируется".
+    """
+    if not oauth_token or not client_login:
+        raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
+
+    date_from, date_to = _period_to_dates(period_hours)
+    report_definition = _build_report_definition(campaign_ids, date_from, date_to)
+
+    text, attempt_statuses = await _execute_report_request(
+        report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
+    )
+    return _handle_success(text, attempt_statuses, date_from, date_to)
 
 
 def _handle_success(text: str, attempt_statuses: list, date_from: str, date_to: str) -> dict:
@@ -277,6 +306,219 @@ def _handle_success(text: str, attempt_statuses: list, date_from: str, date_to: 
         "rows_returned": len(data_rows) if header else 0,
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# Granular reports (ad_group / search_query level) -- Direct Deep Diagnostics
+# ---------------------------------------------------------------------------
+#
+# Reports Service не отдаёт keyword-уровень отдельным ReportType для всех
+# типов кампаний одинаково -- доступность зависит от типа кампании (поиск/
+# РСЯ/смарт-баннеры). Поэтому keyword-уровень в v1 не реализован отдельной
+# функцией: ad_group и query уровни покрывают диагностику, а keyword будет
+# добавлен отдельно, если понадобится, без изменения существующих функций.
+
+
+def _build_ad_group_report_definition(campaign_ids: list, date_from: str, date_to: str) -> dict:
+    selection_criteria = {"DateFrom": date_from, "DateTo": date_to}
+    if campaign_ids:
+        selection_criteria["Filter"] = [
+            {"Field": "CampaignId", "Operator": "IN", "Values": [str(c) for c in campaign_ids]}
+        ]
+
+    return {
+        "params": {
+            "SelectionCriteria": selection_criteria,
+            "FieldNames": [
+                "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
+                "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc",
+            ],
+            "ReportName": f"GrowthAgent_AdGroup_{date_from}_{date_to}",
+            "ReportType": "ADGROUP_PERFORMANCE_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "YES",
+            "IncludeDiscount": "NO",
+        }
+    }
+
+
+def _build_search_query_report_definition(campaign_ids: list, date_from: str, date_to: str) -> dict:
+    selection_criteria = {"DateFrom": date_from, "DateTo": date_to}
+    if campaign_ids:
+        selection_criteria["Filter"] = [
+            {"Field": "CampaignId", "Operator": "IN", "Values": [str(c) for c in campaign_ids]}
+        ]
+
+    return {
+        "params": {
+            "SelectionCriteria": selection_criteria,
+            # AdGroupName в SEARCH_QUERY_PERFORMANCE_REPORT не всегда
+            # доступен (зависит от типа кампании) -- запрашиваем, но
+            # parsing должен пережить его отсутствие в ответе (см.
+            # _parse_tsv: malformed/недостающие колонки не валят весь отчёт).
+            "FieldNames": [
+                "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
+                "Query", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc",
+            ],
+            "ReportName": f"GrowthAgent_Query_{date_from}_{date_to}",
+            "ReportType": "SEARCH_QUERY_PERFORMANCE_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "YES",
+            "IncludeDiscount": "NO",
+        }
+    }
+
+
+def _row_metrics(row: dict) -> dict:
+    """
+    Превращает одну TSV-строку (dict из заголовка и значений) в нормальные
+    числа -- impressions/clicks как int, cost как рубли (делим micros),
+    ctr/cpc как float. Используется одинаково для ad_group и query уровней,
+    чтобы не дублировать парсинг чисел.
+    """
+    def _to_int(value):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return 0
+
+    def _to_float(value):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
+
+    impressions = _to_int(row.get("Impressions", 0))
+    clicks = _to_int(row.get("Clicks", 0))
+    # int() перед делением -- та же обработка, что в _aggregate_rows() для
+    # campaign-level (см. _aggregate_rows: total_cost_micros += int(float(...))),
+    # чтобы оба пути расчёта Cost давали идентичный результат на одних и тех
+    # же исходных данных, а не расходились на доли копейки из-за разного
+    # порядка округления.
+    cost_micros = int(_to_float(row.get("Cost", 0)))
+    cost_rub = cost_micros / 1_000_000
+
+    return {
+        "impressions": impressions,
+        "clicks": clicks,
+        "cost": round(cost_rub, 2),
+        "ctr": round((clicks / impressions * 100) if impressions > 0 else 0.0, 2),
+        "cpc": round((cost_rub / clicks) if clicks > 0 else 0.0, 2),
+    }
+
+
+async def fetch_ad_group_report(
+    oauth_token: Optional[str],
+    client_login: Optional[str],
+    campaign_ids: list,
+    period_hours: int,
+    sandbox: bool = False,
+    timeout_seconds: float = 30.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict:
+    """
+    Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
+    "ad_group_name", "impressions", "clicks", "cost", "ctr", "cpc"}, ...],
+    "_diagnostics": {...}}.
+
+    Это более тяжёлый запрос, чем fetch_metrics() -- вызывающий код
+    (diagnostics.py) должен решать, когда его реально запускать (см.
+    should_run_deep_diagnostics() в service.py), не на каждый /run.
+
+    Бросает те же исключения, что fetch_metrics().
+    """
+    if not oauth_token or not client_login:
+        raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
+
+    date_from, date_to = _period_to_dates(period_hours)
+    report_definition = _build_ad_group_report_definition(campaign_ids, date_from, date_to)
+
+    text, attempt_statuses = await _execute_report_request(
+        report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
+    )
+
+    header, data_rows = _parse_tsv(text)
+    rows = []
+    for row in data_rows:
+        metrics = _row_metrics(row)
+        rows.append({
+            "campaign_id": row.get("CampaignId", ""),
+            "campaign_name": row.get("CampaignName", ""),
+            "ad_group_id": row.get("AdGroupId", ""),
+            "ad_group_name": row.get("AdGroupName", ""),
+            **metrics,
+        })
+
+    return {
+        "rows": rows,
+        "_diagnostics": {
+            "attempt_statuses": attempt_statuses,
+            "date_from": date_from,
+            "date_to": date_to,
+            "rows_returned": len(rows),
+        },
+    }
+
+
+async def fetch_search_query_report(
+    oauth_token: Optional[str],
+    client_login: Optional[str],
+    campaign_ids: list,
+    period_hours: int,
+    sandbox: bool = False,
+    timeout_seconds: float = 30.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict:
+    """
+    Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
+    "ad_group_name", "query", "impressions", "clicks", "cost", "ctr", "cpc"},
+    ...], "_diagnostics": {...}}.
+
+    SEARCH_QUERY_PERFORMANCE_REPORT доступен только для кампаний с
+    поисковыми показами -- для кампаний только в РСЯ запрос может вернуть
+    пустой отчёт (graceful: нули/пустой список, не ошибка, см. обработку
+    пустого TSV в _parse_tsv).
+    """
+    if not oauth_token or not client_login:
+        raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
+
+    date_from, date_to = _period_to_dates(period_hours)
+    report_definition = _build_search_query_report_definition(campaign_ids, date_from, date_to)
+
+    text, attempt_statuses = await _execute_report_request(
+        report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
+    )
+
+    header, data_rows = _parse_tsv(text)
+    rows = []
+    for row in data_rows:
+        metrics = _row_metrics(row)
+        query = row.get("Query", "").strip()
+        if not query:
+            # Строки без текста запроса (например, технический "---" для
+            # показов без явного запроса) не несут диагностической ценности
+            # для кластеризации -- пропускаем, не падаем.
+            continue
+        rows.append({
+            "campaign_id": row.get("CampaignId", ""),
+            "campaign_name": row.get("CampaignName", ""),
+            "ad_group_id": row.get("AdGroupId", ""),
+            "ad_group_name": row.get("AdGroupName", ""),
+            "query": query,
+            **metrics,
+        })
+
+    return {
+        "rows": rows,
+        "_diagnostics": {
+            "attempt_statuses": attempt_statuses,
+            "date_from": date_from,
+            "date_to": date_to,
+            "rows_returned": len(rows),
+        },
+    }
 
 
 def _parse_error_body(status_code: int, text: str) -> str:
@@ -311,7 +553,10 @@ async def test_direct_connection(
 ) -> dict:
     """
     Минимальная проверка: токен валиден, client_login имеет доступ, отчёт
-    за последние 24 часа строится успешно. Не бросает исключения наружу.
+    за текущие календарные сутки (UTC) строится успешно -- не "последние
+    24 часа" в смысле скользящего окна (см. _period_to_dates: Reports
+    Service работает по DateFrom/DateTo датам, не точным timestamp).
+    Не бросает исключения наружу.
     """
     if not oauth_token or not client_login:
         return {"ok": False, "error": "DIRECT_OAUTH_TOKEN or DIRECT_CLIENT_LOGIN not set", "stage": "config"}
