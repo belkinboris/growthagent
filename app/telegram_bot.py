@@ -270,11 +270,16 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     if result.primary_candidate is not None:
         blocks.append(format_alert_block(result.primary_candidate, project_name, is_primary=True))
         for sec in result.secondary:
-            blocks.append(format_alert_block(sec, project_name, is_primary=False))
+            dedup_line = _format_secondary_dedup_or_full(sec, result.primary_candidate, project_name)
+            blocks.append(dedup_line)
 
         deep_summary = _format_deep_diagnostics_teaser(result.deep_diagnostics)
         if deep_summary:
             blocks.append(deep_summary)
+
+        onboarding_summary = _format_onboarding_diagnostics_teaser(result.onboarding_diagnostics)
+        if onboarding_summary:
+            blocks.append(onboarding_summary)
     elif not blocks:
         blocks.append(
             f"Growth Agent — watch-only\nПроект: {project_name}\n\n"
@@ -286,6 +291,30 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         blocks.append(f"Метрики (7д):\n{_format_metrics_line(metrics_7d)}")
 
     return "\n\n".join(blocks)
+
+
+def _format_secondary_dedup_or_full(
+    secondary: AlertCandidate, primary: AlertCandidate, project_name: str
+) -> str:
+    """
+    Если secondary candidate -- по сути то же самое наблюдение, что и
+    primary (тот же rule_id, та же affected_step, просто другое окно или
+    confidence), не повторяем полный текст гипотезы -- одна короткая
+    строка вместо дублирования. "По сути то же самое" определяется как
+    совпадение rule_id ИЛИ affected_step -- это покрывает и случай "то же
+    правило сработало на 24h и 7d", и случай "разные правила, но про один
+    и тот же шаг воронки" (например, оба про signup).
+    """
+    is_same_signal = (
+        secondary.rule_id == primary.rule_id
+        or secondary.affected_step == primary.affected_step
+    )
+
+    if is_same_signal:
+        confidence_ru = CONFIDENCE_RU.get(secondary.confidence.value, secondary.confidence.value)
+        return f"Есть аналогичный ранний сигнал за более короткое окно ({confidence_ru})."
+
+    return format_alert_block(secondary, project_name, is_primary=False)
 
 
 def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None:
@@ -311,6 +340,36 @@ def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None
         return f"Проверил группы объявлений и поисковые запросы: {main_finding['title'].lower()}. Детали — по кнопке ниже."
 
     return "Проверил группы объявлений и поисковые запросы: явных проблем не нашёл."
+
+
+def _format_onboarding_diagnostics_teaser(onboarding_diagnostics: dict | None) -> str | None:
+    """
+    Короткая пометка про onboarding diagnostics для основного сообщения,
+    симметрично _format_deep_diagnostics_teaser выше. status="not_available"
+    -- честная формулировка, что endpoint ещё не реализован в TruePost, НЕ
+    финальная рекомендация "проверьте сами" -- агент явно говорит, что
+    пытался получить данные сам и не смог технически, а не отказался пытаться.
+    """
+    if onboarding_diagnostics is None:
+        return None
+
+    status = onboarding_diagnostics.get("status")
+
+    if status == "not_available":
+        return (
+            "Онбординг-диагностика пока недоступна: продуктовый endpoint ещё не реализован. "
+            "Сейчас известно только, что есть регистрации без активации. Для точной диагностики "
+            "нужно добавить tracking/endpoint в TruePost."
+        )
+
+    if status == "error":
+        return "Не удалось получить данные онбординга в этот раз -- техническая ошибка, не проблема в продукте."
+
+    dropoff_summary = onboarding_diagnostics.get("dropoff_summary")
+    if dropoff_summary:
+        return f"Проверил путь после регистрации: {dropoff_summary} Детали — по кнопке ниже."
+
+    return "Проверил путь после регистрации: явных проблем не нашёл."
 
 
 def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -> str:
@@ -372,6 +431,83 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
         lines.append("\nЕсть и хорошие сигналы:")
         for gf in good_findings[:2]:
             lines.append(f"— {gf['detail']}")
+
+    return "\n".join(lines)
+
+
+def format_onboarding_diagnostics_details(onboarding_diagnostics: dict, project_name: str) -> str:
+    """
+    Детальная диагностика онбординга по кнопке "Проверить онбординг".
+    Формат из задачи: главный сигнал, что проверил, результат, вероятная
+    зона проблемы (список причин), что сделать, что НЕ делать.
+
+    status="not_available" -- отдельная, более короткая ветка: если
+    endpoint не реализован, не показываем "результат"/"вероятная зона" по
+    пустым данным, честно говорим, что нечего показать технически.
+    """
+    status = onboarding_diagnostics.get("status")
+
+    if status == "not_available":
+        return (
+            "Growth Agent — диагностика онбординга\n"
+            f"Проект: {project_name}\n\n"
+            "Онбординг-диагностика пока недоступна: продуктовый endpoint "
+            "(/api/internal/onboarding-diagnostics) ещё не реализован в TruePost.\n\n"
+            "Что известно: есть регистрации без подтверждённой активации, но без "
+            "событий онбординга нельзя точно сказать, на каком шаге останавливаются пользователи.\n\n"
+            "Что сделать:\n"
+            "Добавить tracking событий onboarding_started и channel_created в TruePost, "
+            "чтобы агент мог анализировать путь пользователя автоматически."
+        )
+
+    if status == "error":
+        return (
+            "Growth Agent — диагностика онбординга\n"
+            f"Проект: {project_name}\n\n"
+            f"Не удалось получить данные онбординга: {onboarding_diagnostics.get('error_detail', 'техническая ошибка')}.\n\n"
+            "Это техническая проблема с подключением, не вывод о продукте. Можно попробовать ещё раз позже."
+        )
+
+    lines = [
+        "Growth Agent — диагностика онбординга",
+        f"Проект: {project_name}",
+        "",
+        "Главный сигнал:",
+        "Есть регистрация без активации. Данных мало, вывод осторожный." if onboarding_diagnostics.get("registrations", 0) < 5
+        else "Есть регистрации без активации.",
+        "",
+        "Что проверил:",
+        "Проверил путь после регистрации по данным продукта.",
+        "",
+        "Результат:",
+        onboarding_diagnostics.get("dropoff_summary", "Нет данных для анализа."),
+    ]
+
+    probable_causes = onboarding_diagnostics.get("probable_causes", [])
+    if probable_causes:
+        lines.append("")
+        lines.append("Вероятная зона проблемы:")
+        lines.extend(f"{i+1}. {cause}" for i, cause in enumerate(probable_causes))
+
+    recommended_actions = onboarding_diagnostics.get("recommended_actions", [])
+    if recommended_actions:
+        lines.append("")
+        lines.append("Что сделать:")
+        lines.extend(f"{i+1}. {action}" for i, action in enumerate(recommended_actions))
+        lines.append(f"{len(recommended_actions)+1}. Не менять рекламу на основании этого сигнала.")
+
+    notes = onboarding_diagnostics.get("notes", [])
+    if notes:
+        lines.append("")
+        lines.append("Заметки:")
+        lines.extend(f"— {note}" for note in notes)
+
+    lines.append("")
+    lines.append("Что НЕ делать:")
+    lines.append(
+        "Не делать вывод, что реклама плохая, только из-за этого onboarding-сигнала. "
+        "Не менять рекламу и онбординг одновременно."
+    )
 
     return "\n".join(lines)
 
@@ -484,17 +620,42 @@ def _get_deep_diagnostics_for_keyboard(session, project_id: int) -> dict | None:
     return cached.result_json if cached else None
 
 
-def build_alert_keyboard(alert_id: int, has_deep_diagnostics: bool = False, deep_diagnostics_available: bool = False) -> InlineKeyboardMarkup:
+def _get_onboarding_diagnostics_for_keyboard(session, project_id: int) -> dict | None:
+    """
+    Симметрично _get_deep_diagnostics_for_keyboard, но для onboarding --
+    смотрит в ONBOARDING_CACHE_PERIOD_KEY ("onboarding_24h"), отдельный
+    namespace в той же таблице DeepDiagnosticsCache, чтобы не путать с
+    кэшем Direct deep diagnostics (см. service.py).
+    """
+    from app.service import get_cached_diagnostics, ONBOARDING_CACHE_PERIOD_KEY
+    cached = get_cached_diagnostics(session, project_id, ONBOARDING_CACHE_PERIOD_KEY)
+    return cached.result_json if cached else None
+
+
+def build_alert_keyboard(
+    alert_id: int,
+    has_deep_diagnostics: bool = False,
+    deep_diagnostics_available: bool = False,
+    has_onboarding_diagnostics: bool = False,
+    onboarding_diagnostics_available: bool = False,
+) -> InlineKeyboardMarkup:
     """
     has_deep_diagnostics -- diagnostics уже запускался в этом цикле
     (автоматически или из кэша), есть что показать по кнопке "Показать
     детали". deep_diagnostics_available -- Direct настроен и в принципе
-    может быть запущен по требованию, даже если в этом цикле он не
-    запускался (например, alert был не той категории, что триггерит auto-run) --
-    тогда показываем "Проверить глубже" как force refresh.
+    может быть запущен по требованию -- тогда показываем "Проверить
+    рекламу глубже" как force refresh.
 
-    Обе кнопки не показываются одновременно: если диагностика уже есть --
-    "Показать детали"; если нет, но в принципе доступна -- "Проверить глубже".
+    has_onboarding_diagnostics / onboarding_diagnostics_available --
+    симметрично для onboarding diagnostics, отдельная строка кнопок.
+
+    ВАЖНО: обе пары кнопок (Direct и onboarding) показываются НЕЗАВИСИМО
+    друг от друга и независимо от того, что сейчас primary alert -- по
+    решению: пользователь может вручную проверить рекламу/онбординг, даже
+    если главный сигнал сейчас про другую часть воронки (см. should_show_
+    deep_direct_button / should_show_onboarding_button в service.py).
+    Это secondary diagnostic utilities -- они read-only и не относятся к
+    основным действиям над алертом (Понял/Отложить/Создать задачу).
     """
     rows = [
         [
@@ -507,10 +668,26 @@ def build_alert_keyboard(alert_id: int, has_deep_diagnostics: bool = False, deep
         ],
     ]
 
+    diagnostic_row = []
     if has_deep_diagnostics:
-        rows.append([InlineKeyboardButton("Показать детали", callback_data=f"show_details:{alert_id}")])
+        diagnostic_row.append(InlineKeyboardButton("Показать детали рекламы", callback_data=f"show_details:{alert_id}"))
     elif deep_diagnostics_available:
-        rows.append([InlineKeyboardButton("Проверить глубже", callback_data=f"deep_check:{alert_id}")])
+        diagnostic_row.append(InlineKeyboardButton("Проверить рекламу глубже", callback_data=f"deep_check:{alert_id}"))
+
+    if has_onboarding_diagnostics:
+        diagnostic_row.append(InlineKeyboardButton("Детали онбординга", callback_data=f"show_onboarding:{alert_id}"))
+    elif onboarding_diagnostics_available:
+        diagnostic_row.append(InlineKeyboardButton("Проверить онбординг", callback_data=f"onboarding_check:{alert_id}"))
+
+    if diagnostic_row:
+        # Если обе кнопки попали в одну строку и текст длинный -- Telegram
+        # сам перенесёт их визуально, но лучше не больше двух кнопок на
+        # ряд для читаемости на мобильном экране.
+        if len(diagnostic_row) <= 2:
+            rows.append(diagnostic_row)
+        else:
+            rows.append([diagnostic_row[0]])
+            rows.append(diagnostic_row[1:])
 
     return InlineKeyboardMarkup(rows)
 
@@ -626,6 +803,43 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 suggestion_text = format_negative_keywords_suggestion(deep_diagnostics, project_query_clusters)
                 await query.message.reply_text(suggestion_text)
 
+        elif action == "show_onboarding":
+            # Кэш уже есть (иначе кнопка была бы "Проверить онбординг") --
+            # читаем его, не запускаем заново.
+            onboarding_diagnostics = _get_onboarding_diagnostics_for_keyboard(session, alert.project_id)
+            if onboarding_diagnostics is None:
+                await query.message.reply_text(
+                    "Детали онбординга не найдены (кэш устарел между нажатиями). Попробуйте /run заново."
+                )
+            else:
+                project = session.get(Project, alert.project_id)
+                project_name = project.name if project else "Проект"
+                details_text = format_onboarding_diagnostics_details(onboarding_diagnostics, project_name)
+                await query.message.reply_text(details_text)
+
+        elif action == "onboarding_check":
+            # Force refresh -- минуя кэш, симметрично deep_check для Direct.
+            await query.message.reply_text("Проверяю путь после регистрации...")
+            from app.scheduler import force_refresh_onboarding_diagnostics
+            outcome = await force_refresh_onboarding_diagnostics(alert.project_id)
+
+            project = session.get(Project, alert.project_id)
+            project_name = project.name if project else "Проект"
+
+            # outcome -- {"status": ..., "result": {...}|None, "error": ...}.
+            # format_onboarding_diagnostics_details ожидает плоский dict с
+            # status внутри -- если status="ok", это outcome["result"]
+            # (там есть свой "status"="ok" от OnboardingDiagnosticsResult.to_dict());
+            # если not_available/error, передаём сам outcome -- у него уже
+            # верная форма {"status": ..., "error_detail"/...}.
+            if outcome["status"] == "ok":
+                details_text = format_onboarding_diagnostics_details(outcome["result"], project_name)
+            else:
+                payload_for_details = {"status": outcome["status"], "error_detail": outcome.get("error")}
+                details_text = format_onboarding_diagnostics_details(payload_for_details, project_name)
+
+            await query.message.reply_text(details_text)
+
         else:
             await query.edit_message_text("Неизвестное действие.")
 
@@ -653,7 +867,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/settings — основные настройки\n"
         "/test_metrika — проверить подключение к Яндекс.Метрике\n"
         "/test_direct — проверить подключение к Яндекс.Директу\n"
-        "/deep_direct — глубокая диагностика Директа (группы, запросы) независимо от текущего alert"
+        "/deep_direct — глубокая диагностика Директа (группы, запросы) независимо от текущего alert\n"
+        "/check_onboarding — диагностика онбординга (путь после регистрации) независимо от текущего alert"
     )
 
 
@@ -717,12 +932,16 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
             ).first()
             if alert:
-                settings = get_settings()
-                direct_available = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
+                # show_deep_direct_button/show_onboarding_button уже учитывают
+                # и наличие интеграции, и наличие реальных данных за период
+                # (не просто "токен задан") -- вычислены в scheduler.py.
                 keyboard = build_alert_keyboard(
                     alert.id,
                     has_deep_diagnostics=result.deep_diagnostics is not None,
-                    deep_diagnostics_available=direct_available,
+                    deep_diagnostics_available=result.show_deep_direct_button,
+                    has_onboarding_diagnostics=result.onboarding_diagnostics is not None
+                    and result.onboarding_diagnostics.get("status") == "ok",
+                    onboarding_diagnostics_available=result.show_onboarding_button,
                 )
             else:
                 keyboard = None
@@ -884,6 +1103,43 @@ async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(details_text)
 
 
+async def cmd_check_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Принудительный запуск Product Onboarding Diagnostics НЕЗАВИСИМО от
+    primary alert -- симметрично cmd_deep_direct. Полезна, когда нужно
+    проверить путь после регистрации, даже если текущий главный сигнал
+    сейчас не product/onboarding категории.
+
+    Read-only: только чтение через onboarding-endpoint TruePost, никаких
+    изменений в продукте. Честно сообщает "недоступно", если endpoint
+    ещё не реализован в TruePost -- не падает и не молчит об этом.
+    """
+    settings = get_settings()
+
+    if not (settings.project_internal_api_token):
+        await update.message.reply_text(
+            "TruePost не настроен (нет PROJECT_INTERNAL_API_TOKEN) -- диагностика онбординга недоступна."
+        )
+        return
+
+    await update.message.reply_text("Проверяю путь после регистрации...")
+
+    from app.scheduler import force_refresh_onboarding_diagnostics
+    outcome = await force_refresh_onboarding_diagnostics()
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        project_name = project.name if project else "Проект"
+
+    if outcome["status"] == "ok":
+        details_text = format_onboarding_diagnostics_details(outcome["result"], project_name)
+    else:
+        payload_for_details = {"status": outcome["status"], "error_detail": outcome.get("error")}
+        details_text = format_onboarding_diagnostics_details(payload_for_details, project_name)
+
+    await update.message.reply_text(details_text)
+
+
 async def cmd_test_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Проверка подключения к Яндекс.Директу без полного цикла -- использует
@@ -1017,11 +1273,13 @@ async def send_cycle_notification(app: Application, result: CycleResult, project
                 select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
             ).first()
             if alert:
-                direct_available = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
                 keyboard = build_alert_keyboard(
                     alert.id,
                     has_deep_diagnostics=result.deep_diagnostics is not None,
-                    deep_diagnostics_available=direct_available,
+                    deep_diagnostics_available=result.show_deep_direct_button,
+                    has_onboarding_diagnostics=result.onboarding_diagnostics is not None
+                    and result.onboarding_diagnostics.get("status") == "ok",
+                    onboarding_diagnostics_available=result.show_onboarding_button,
                 )
                 if alert.status == AlertStatus.open:
                     alert.status = AlertStatus.sent
@@ -1059,6 +1317,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("test_metrika", cmd_test_metrika))
     app.add_handler(CommandHandler("test_direct", cmd_test_direct))
     app.add_handler(CommandHandler("deep_direct", cmd_deep_direct))
+    app.add_handler(CommandHandler("check_onboarding", cmd_check_onboarding))
     app.add_handler(CallbackQueryHandler(on_button_press))
 
     return app

@@ -405,3 +405,184 @@ def run_diagnostics(
         main_finding=main_finding,
         good_findings=good_findings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Product Onboarding Diagnostics
+# ---------------------------------------------------------------------------
+#
+# Симметрично Direct Deep Diagnostics выше: read-only анализ, осторожные
+# формулировки, явная пометка при недостатке данных. Отличие -- источник
+# данных -- connectors/onboarding.py (TruePost), не Director, и сам
+# endpoint может ОТСУТСТВОВАТЬ (ожидаемо на данный момент) -- это
+# обрабатывается отдельным статусом OnboardingDiagnosticsResult.status,
+# не через insufficient_data (это разные ситуации: "данных мало" vs
+# "источника данных вообще нет").
+
+
+@dataclass
+class OnboardingDiagnosticsResult:
+    """
+    status:
+      "ok"            -- endpoint ответил, есть данные для анализа;
+      "not_available" -- endpoint не реализован в TruePost (404) или
+                          product connector не настроен -- ОЖИДАЕМАЯ
+                          ситуация на данный момент, не ошибка;
+      "error"         -- endpoint существует, но ответил ошибкой
+                          (timeout, 5xx, invalid JSON).
+    """
+
+    status: str
+    registrations: int = 0
+    last_known_step: Optional[str] = None
+    dropoff_summary: Optional[str] = None
+    probable_causes: list = field(default_factory=list)
+    recommended_actions: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    error_detail: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "registrations": self.registrations,
+            "last_known_step": self.last_known_step,
+            "dropoff_summary": self.dropoff_summary,
+            "probable_causes": self.probable_causes,
+            "recommended_actions": self.recommended_actions,
+            "notes": self.notes,
+            "error_detail": self.error_detail,
+        }
+
+
+# Стандартные шаги воронки онбординга в ожидаемом порядке (см. контракт
+# endpoint в connectors/onboarding.py). Порядок важен для определения
+# "последнего известного шага" -- это первый шаг по порядку, на котором
+# users == 0, при условии что предыдущий шаг был > 0.
+_ONBOARDING_STEP_ORDER = [
+    ("registered", "регистрация"),
+    ("onboarding_started", "начало онбординга"),
+    ("channel_created", "создание канала"),
+    ("post_generated", "генерация первого поста"),
+]
+
+# Типовые вероятные причины и действия для каждой пары "последний живой
+# шаг -> где застряли". Это не привязано к конкретному продукту жёстко
+# (формулировки общие для любого SaaS-онбординга), в отличие от
+# query_clusters, которые специфичны для АвтоПоста -- поэтому здесь нет
+# per-project override, в отличие от DEFAULT_QUERY_CLUSTERS.
+_DROPOFF_CAUSES = {
+    "registered": [
+        "После регистрации неочевидно, что делать дальше.",
+        "Нет явного призыва к действию на следующий шаг.",
+        "Пользователь не попал на нужный экран после регистрации (проблема с redirect).",
+        "Событие onboarding_started пока не трекается -- возможно, пользователь продвинулся дальше, но это не видно в данных.",
+    ],
+    "onboarding_started": [
+        "Пользователь начал онбординг, но не дошёл до создания канала.",
+        "Шаг создания канала может быть неочевиден или требовать действий вне продукта (добавление бота в Telegram-канал).",
+    ],
+    "channel_created": [
+        "Канал создан, но первый пост не сгенерирован -- возможна проблема на шаге генерации контента.",
+    ],
+}
+
+_DROPOFF_ACTIONS = {
+    "registered": [
+        "Проверить redirect сразу после регистрации.",
+        "Проверить наличие явного CTA на следующий шаг.",
+        "Добавить/проверить tracking событий onboarding_started и create_channel_clicked.",
+    ],
+    "onboarding_started": [
+        "Проверить, понятен ли пользователю шаг добавления бота в канал.",
+        "Проверить, не теряется ли пользователь между онбордингом и созданием канала.",
+    ],
+    "channel_created": [
+        "Проверить, что происходит сразу после создания канала -- доходит ли пользователь до генерации первого поста.",
+    ],
+}
+
+
+def analyze_onboarding(connector_result: dict) -> OnboardingDiagnosticsResult:
+    """
+    Принимает результат connectors/onboarding.fetch_onboarding_diagnostics()
+    (уже успешный, status="ok" подразумевается -- ошибки/недоступность
+    обрабатываются ДО вызова этой функции, на уровне scheduler.py, как и
+    integration_down для остальных коннекторов). Определяет последний
+    живой шаг воронки и формулирует осторожные находки.
+    """
+    last_known_step_summary = connector_result.get("last_known_step_summary") or {}
+    registrations = connector_result.get("registrations", 0)
+    notes = list(connector_result.get("notes", []))
+
+    if registrations == 0:
+        # Не должно обычно вызываться в этой ситуации (триггер -- alert
+        # "регистрации без активации", то есть registrations > 0), но
+        # защитная ветка на случай рассинхрона данных между основным
+        # циклом и onboarding-запросом (разные моменты опроса).
+        return OnboardingDiagnosticsResult(
+            status="ok",
+            registrations=0,
+            last_known_step=None,
+            dropoff_summary="За проверенный период регистраций не было -- не на чём строить диагностику онбординга.",
+            notes=notes,
+        )
+
+    # Находим последний шаг, до которого реально дошла БОЛЬШАЯ ЧАСТЬ
+    # зарегистрировавшихся -- не просто "значение > 0" (иначе 1 успешный
+    # пользователь из 5 ошибочно выглядел бы как "все дошли до конца").
+    # Алгоритм: идём по шагам по порядку, сравнивая каждый со значением
+    # предыдущего шага. Последний шаг, где значение >= половины предыдущего,
+    # считается "пройденным большинством"; первый шаг с резким падением
+    # (< половины предыдущего) или с untracked (None) считается точкой обрыва.
+    last_known_step_key = "registered"
+    untracked_steps = []
+    previous_value = registrations
+
+    for step_key, _ in _ONBOARDING_STEP_ORDER[1:]:  # registered точно есть, раз registrations > 0
+        value = last_known_step_summary.get(step_key)
+        if value is None:
+            untracked_steps.append(step_key)
+            continue
+        if value == 0:
+            break  # трекается, но дошло 0 -- явный обрыв на этом шаге
+        if value < previous_value:
+            # Дошла не вся группа, а только часть -- этот шаг становится
+            # последним "подтверждённым", но дальше не продолжаем считать
+            # следующие шаги пройденными большинством, даже если там
+            # формально value > 0 (это уже подмножество, не основной поток).
+            last_known_step_key = step_key
+            previous_value = value
+            break
+        last_known_step_key = step_key
+        previous_value = value
+
+    causes = list(_DROPOFF_CAUSES.get(last_known_step_key, []))
+    actions = list(_DROPOFF_ACTIONS.get(last_known_step_key, []))
+
+    if untracked_steps:
+        untracked_labels = ", ".join(untracked_steps)
+        notes.append(f"События не трекаются пока: {untracked_labels}.")
+
+    step_label = dict(_ONBOARDING_STEP_ORDER).get(last_known_step_key, last_known_step_key)
+
+    if last_known_step_key == "registered":
+        dropoff_summary = (
+            f"{registrations} пользователь(ей) зарегистрировались. "
+            f"Дальше регистрации никто не продвинулся (по доступным данным)."
+        )
+    else:
+        reached_count = previous_value
+        dropoff_summary = (
+            f"{registrations} пользователь(ей) зарегистрировались, из них {reached_count} "
+            f"дошли до шага «{step_label}»."
+        )
+
+    return OnboardingDiagnosticsResult(
+        status="ok",
+        registrations=registrations,
+        last_known_step=last_known_step_key,
+        dropoff_summary=dropoff_summary,
+        probable_causes=causes,
+        recommended_actions=actions,
+        notes=notes,
+    )

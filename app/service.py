@@ -98,6 +98,18 @@ class CycleResult:
     # не запускался -- например, Direct не настроен или primary_candidate
     # не относится к категориям, требующим granular-анализа.
     deep_diagnostics: dict | None = None
+    # Симметрично deep_diagnostics, но для product onboarding diagnostics.
+    # dict с ключом "status" ("ok"/"not_available"/"error") -- None означает
+    # "вообще не запускался в этом цикле" (отличается от status="not_available",
+    # которое означает "запускался, но endpoint отсутствует в TruePost").
+    onboarding_diagnostics: dict | None = None
+    # Независимо от того, запускалась ли диагностика автоматически в этом
+    # цикле -- показывать ли кнопки ручного запуска. См. service.
+    # should_show_deep_direct_button/should_show_onboarding_button: кнопки
+    # не привязаны строго к primary_candidate, пользователь может вручную
+    # проверить рекламу/онбординг, даже если сейчас главный сигнал другой.
+    show_deep_direct_button: bool = False
+    show_onboarding_button: bool = False
 
     @property
     def has_notifiable_changes(self) -> bool:
@@ -442,6 +454,62 @@ def should_run_deep_diagnostics(primary_candidate: AlertCandidate | None) -> boo
     if primary_candidate is None:
         return False
     return primary_candidate.category in DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES
+
+
+def should_show_deep_direct_button(direct_configured: bool, metrics_7d) -> bool:
+    """
+    Решает, показывать ли кнопку "Проверить рекламу глубже" -- НЕЗАВИСИМО
+    от того, что сейчас primary alert (по решению: кнопки диагностики не
+    должны зависеть только от primary alert, см. обсуждение с архитектором).
+    Условие показа: Direct настроен И есть хоть какие-то рекламные данные
+    за 7d-окно (clicks не None) -- иначе кнопка вела бы в пустоту.
+    """
+    if not direct_configured:
+        return False
+    if metrics_7d is None:
+        return False
+    return metrics_7d.clicks is not None and metrics_7d.clicks > 0
+
+
+# ---------------------------------------------------------------------------
+# Product Onboarding Diagnostics: триггер, показ кнопки и кэш
+# ---------------------------------------------------------------------------
+
+# Категории алертов, при которых onboarding diagnostics запускается
+# АВТОМАТИЧЕСКИ. Симметрично DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES для
+# Direct, но для продуктовой стороны воронки -- "регистрация без
+# активации" это ровно тот случай, который должен сам себя диагностировать,
+# не просить пользователя "проверить руками".
+ONBOARDING_DIAGNOSTICS_TRIGGER_CATEGORIES = {
+    AlertCategory.signups_no_activation,
+}
+
+# Namespace-префикс для period_key в DeepDiagnosticsCache, чтобы не путать
+# кэш onboarding-диагностики с кэшем Direct deep diagnostics -- они хранятся
+# в одной таблице (project_id + period_key), различить их по period_key
+# проще, чем добавлять отдельное поле diagnostic_type в схему сейчас.
+ONBOARDING_CACHE_PERIOD_KEY = "onboarding_24h"
+
+
+def should_run_onboarding_diagnostics(primary_candidate: AlertCandidate | None) -> bool:
+    """Автозапуск onboarding diagnostics -- симметрично should_run_deep_diagnostics()."""
+    if primary_candidate is None:
+        return False
+    return primary_candidate.category in ONBOARDING_DIAGNOSTICS_TRIGGER_CATEGORIES
+
+
+def should_show_onboarding_button(product_configured: bool, metrics_7d) -> bool:
+    """
+    Решает, показывать ли кнопку "Проверить онбординг" -- НЕЗАВИСИМО от
+    primary alert. Условие: product connector настроен И есть хотя бы
+    одна регистрация за 7d-окно -- иначе нет смысла запускать диагностику
+    пути, по которому никто не прошёл.
+    """
+    if not product_configured:
+        return False
+    if metrics_7d is None:
+        return False
+    return metrics_7d.signup is not None and metrics_7d.signup > 0
 
 
 def get_cached_diagnostics(session: Session, project_id: int, period_key: str) -> DeepDiagnosticsCache | None:

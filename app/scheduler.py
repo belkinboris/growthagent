@@ -23,21 +23,26 @@ from sqlmodel import select
 from app.config import ANALYSIS_WINDOWS_HOURS, get_settings
 from app.connectors import direct as direct_connector
 from app.connectors import metrika as metrika_connector
+from app.connectors import onboarding as onboarding_connector
 from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
-from app.diagnostics import run_diagnostics, get_query_clusters
+from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding
 from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
 from app.service import (
     CycleResult,
+    ONBOARDING_CACHE_PERIOD_KEY,
     check_integration_freshness,
     get_cached_diagnostics,
     process_cycle,
     save_diagnostics_cache,
     save_snapshot,
     should_run_deep_diagnostics,
+    should_run_onboarding_diagnostics,
+    should_show_deep_direct_button,
+    should_show_onboarding_button,
 )
 
 logger = logging.getLogger("growth_agent.scheduler")
@@ -330,6 +335,15 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # достаточный объём кликов для MIN_CLICKS_FOR_DEEP_DIAGNOSTICS.
         settings = get_settings()
         direct_configured = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
+        product_configured = bool(project.base_url and settings.project_internal_api_token)
+        metrics_7d = metrics_by_window.get("7d")
+
+        # Флаги показа кнопок считаются ВСЕГДА, независимо от того, что
+        # сейчас primary_candidate -- по решению: кнопки диагностики не
+        # должны зависеть только от primary alert, пользователь может
+        # вручную проверить рекламу/онбординг при наличии данных.
+        result.show_deep_direct_button = should_show_deep_direct_button(direct_configured, metrics_7d)
+        result.show_onboarding_button = should_show_onboarding_button(product_configured, metrics_7d)
 
         if direct_configured and should_run_deep_diagnostics(result.primary_candidate):
             cached = get_cached_diagnostics(session, project.id, "7d")
@@ -353,6 +367,35 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                         session, project.id, "7d", "alert_triggered", {}, ok=False, error=diag_error,
                     )
                     logger.warning("Deep diagnostics failed: %s", diag_error)
+
+        # Onboarding diagnostics: симметрично Direct, но триггер -- продуктовые
+        # категории (signups_no_activation), не рекламные.
+        if product_configured and should_run_onboarding_diagnostics(result.primary_candidate):
+            cached_onboarding = get_cached_diagnostics(session, project.id, ONBOARDING_CACHE_PERIOD_KEY)
+            if cached_onboarding is not None:
+                result.onboarding_diagnostics = cached_onboarding.result_json
+                result.onboarding_diagnostics["_from_cache"] = True
+            else:
+                onboarding_outcome = await run_onboarding_diagnostics_for_project(project, settings)
+                if onboarding_outcome["status"] == "ok":
+                    onboarding_outcome["result"]["_from_cache"] = False
+                    result.onboarding_diagnostics = onboarding_outcome["result"]
+                    save_diagnostics_cache(
+                        session, project.id, ONBOARDING_CACHE_PERIOD_KEY,
+                        "alert_triggered", result.onboarding_diagnostics,
+                    )
+                elif onboarding_outcome["status"] == "not_available":
+                    # Не кэшируем -- см. force_refresh_onboarding_diagnostics
+                    # docstring. Передаём статус в CycleResult, чтобы
+                    # telegram_bot.py мог честно сообщить "пока недоступна",
+                    # не молчать об этом.
+                    result.onboarding_diagnostics = {"status": "not_available"}
+                else:
+                    save_diagnostics_cache(
+                        session, project.id, ONBOARDING_CACHE_PERIOD_KEY, "alert_triggered",
+                        {}, ok=False, error=onboarding_outcome["error"],
+                    )
+                    logger.warning("Onboarding diagnostics failed: %s", onboarding_outcome["error"])
 
         return result
 
@@ -464,6 +507,78 @@ async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
         save_diagnostics_cache(session, project.id, "7d", "manual_refresh", result_dict)
 
         return {"ok": True, "result": result_dict}
+
+
+# ---------------------------------------------------------------------------
+# Product Onboarding Diagnostics
+# ---------------------------------------------------------------------------
+
+
+async def run_onboarding_diagnostics_for_project(project: Project, settings, period_hours: int = 24) -> dict:
+    """
+    Запускает onboarding diagnostics. Возвращает dict с тем же форматом
+    исхода, что и Direct diagnostics, но с дополнительным учётом
+    NotAvailableError -- endpoint в TruePost может просто не существовать,
+    это не ошибка ("error"), а отдельный статус ("not_available").
+
+    Возвращает {"status": "ok"|"not_available"|"error", "result": {...}|None,
+    "error": "..."|None} -- единый формат для scheduler.py/telegram_bot.py,
+    не бросает исключения наружу.
+    """
+    if not project.base_url or not settings.project_internal_api_token:
+        return {"status": "not_available", "result": None, "error": None}
+
+    try:
+        connector_result = await onboarding_connector.fetch_onboarding_diagnostics(
+            base_url=project.base_url,
+            api_token=settings.project_internal_api_token,
+            period_hours=period_hours,
+        )
+    except onboarding_connector.NotAvailableError:
+        # Ожидаемая ситуация -- endpoint не реализован. Не error.
+        return {"status": "not_available", "result": None, "error": None}
+    except onboarding_connector.OnboardingConnectorError as exc:
+        return {"status": "error", "result": None, "error": str(exc)}
+
+    diag_result = analyze_onboarding(connector_result)
+    return {"status": "ok", "result": diag_result.to_dict(), "error": None}
+
+
+async def force_refresh_onboarding_diagnostics(project_id: int | None = None) -> dict:
+    """
+    Принудительный запуск onboarding diagnostics, минуя кэш -- для кнопки
+    "Проверить онбординг" / команды /check_onboarding. Не падает на
+    отсутствии endpoint -- возвращает status="not_available" с понятным
+    текстом, который telegram_bot.py превращает в сообщение пользователю.
+    """
+    settings = get_settings()
+
+    with get_session() as session:
+        if project_id is not None:
+            project = session.get(Project, project_id)
+        else:
+            project = session.exec(select(Project).where(Project.is_active == True)).first()
+
+        if project is None:
+            return {"status": "error", "result": None, "error": "Активный проект не найден"}
+
+        outcome = await run_onboarding_diagnostics_for_project(project, settings)
+
+        if outcome["status"] == "ok":
+            outcome["result"]["_from_cache"] = False
+            save_diagnostics_cache(
+                session, project.id, ONBOARDING_CACHE_PERIOD_KEY, "manual_refresh", outcome["result"],
+            )
+        elif outcome["status"] == "error":
+            save_diagnostics_cache(
+                session, project.id, ONBOARDING_CACHE_PERIOD_KEY, "manual_refresh",
+                {}, ok=False, error=outcome["error"],
+            )
+        # not_available не кэшируется вообще -- это не "результат с ошибкой",
+        # это "источника пока нет", кэшировать нечего, и кэш только усложнил
+        # бы переключение на "ok", когда endpoint наконец появится в TruePost.
+
+        return outcome
 
 
 # ---------------------------------------------------------------------------
