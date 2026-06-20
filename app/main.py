@@ -118,10 +118,11 @@ async def health():
 @app.get("/status")
 async def status():
     settings = get_settings()
+    from app.config import BUILD_MARKER
     with get_session() as session:
         project = session.exec(select(Project).where(Project.is_active == True)).first()
         if project is None:
-            return JSONResponse(status_code=404, content={"error": "No active project"})
+            return JSONResponse(status_code=404, content={"error": "No active project", "build_marker": BUILD_MARKER})
 
         integrations = session.exec(
             select(Integration).where(Integration.project_id == project.id)
@@ -135,6 +136,7 @@ async def status():
         ).all()
 
         return {
+            "build_marker": BUILD_MARKER,
             "project": {
                 "name": project.name,
                 "type": project.type,

@@ -12,13 +12,14 @@ Telegram-бот.
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from sqlmodel import select
 
 from app.analyzer import AlertCandidate
-from app.config import get_settings, MIN_SIGNUP_CONVERSION_WARN_PERCENT
+from app.config import get_settings, MIN_SIGNUP_CONVERSION_WARN_PERCENT, DEFAULT_QUERY_CLUSTERS
 from app.db import get_session
 from app.models import Alert, AlertStatus, Integration, IntegrationStatus, Project
 from app.rules import NormalizedMetrics
@@ -126,9 +127,12 @@ def _explain_metrics_discrepancy(payload: dict) -> str:
 
 def _explain_low_signup_conversion(payload: dict) -> str:
     return (
-        f"Почему я так решил: за период было {payload.get('clicks', 0)} кликов, "
-        f"регистраций — {payload.get('signup', 0)}, конверсия — {payload.get('conversion_percent', 0)}%.\n\n"
-        f"Это ниже осторожного порога {MIN_SIGNUP_CONVERSION_WARN_PERCENT}%.\n\n"
+        f"Почему я так решил: за период было {payload.get('clicks', 0)} кликов из Директа, "
+        f"регистраций в продукте — {payload.get('signup', 0)}, соотношение — "
+        f"{payload.get('conversion_percent', 0)}%.\n\n"
+        f"Это ниже осторожного порога {MIN_SIGNUP_CONVERSION_WARN_PERCENT}%. "
+        "Атрибуция регистраций к Директу не подтверждена -- цифры приведены за один и тот же "
+        "период, не как прямая причинно-следственная связь.\n\n"
         "Вероятная зона проблемы: реклама → лендинг → регистрация.\n\n"
         "Что проверить:\n"
         "1. Соответствие объявления первому экрану.\n"
@@ -242,11 +246,14 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     есть integration_down -- показывает его. Если вообще ничего notifiable --
     показывает "всё спокойно" с текущими метриками (используется в /run,
     который должен показывать результат даже без новых алертов).
+
+    Деп diagnostics (granular-находки) НЕ включаются в этот текст -- по
+    дизайну двухуровневого вывода они доступны через кнопку "Показать
+    детали"/"Проверить глубже" (см. build_alert_keyboard), а здесь только
+    короткая пометка, что глубокая проверка была сделана и что нашла.
     """
     blocks = []
 
-    # integration_down всегда показываем первым, если есть -- это
-    # инфраструктурная проблема, она важнее любого бизнес-сигнала.
     new_or_escalated_integration = [
         c for c in result.integration_down_changes
         if c.change_type in (AlertChangeType.new, AlertChangeType.escalated)
@@ -264,14 +271,16 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         blocks.append(format_alert_block(result.primary_candidate, project_name, is_primary=True))
         for sec in result.secondary:
             blocks.append(format_alert_block(sec, project_name, is_primary=False))
+
+        deep_summary = _format_deep_diagnostics_teaser(result.deep_diagnostics)
+        if deep_summary:
+            blocks.append(deep_summary)
     elif not blocks:
         blocks.append(
             f"Growth Agent — watch-only\nПроект: {project_name}\n\n"
             "Главный сигнал: пока всё спокойно, явных проблем не найдено."
         )
 
-    # Метрики -- внизу, по самому длинному доступному окну (7d), как
-    # договорились: метрики не главное, главное -- вывод.
     metrics_7d = result.metrics_by_window.get("7d")
     if metrics_7d:
         blocks.append(f"Метрики (7д):\n{_format_metrics_line(metrics_7d)}")
@@ -279,13 +288,215 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     return "\n\n".join(blocks)
 
 
+def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None:
+    """
+    Короткая пометка про deep diagnostics для основного сообщения --
+    НЕ полная детализация (та идёт по кнопке, см. format_deep_diagnostics_details).
+    Возвращает None, если diagnostics не запускался вовсе -- тогда в
+    основном сообщении про него вообще не упоминается, чтобы не плодить
+    лишние строки для тех, у кого Direct не настроен.
+    """
+    if deep_diagnostics is None:
+        return None
+
+    if deep_diagnostics.get("insufficient_data"):
+        clicks = deep_diagnostics.get("total_clicks", 0)
+        return (
+            f"Глубокая проверка рекламы: данных пока мало ({clicks} кликов за период). "
+            "Можно запустить вручную, но вывод будет предварительным."
+        )
+
+    main_finding = deep_diagnostics.get("main_finding")
+    if main_finding:
+        return f"Проверил группы объявлений и поисковые запросы: {main_finding['title'].lower()}. Детали — по кнопке ниже."
+
+    return "Проверил группы объявлений и поисковые запросы: явных проблем не нашёл."
+
+
+def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -> str:
+    """
+    Детальная диагностика по кнопке "Показать детали"/"Проверить глубже".
+    Формат по задаче: главная находка, основные запросы, вероятная
+    причина, что сделать, уровень уверенности.
+
+    attribution_status формулируется явно текстом, не цифрой -- агент
+    никогда не должен писать "клики дали регистрации" как причинно-
+    следственную связь, если атрибуция не подтверждена (almost всегда
+    not_available в v1, см. scheduler.run_deep_diagnostics_for_project).
+    """
+    attribution_ru = {
+        "confirmed": "подтверждена",
+        "partial": "частичная",
+        "not_available": "не подтверждена",
+    }
+
+    lines = [
+        "Growth Agent — рекламная диагностика",
+        f"Проект: {project_name}",
+        "",
+    ]
+
+    if deep_diagnostics.get("insufficient_data"):
+        clicks = deep_diagnostics.get("total_clicks", 0)
+        lines.append(
+            f"Данных пока мало для глубокой диагностики: {clicks} кликов за 7 дней. "
+            "Вывод будет предварительным, если запустить проверку сейчас."
+        )
+        return "\n".join(lines)
+
+    main_finding = deep_diagnostics.get("main_finding")
+    if main_finding is None:
+        lines.append("Проверил группы объявлений и поисковые запросы — явных проблем не нашёл.")
+        attribution_status = deep_diagnostics.get("attribution_status", "not_available")
+        lines.append(f"\nАтрибуция регистраций к Директу: {attribution_ru.get(attribution_status, attribution_status)}.")
+        return "\n".join(lines)
+
+    lines.append(f"Главная находка:\n{main_finding['detail']}")
+
+    top_queries = main_finding.get("payload", {}).get("top_queries")
+    if top_queries:
+        lines.append("\nОсновные запросы:")
+        lines.extend(f"— {q}" for q in top_queries)
+
+    if main_finding.get("recommended_action"):
+        lines.append(f"\nЧто сделать:\n{main_finding['recommended_action']}")
+
+    lines.append("\nЛендинг и рекламу одновременно менять не стоит — сначала найти проблемный сегмент.")
+
+    attribution_status = deep_diagnostics.get("attribution_status", "not_available")
+    lines.append(f"\nАтрибуция регистраций к Директу: {attribution_ru.get(attribution_status, attribution_status)}.")
+    lines.append(f"Уровень уверенности: {main_finding.get('confidence', 'medium')}.")
+
+    good_findings = deep_diagnostics.get("good_findings", [])
+    if good_findings:
+        lines.append("\nЕсть и хорошие сигналы:")
+        for gf in good_findings[:2]:
+            lines.append(f"— {gf['detail']}")
+
+    return "\n".join(lines)
+
+
+def format_negative_keywords_suggestion(deep_diagnostics: dict, query_clusters: Optional[dict] = None) -> str:
+    """
+    "Подготовить минус-фразы" -- по задаче, это MVP-заглушка: формирует
+    список ПРЕДЛОЖЕННЫХ кандидатов в минус-фразы из top_queries найденного
+    irrelevant-кластера, не применяет их автоматически в Директе.
+
+    Защита от слишком широких минус-фраз (см. замечание архитектора):
+    - предлагаются МНОГОСЛОВНЫЕ фразы (полные запросы или их значимые
+      part), не отдельные слова -- одиночное слово "текст" или "генерация"
+      может убить запросы вроде "генерация постов для Telegram", которые
+      релевантны продукту;
+    - явная проверка: ни один кандидат не должен пересекаться с include-
+      термином good-кластеров (white-list) -- если слово "telegram" есть
+      и в плохом, и в хорошем кластере, оно никогда не попадёт в минус-фразы;
+    - стоп-слова (предлоги, частицы) исключаются, как и слова короче 4
+      символов -- они либо бесполезны как минус-фразы, либо слишком общие.
+    """
+    main_finding = deep_diagnostics.get("main_finding")
+    if main_finding is None or main_finding.get("finding_type") != "irrelevant_query_cluster":
+        return "Нет подходящей находки для подготовки минус-фраз — нужен сигнал об нерелевантном кластере запросов."
+
+    top_queries = main_finding.get("payload", {}).get("top_queries", [])
+    if not top_queries:
+        return "Запросы для минус-фраз не найдены в этой находке."
+
+    query_clusters = query_clusters or DEFAULT_QUERY_CLUSTERS
+
+    # White-list: все include-термины всех good-кластеров. Ни один
+    # кандидат в минус-фразу не должен содержать ничего из этого списка
+    # (даже как подстроку), иначе минус-фраза рискует обрезать релевантный
+    # трафик вместе с нерелевантным.
+    good_terms = set()
+    for cluster_def in query_clusters.get("good", {}).values():
+        good_terms |= {t.lower() for t in cluster_def.get("include", [])}
+
+    _STOP_WORDS = {"для", "как", "что", "это", "или", "если", "при", "без", "под", "над"}
+
+    def _is_safe_candidate(phrase: str) -> bool:
+        phrase_lower = phrase.lower()
+        if any(good_term in phrase_lower for good_term in good_terms):
+            return False  # пересекается с релевантным intent -- не предлагаем
+        if phrase_lower in _STOP_WORDS:
+            return False
+        if len(phrase_lower) < 4:
+            return False
+        return True
+
+    # Кандидаты -- ПОЛНЫЕ запросы (не отдельные слова) плюс отдельные
+    # значимые слова, которые сами по себе безопасны (прошли white-list).
+    # Полные запросы как минус-фразы безопаснее единичных слов почти всегда,
+    # поэтому идут первыми и это основной рекомендуемый вариант.
+    full_query_candidates = [q for q in top_queries if _is_safe_candidate(q)]
+
+    single_word_candidates = []
+    seen_words = set()
+    for query in top_queries:
+        for word in query.lower().split():
+            word = word.strip(".,!?")
+            if word in seen_words:
+                continue
+            if _is_safe_candidate(word):
+                seen_words.add(word)
+                single_word_candidates.append(word)
+
+    lines = ["Кандидаты в минус-фразы (черновик для ручной проверки):", ""]
+
+    if full_query_candidates:
+        lines.append("Рекомендуется (целые фразы, безопаснее):")
+        lines.extend(f"-{q}" for q in full_query_candidates)
+        lines.append("")
+
+    if single_word_candidates:
+        lines.append("Можно рассмотреть отдельно (проверьте, не слишком ли широко):")
+        lines.extend(f"-{w}" for w in single_word_candidates)
+        lines.append("")
+
+    if not full_query_candidates and not single_word_candidates:
+        lines.append("Не нашлось безопасных кандидатов — все слова из найденных запросов пересекаются с релевантными.")
+        lines.append("")
+
+    lines.append(
+        "Это черновик, требующий проверки человеком. Минус-фразы НЕ применены "
+        "автоматически — добавьте вручную в интерфейсе Директа, если согласны. "
+        "Слова, совпадающие с релевантными запросами продукта, уже исключены из списка."
+    )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Кнопки
 # ---------------------------------------------------------------------------
 
 
-def build_alert_keyboard(alert_id: int) -> InlineKeyboardMarkup:
-    buttons = [
+def _get_deep_diagnostics_for_keyboard(session, project_id: int) -> dict | None:
+    """
+    Возвращает result_json последнего свежего deep diagnostics кэша для
+    проекта, если он есть -- используется при построении клавиатуры, чтобы
+    решить, показывать "Показать детали" (уже есть что показать) или
+    "Проверить глубже" (force refresh). Кэш привязан к project_id +
+    period_key, не к конкретному alert_id -- в v1 один активный проект,
+    поэтому "последний свежий кэш проекта" эквивалентно "кэш для текущего
+    primary alert" на практике, разделять их не нужно.
+    """
+    from app.service import get_cached_diagnostics
+    cached = get_cached_diagnostics(session, project_id, "7d")
+    return cached.result_json if cached else None
+
+
+def build_alert_keyboard(alert_id: int, has_deep_diagnostics: bool = False, deep_diagnostics_available: bool = False) -> InlineKeyboardMarkup:
+    """
+    has_deep_diagnostics -- diagnostics уже запускался в этом цикле
+    (автоматически или из кэша), есть что показать по кнопке "Показать
+    детали". deep_diagnostics_available -- Direct настроен и в принципе
+    может быть запущен по требованию, даже если в этом цикле он не
+    запускался (например, alert был не той категории, что триггерит auto-run) --
+    тогда показываем "Проверить глубже" как force refresh.
+
+    Обе кнопки не показываются одновременно: если диагностика уже есть --
+    "Показать детали"; если нет, но в принципе доступна -- "Проверить глубже".
+    """
+    rows = [
         [
             InlineKeyboardButton("Понял", callback_data=f"ack:{alert_id}"),
             InlineKeyboardButton("Отложить", callback_data=f"snooze:{alert_id}"),
@@ -295,7 +506,32 @@ def build_alert_keyboard(alert_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Создай задачу", callback_data=f"task:{alert_id}"),
         ],
     ]
-    return InlineKeyboardMarkup(buttons)
+
+    if has_deep_diagnostics:
+        rows.append([InlineKeyboardButton("Показать детали", callback_data=f"show_details:{alert_id}")])
+    elif deep_diagnostics_available:
+        rows.append([InlineKeyboardButton("Проверить глубже", callback_data=f"deep_check:{alert_id}")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def build_negative_keywords_keyboard(alert_id: int, deep_diagnostics: dict) -> InlineKeyboardMarkup | None:
+    """
+    Кнопки для детальной диагностики (формат "B" из задачи): "Создать
+    задачу", "Подготовить минус-фразы", "Отклонить". "Подготовить минус-
+    фразы" показывается только если главная находка -- irrelevant_query_cluster,
+    иначе кнопка бессмысленна (нет запросов, из которых готовить минус-фразы).
+    """
+    main_finding = deep_diagnostics.get("main_finding")
+
+    rows = [[InlineKeyboardButton("Создать задачу", callback_data=f"task:{alert_id}")]]
+
+    if main_finding and main_finding.get("finding_type") == "irrelevant_query_cluster":
+        rows[0].append(InlineKeyboardButton("Подготовить минус-фразы", callback_data=f"prepare_negative_keywords:{alert_id}"))
+
+    rows.append([InlineKeyboardButton("Отклонить", callback_data=f"ack:{alert_id}")])
+
+    return InlineKeyboardMarkup(rows)
 
 
 async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -340,6 +576,56 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             session.commit()
             await query.edit_message_text(f"{query.message.text}\n\n📌 Зафиксировано как задача.")
 
+        elif action == "show_details":
+            # Кэш уже есть (иначе кнопка была бы "Проверить глубже", не
+            # "Показать детали") -- читаем его, не запускаем заново.
+            deep_diagnostics = _get_deep_diagnostics_for_keyboard(session, alert.project_id)
+            if deep_diagnostics is None:
+                await query.message.reply_text(
+                    "Детали не найдены (кэш устарел между нажатиями). Попробуйте /run заново."
+                )
+            else:
+                project = session.get(Project, alert.project_id)
+                project_name = project.name if project else "Проект"
+                details_text = format_deep_diagnostics_details(deep_diagnostics, project_name)
+                keyboard = build_negative_keywords_keyboard(alert.id, deep_diagnostics)
+                await query.message.reply_text(details_text, reply_markup=keyboard)
+
+        elif action == "deep_check":
+            # Force refresh -- пользователь явно попросил, минуя кэш и
+            # триггер-условие. Может занять до 30+ секунд (granular-отчёты
+            # Директа), предупреждаем заранее.
+            await query.message.reply_text("Проверяю глубже: смотрю группы объявлений и поисковые запросы...")
+            from app.scheduler import force_refresh_deep_diagnostics
+            refresh_result = await force_refresh_deep_diagnostics(alert.project_id)
+
+            if not refresh_result["ok"]:
+                await query.message.reply_text(
+                    f"Не удалось выполнить глубокую проверку: {refresh_result['error']}\n\n"
+                    "Можно проверить позже — light-диагностика продолжает работать как обычно."
+                )
+            else:
+                project = session.get(Project, alert.project_id)
+                project_name = project.name if project else "Проект"
+                details_text = format_deep_diagnostics_details(refresh_result["result"], project_name)
+                keyboard = build_negative_keywords_keyboard(alert.id, refresh_result["result"])
+                await query.message.reply_text(details_text, reply_markup=keyboard)
+
+        elif action == "prepare_negative_keywords":
+            deep_diagnostics = _get_deep_diagnostics_for_keyboard(session, alert.project_id)
+            if deep_diagnostics is None:
+                await query.message.reply_text("Нет данных для подготовки минус-фраз — запустите проверку глубже сначала.")
+            else:
+                from app.diagnostics import get_query_clusters
+                project = session.get(Project, alert.project_id)
+                # Используем тот же словарь кластеров, что и при самой
+                # диагностике (per-project settings с fallback на дефолт) --
+                # иначе white-list защита в минус-фразах может разойтись с
+                # тем, что реально считалось "хорошим" при поиске находки.
+                project_query_clusters = get_query_clusters(project.settings_json if project else {})
+                suggestion_text = format_negative_keywords_suggestion(deep_diagnostics, project_query_clusters)
+                await query.message.reply_text(suggestion_text)
+
         else:
             await query.edit_message_text("Неизвестное действие.")
 
@@ -354,8 +640,10 @@ def _get_active_project(session) -> Project | None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from app.config import BUILD_MARKER
     await update.message.reply_text(
-        "Growth Agent — watch-only.\n\n"
+        "Growth Agent — watch-only.\n"
+        f"Версия: {BUILD_MARKER}\n\n"
         "Команды:\n"
         "/status — состояние проекта\n"
         "/run — запустить проверку вручную\n"
@@ -364,7 +652,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/mode — текущий режим\n"
         "/settings — основные настройки\n"
         "/test_metrika — проверить подключение к Яндекс.Метрике\n"
-        "/test_direct — проверить подключение к Яндекс.Директу"
+        "/test_direct — проверить подключение к Яндекс.Директу\n"
+        "/deep_direct — глубокая диагностика Директа (группы, запросы) независимо от текущего alert"
     )
 
 
@@ -427,7 +716,16 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             alert = session.exec(
                 select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
             ).first()
-            keyboard = build_alert_keyboard(alert.id) if alert else None
+            if alert:
+                settings = get_settings()
+                direct_available = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
+                keyboard = build_alert_keyboard(
+                    alert.id,
+                    has_deep_diagnostics=result.deep_diagnostics is not None,
+                    deep_diagnostics_available=direct_available,
+                )
+            else:
+                keyboard = None
         await update.message.reply_text(text, reply_markup=keyboard)
     else:
         await update.message.reply_text(text)
@@ -492,6 +790,11 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Проверка подключения к Яндекс.Метрике без полного цикла -- использует
     test_metrika_connection() из connectors/metrika.py. Полезно при первой
     настройке live-токенов, чтобы не ждать полного /run для диагностики.
+
+    Запрашивает данные за текущие календарные сутки (UTC), не за скользящее
+    окно "последние 24 часа" -- Reports API Метрики работает по датам
+    (DateFrom/DateTo), не по точным временным меткам. Если сейчас 23:00 UTC,
+    отчёт покроет только последний час суток, не предыдущие 24 часа.
     """
     from app.connectors.metrika import test_metrika_connection
 
@@ -508,7 +811,7 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         goals_text = "\n".join(f"  {k}: {v}" for k, v in result["goals_found"].items())
         await update.message.reply_text(
             f"Метрика подключена.\n\n"
-            f"Визиты (24ч): {result['traffic']}\n"
+            f"Визиты (сегодня): {result['traffic']}\n"
             f"Пользователи: {result['users']}\n"
             f"Sampled: {result['sampled']}\n"
             f"Data lag: {result['data_lag']} сек\n\n"
@@ -520,6 +823,65 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Этап: {result['stage']}\n"
             f"Ошибка: {result['error']}"
         )
+
+
+async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Принудительный запуск Direct deep diagnostics НЕЗАВИСИМО от primary
+    alert. Нужна, потому что обычная кнопка "Проверить глубже" привязана
+    к конкретному alert_id и появляется только если этот alert относится к
+    триггерящей категории (DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES) -- если
+    сейчас главный сигнал продуктовый (например, "Регистрации без
+    активации"), кнопки не будет вообще, хотя Direct может быть подключён
+    и его стоит проверить отдельно для теста/диагностики.
+
+    Read-only, как и весь Direct-анализ: только granular-отчёты (ad group,
+    search query) и поиск находок, никаких изменений в кампаниях.
+    """
+    settings = get_settings()
+
+    if not (settings.effective_direct_oauth_token and settings.direct_client_login):
+        await update.message.reply_text(
+            "Директ не настроен (нет OAuth-токена или DIRECT_CLIENT_LOGIN) -- "
+            "глубокая диагностика недоступна."
+        )
+        return
+
+    await update.message.reply_text(
+        "Запускаю глубокую диагностику Директа (группы объявлений, поисковые запросы)...\n"
+        "Может занять до 30 секунд."
+    )
+
+    from app.scheduler import force_refresh_deep_diagnostics
+    refresh_result = await force_refresh_deep_diagnostics()
+
+    if not refresh_result["ok"]:
+        await update.message.reply_text(f"Не удалось выполнить глубокую проверку: {refresh_result['error']}")
+        return
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        project_name = project.name if project else "Проект"
+
+    details_text = format_deep_diagnostics_details(refresh_result["result"], project_name)
+
+    # Кнопка "Подготовить минус-фразы" имеет смысл и здесь, если находка --
+    # irrelevant_query_cluster, поэтому используем тот же конструктор
+    # клавиатуры, что и для обычной детальной диагностики. alert_id здесь
+    # не привязан к реальному Alert -- ставим 0 как заглушку, потому что
+    # "Создать задачу"/"Отклонить" в контексте ручной диагностики без
+    # привязки к конкретному алерту неприменимы так же буквально; кнопка
+    # минус-фраз использует project-контекст из кэша, не alert_id напрямую.
+    if refresh_result["result"].get("main_finding", {}).get("finding_type") == "irrelevant_query_cluster":
+        from app.diagnostics import get_query_clusters
+        with get_session() as session:
+            project = _get_active_project(session)
+            project_query_clusters = get_query_clusters(project.settings_json if project else {})
+        suggestion_text = format_negative_keywords_suggestion(refresh_result["result"], project_query_clusters)
+        await update.message.reply_text(details_text)
+        await update.message.reply_text(suggestion_text)
+    else:
+        await update.message.reply_text(details_text)
 
 
 async def cmd_test_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -542,7 +904,7 @@ async def cmd_test_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if result["ok"]:
         await update.message.reply_text(
             f"Директ подключен.\n\n"
-            f"Расход (24ч): {result['spend']} ₽\n"
+            f"Расход (сегодня): {result['spend']} ₽\n"
             f"Клики: {result['clicks']}\n"
             f"Показы: {result['impressions']}\n"
             f"Кампаний в отчёте: {result['campaigns_count']}"
@@ -655,7 +1017,12 @@ async def send_cycle_notification(app: Application, result: CycleResult, project
                 select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
             ).first()
             if alert:
-                keyboard = build_alert_keyboard(alert.id)
+                direct_available = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
+                keyboard = build_alert_keyboard(
+                    alert.id,
+                    has_deep_diagnostics=result.deep_diagnostics is not None,
+                    deep_diagnostics_available=direct_available,
+                )
                 if alert.status == AlertStatus.open:
                     alert.status = AlertStatus.sent
                     alert.sent_at = datetime.now(timezone.utc)
@@ -691,6 +1058,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("debug_alert", cmd_debug_alert))
     app.add_handler(CommandHandler("test_metrika", cmd_test_metrika))
     app.add_handler(CommandHandler("test_direct", cmd_test_direct))
+    app.add_handler(CommandHandler("deep_direct", cmd_deep_direct))
     app.add_handler(CallbackQueryHandler(on_button_press))
 
     return app
