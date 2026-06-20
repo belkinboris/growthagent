@@ -20,13 +20,14 @@ from enum import Enum
 from sqlmodel import Session, select
 
 from app.analyzer import AlertCandidate, pick_primary_candidate, secondary_candidates
-from app.config import get_settings
+from app.config import get_settings, DEEP_DIAGNOSTICS_CACHE_TTL_HOURS
 from app.models import (
     Alert,
     AlertCategory,
     AlertSeverity,
     AlertStatus,
     ConfidenceLevel,
+    DeepDiagnosticsCache,
     Integration,
     IntegrationStatus,
     IntegrationType,
@@ -92,6 +93,11 @@ class CycleResult:
     primary_candidate: AlertCandidate | None = None
     secondary: list[AlertCandidate] = field(default_factory=list)
     metrics_by_window: dict = field(default_factory=dict)
+    # Заполняется scheduler.py, если deep diagnostics был запущен в этом
+    # цикле (автоматически по триггеру или из кэша). None, если diagnostics
+    # не запускался -- например, Direct не настроен или primary_candidate
+    # не относится к категориям, требующим granular-анализа.
+    deep_diagnostics: dict | None = None
 
     @property
     def has_notifiable_changes(self) -> bool:
@@ -408,3 +414,98 @@ def process_cycle(
         secondary=secondary,
         metrics_by_window=metrics_by_window,
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct Deep Diagnostics: триггер и кэш
+# ---------------------------------------------------------------------------
+
+# Категории алертов, при которых deep diagnostics имеет смысл запускать
+# автоматически -- это все категории, где причина может лежать в рекламе
+# (трафик без конверсий, низкая конверсия). Категории про продукт
+# (signups_no_activation, payments_started_no_success и т.п.) не запускают
+# deep diagnostics -- там проблема не в рекламе, а в продукте, granular
+# Direct-анализ не поможет её локализовать.
+DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES = {
+    AlertCategory.traffic_no_signups,
+}
+
+
+def should_run_deep_diagnostics(primary_candidate: AlertCandidate | None) -> bool:
+    """
+    Решает, есть ли основание для автоматического запуска deep diagnostics
+    в этом цикле. Не проверяет наличие кэша и не проверяет, настроен ли
+    Direct -- это отдельные проверки в scheduler.py (там же, где известно,
+    доступен ли connector). Эта функция отвечает только на вопрос "алерт
+    такой, что deep diagnostics в принципе релевантен".
+    """
+    if primary_candidate is None:
+        return False
+    return primary_candidate.category in DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES
+
+
+def get_cached_diagnostics(session: Session, project_id: int, period_key: str) -> DeepDiagnosticsCache | None:
+    """
+    Возвращает свежую (не просроченную) запись кэша для данного периода,
+    если она есть. Свежесть определяется expires_at, не TTL здесь заново --
+    expires_at вычисляется один раз при сохранении (save_diagnostics_cache),
+    чтобы логика "что считается свежим" жила в одном месте.
+    """
+    cached = session.exec(
+        select(DeepDiagnosticsCache)
+        .where(
+            DeepDiagnosticsCache.project_id == project_id,
+            DeepDiagnosticsCache.period_key == period_key,
+            DeepDiagnosticsCache.ok == True,  # noqa: E712
+        )
+        .order_by(DeepDiagnosticsCache.created_at.desc())
+    ).first()
+
+    if cached is None:
+        return None
+
+    if cached.expires_at:
+        expires_at = cached.expires_at
+        # SQLite не хранит timezone -- при чтении обратно datetime приходит
+        # naive, даже если при записи был aware (utcnow()). Приводим к aware
+        # UTC перед сравнением, иначе TypeError на сравнении naive vs aware.
+        # Для Postgres это no-op (там tzinfo сохраняется), для SQLite это
+        # необходимое исправление.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < utcnow():
+            return None  # просрочен -- как будто кэша нет
+
+    return cached
+
+
+def save_diagnostics_cache(
+    session: Session,
+    project_id: int,
+    period_key: str,
+    trigger_reason: str,
+    result_json: dict,
+    ok: bool = True,
+    error: str | None = None,
+    ttl_hours: int = DEEP_DIAGNOSTICS_CACHE_TTL_HOURS,
+) -> DeepDiagnosticsCache:
+    """
+    Сохраняет результат deep diagnostics (или ошибку) в кэш. ok=False
+    используется, когда сам запуск diagnostics не удался (например, Direct
+    API вернул ошибку при granular-запросе) -- такая запись НЕ считается
+    валидным кэшем в get_cached_diagnostics (фильтр ok == True), поэтому
+    следующий цикл попробует снова, не застревая на закэшированной ошибке.
+    """
+    cache_entry = DeepDiagnosticsCache(
+        project_id=project_id,
+        period_key=period_key,
+        trigger_reason=trigger_reason,
+        result_json=result_json,
+        ok=ok,
+        error=error,
+        expires_at=utcnow() + timedelta(hours=ttl_hours),
+    )
+    session.add(cache_entry)
+    session.commit()
+    session.refresh(cache_entry)
+    return cache_entry

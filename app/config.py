@@ -53,6 +53,61 @@ ANALYSIS_WINDOWS_HOURS = {
 MIN_CLICKS_FOR_CONVERSION_CHECK = 100
 MIN_SIGNUP_CONVERSION_WARN_PERCENT = 2.0
 
+# Сколько часов считать deep diagnostics кэш свежим, чтобы не дёргать
+# granular-отчёты Директа на каждый /run. Per-project override -- через
+# Project.settings_json["deep_diagnostics_cache_ttl_hours"], если когда-то
+# понадобится другой ритм для другого проекта.
+DEEP_DIAGNOSTICS_CACHE_TTL_HOURS = 6
+
+# Минимальный объём данных, при котором deep diagnostics даёт осмысленный
+# результат, а не шум. Ниже этого порога агент пишет "данных мало" и не
+# запускает granular-анализ автоматически (но кнопка "Проверить глубже"
+# всё равно доступна как принудительный запуск с явной пометкой "предварительно").
+MIN_CLICKS_FOR_DEEP_DIAGNOSTICS = 30
+
+# Словарь кластеров поисковых запросов по умолчанию -- используется, если
+# в Project.settings_json["query_clusters"] ничего не задано. Per-project
+# словарь почти всегда нужен (у каждого продукта свой релевантный intent),
+# но дефолт даёт системе работать "из коробки" для АвтоПоста без
+# дополнительной настройки -- и не даёт коду упасть, если settings_json
+# пустой или повреждён (см. diagnostics.py: graceful fallback).
+DEFAULT_QUERY_CLUSTERS = {
+    "good": {
+        "telegram_autoposting": {
+            "label": "Telegram / автопостинг",
+            "include": [
+                "автопостинг", "автопост", "telegram", "телеграм",
+                "посты для телеграм", "контент для телеграм",
+                "контент план телеграм", "бот для постинга",
+            ],
+            "exclude": [],
+        },
+        "smm_content": {
+            "label": "SMM / контент",
+            "include": [
+                "контент план", "ведение канала", "посты для канала",
+                "контент для канала",
+            ],
+            "exclude": [],
+        },
+    },
+    "irrelevant": {
+        "generic_text_generation": {
+            "label": "Общая генерация текста",
+            "include": [
+                "генерация текста", "сгенерировать текст", "нейросеть текст",
+                "написать текст", "переписать текст",
+            ],
+            "exclude": ["telegram", "телеграм", "канал"],
+        },
+        "student_homework": {
+            "label": "Учёба / рефераты / сочинения",
+            "include": ["реферат", "сочинение", "эссе", "курсовая", "домашнее задание"],
+            "exclude": [],
+        },
+    },
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

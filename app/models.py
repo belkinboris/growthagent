@@ -242,3 +242,81 @@ class AgentRun(SQLModel, table=True):
     ok: bool = True
     errors_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Direct Deep Diagnostics
+# ---------------------------------------------------------------------------
+
+
+class AttributionStatus(str, Enum):
+    """
+    Насколько достоверно регистрации/события продукта связаны с трафиком
+    из Директа. В v1 у нас нет UTM-сквозной аналитики между Direct и
+    TruePost (TruePost отдаёт просто "N регистраций за период", без
+    привязки к источнику трафика) -- поэтому почти всегда not_available.
+    Это поле существует, чтобы агент НИКОГДА не формулировал "клики дали
+    регистрации" как причинно-следственную связь, если она не подтверждена.
+    """
+    confirmed = "confirmed"          # есть сквозная атрибуция (UTM -> событие)
+    partial = "partial"              # есть косвенная связь (например, по времени)
+    not_available = "not_available"  # регистрации считаются только как общее число за период
+
+
+class DirectDimensionType(str, Enum):
+    campaign = "campaign"
+    ad_group = "ad_group"
+    query = "query"
+    keyword = "keyword"
+
+
+class DirectGranularSnapshot(SQLModel, table=True):
+    """
+    Универсальная модель для granular-данных Директа (campaign/ad_group/
+    query/keyword level). Одна таблица на все уровни вместо трёх отдельных
+    моделей -- dimension_type различает уровень, parent_dimension_id
+    связывает иерархию (ad_group знает свой campaign_id, query знает свой
+    ad_group_id) без отдельных foreign key на разные родительские таблицы.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+
+    period_key: str  # "24h" | "7d" | "14d" | "30d"
+    period_start: datetime
+    period_end: datetime
+
+    dimension_type: DirectDimensionType
+    dimension_id: str          # campaign_id, ad_group_id, query text, или keyword text
+    dimension_name: Optional[str] = None   # campaign_name, ad_group_name -- если доступно
+    parent_dimension_id: Optional[str] = None  # campaign_id для ad_group, ad_group_id для query
+
+    metrics_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # ожидаемые ключи внутри metrics_json: impressions, clicks, cost, ctr,
+    # cpc, conversions (опционально, если Direct API их отдаёт для проекта)
+
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class DeepDiagnosticsCache(SQLModel, table=True):
+    """
+    Кэш результата deep diagnostics, чтобы не дёргать granular-отчёты
+    Директа на каждый /run -- только когда нужно (см. service.py:
+    should_run_deep_diagnostics()). created_at + expires_at определяют,
+    считается ли кэш свежим; trigger_reason фиксирует, почему diagnostics
+    запускался (alert/manual/retry), для дебага и истории.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+
+    period_key: str
+    trigger_reason: str  # "alert_triggered" | "manual_refresh" | "insufficient_data_retry"
+    result_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # result_json хранит сериализованный DiagnosticsResult (см. diagnostics.py)
+
+    ok: bool = True
+    error: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=utcnow)
+    expires_at: Optional[datetime] = None

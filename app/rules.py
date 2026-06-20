@@ -336,8 +336,9 @@ def make_low_signup_conversion_rule(
         required_sources=("direct", "product"),
         condition=condition,
         hypothesis_template=(
-            "{clicks} кликов дали {signup} регистраций -- конверсия {conversion_percent}%, "
-            "это ниже ожидаемого уровня."
+            "За тот же период было {clicks} кликов из Директа и {signup} регистраций "
+            "в продукте -- соотношение {conversion_percent}%, ниже ожидаемого уровня. "
+            "Атрибуция регистраций к Директу не подтверждена, поэтому вывод предварительный."
         ),
         check_action_template=(
             "Проверить соответствие рекламного объявления, первого экрана лендинга "

@@ -26,10 +26,19 @@ from app.connectors import metrika as metrika_connector
 from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
-from app.models import Integration, IntegrationStatus, IntegrationType, Project
+from app.diagnostics import run_diagnostics, get_query_clusters
+from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
-from app.service import CycleResult, check_integration_freshness, process_cycle, save_snapshot
+from app.service import (
+    CycleResult,
+    check_integration_freshness,
+    get_cached_diagnostics,
+    process_cycle,
+    save_diagnostics_cache,
+    save_snapshot,
+    should_run_deep_diagnostics,
+)
 
 logger = logging.getLogger("growth_agent.scheduler")
 
@@ -314,12 +323,147 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         )
         result.integration_down_changes = integration_changes
 
+        # Deep diagnostics: гибридный режим. Автоматически запускается
+        # только если (а) есть триггерящий алерт, (б) Direct настроен,
+        # (в) нет свежего кэша на это окно. Использует 7d окно -- оно даёт
+        # больше данных для granular-анализа, чем 3h/24h, и обычно содержит
+        # достаточный объём кликов для MIN_CLICKS_FOR_DEEP_DIAGNOSTICS.
+        settings = get_settings()
+        direct_configured = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
+
+        if direct_configured and should_run_deep_diagnostics(result.primary_candidate):
+            cached = get_cached_diagnostics(session, project.id, "7d")
+            if cached is not None:
+                result.deep_diagnostics = cached.result_json
+                result.deep_diagnostics["_from_cache"] = True
+            else:
+                diag_result, diag_error = await run_deep_diagnostics_for_project(
+                    project, settings, period_hours=ANALYSIS_WINDOWS_HOURS["7d"],
+                )
+                if diag_result is not None:
+                    result.deep_diagnostics = diag_result.to_dict()
+                    result.deep_diagnostics["_from_cache"] = False
+                    save_diagnostics_cache(session, project.id, "7d", "alert_triggered", result.deep_diagnostics)
+                else:
+                    # Запуск не удался (ошибка Direct API на granular-запросе) --
+                    # не падаем, не показываем deep diagnostics в этом цикле,
+                    # сохраняем ok=False, чтобы не застрять на этой ошибке как
+                    # на валидном кэше (см. service.save_diagnostics_cache).
+                    save_diagnostics_cache(
+                        session, project.id, "7d", "alert_triggered", {}, ok=False, error=diag_error,
+                    )
+                    logger.warning("Deep diagnostics failed: %s", diag_error)
+
         return result
+
+
+async def run_deep_diagnostics_for_project(project: Project, settings, period_hours: int):
+    """
+    Запускает granular Direct отчёты (ad_group + search_query) и
+    diagnostics.run_diagnostics(). Возвращает (DiagnosticsResult, None) при
+    успехе или (None, error_message) при сбое -- не бросает исключение
+    наружу, чтобы вызывающий код (run_cycle_once или Telegram-кнопка force
+    refresh) мог решить, что делать с ошибкой, не оборачивая каждый вызов
+    в try/except по отдельности.
+    """
+    campaign_ids = settings.direct_campaign_ids_list
+
+    if not campaign_ids:
+        # В отличие от fetch_metrics() (campaign-level summary), где "без
+        # фильтра -- видим весь аккаунт" безопасно как агрегат, для deep
+        # diagnostics это рискованнее: если в Director-аккаунте есть другие
+        # кампании, не относящиеся к этому проекту, granular-анализ начнёт
+        # искать "проблемные группы" и "нерелевантные запросы" в чужой
+        # рекламе и присылать по ней находки. Логируем явно, чтобы это не
+        # прошло незаметно при первом включении на новом аккаунте.
+        logger.warning(
+            "DIRECT_CAMPAIGN_IDS not set -- deep diagnostics will analyze ALL campaigns "
+            "in the Direct account, not just this project. Set DIRECT_CAMPAIGN_IDS to scope "
+            "the analysis if the account has campaigns for other projects."
+        )
+
+    try:
+        ad_group_report = await direct_connector.fetch_ad_group_report(
+            oauth_token=settings.effective_direct_oauth_token,
+            client_login=settings.direct_client_login,
+            campaign_ids=campaign_ids,
+            period_hours=period_hours,
+            sandbox=settings.direct_sandbox,
+        )
+        query_report = await direct_connector.fetch_search_query_report(
+            oauth_token=settings.effective_direct_oauth_token,
+            client_login=settings.direct_client_login,
+            campaign_ids=campaign_ids,
+            period_hours=period_hours,
+            sandbox=settings.direct_sandbox,
+        )
+    except direct_connector.NotConfiguredError as exc:
+        return None, str(exc)
+    except direct_connector.DirectConnectorError as exc:
+        return None, str(exc)
+
+    query_clusters = get_query_clusters(project.settings_json)
+
+    # attribution_status: в v1 у нас нет сквозной UTM-атрибуции между
+    # Direct и TruePost (TruePost отдаёт просто число регистраций за
+    # период, не привязанное к источнику трафика) -- поэтому всегда
+    # not_available. Это явное, не угаданное значение: если в будущем
+    # появится UTM-трекинг, здесь будет реальная проверка, не константа.
+    attribution_status = AttributionStatus.not_available
+
+    diag_result = run_diagnostics(
+        period_key="7d",
+        ad_group_rows=ad_group_report["rows"],
+        query_rows=query_report["rows"],
+        attribution_status=attribution_status,
+        query_clusters=query_clusters,
+    )
+    return diag_result, None
 
 
 def run_cycle_once_sync(project_id: int | None = None) -> CycleResult:
     """Синхронная обёртка для вызова из не-async контекста (например APScheduler job)."""
     return asyncio.run(run_cycle_once(project_id))
+
+
+async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
+    """
+    Принудительный запуск deep diagnostics, минуя кэш -- используется
+    кнопкой "Проверить глубже" в Telegram. В отличие от автоматического
+    пути в run_cycle_once(), здесь НЕТ проверки should_run_deep_diagnostics()
+    -- пользователь явно попросил, ему не нужно ждать триггера по алерту.
+
+    Возвращает dict: {"ok": True, "result": {...}} или {"ok": False, "error": "..."}.
+    Не бросает исключения наружу -- вызывающий Telegram-handler получает
+    структурированный ответ для прямого показа пользователю.
+    """
+    settings = get_settings()
+
+    if not (settings.effective_direct_oauth_token and settings.direct_client_login):
+        return {"ok": False, "error": "Direct не настроен (нет OAuth-токена или client_login)"}
+
+    with get_session() as session:
+        if project_id is not None:
+            project = session.get(Project, project_id)
+        else:
+            project = session.exec(select(Project).where(Project.is_active == True)).first()
+
+        if project is None:
+            return {"ok": False, "error": "Активный проект не найден"}
+
+        diag_result, diag_error = await run_deep_diagnostics_for_project(
+            project, settings, period_hours=ANALYSIS_WINDOWS_HOURS["7d"],
+        )
+
+        if diag_result is None:
+            save_diagnostics_cache(session, project.id, "7d", "manual_refresh", {}, ok=False, error=diag_error)
+            return {"ok": False, "error": diag_error}
+
+        result_dict = diag_result.to_dict()
+        result_dict["_from_cache"] = False
+        save_diagnostics_cache(session, project.id, "7d", "manual_refresh", result_dict)
+
+        return {"ok": True, "result": result_dict}
 
 
 # ---------------------------------------------------------------------------
