@@ -76,6 +76,11 @@ MIN_CLICKS_FOR_DEEP_DIAGNOSTICS = 30
 LANDING_VIEWS_VS_CLICKS_MIN_RATIO = 0.5
 CTA_CLICKS_VS_VIEWS_MIN_RATIO = 0.05
 BOT_STARTS_VS_CTA_MIN_RATIO = 0.5
+# Минимальный объём cta_hero_bot_clicks (НЕ суммы CTA), при котором правило
+# C (Telegram-open path) даёт уверенный вывод. Ниже этого порога -- low
+# confidence, не уверенный сигнал о проблеме (требование E: "если Telegram
+# CTA clicks мало, не делать уверенный вывод").
+MIN_TELEGRAM_CTA_CLICKS_FOR_CONFIDENT_FINDING = 10
 REGISTER_VS_BOT_STARTS_MIN_RATIO = 0.3
 # Минимальный объём (landing_views), ниже которого правила B-F не
 # применяются вообще -- слишком мало данных для процентных порогов,

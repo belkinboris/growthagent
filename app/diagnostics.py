@@ -619,6 +619,7 @@ class LandingFunnelStepResult:
     recommended_action: str
     metric_to_recheck: str
     affects_landing_or_ads: bool  # False для правил C/D/E -- проблема ПОСЛЕ клика, не повод трогать лендинг/рекламу
+    confidence: str = "high"  # "low" | "medium" | "high" -- low при малом объёме cta_hero_bot_clicks (требование E)
 
 
 @dataclass
@@ -737,6 +738,7 @@ def analyze_landing_funnel(
         REGISTER_VS_BOT_STARTS_MIN_RATIO,
         MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS,
         LANDING_TRACKING_MIN_MATURITY_HOURS,
+        MIN_TELEGRAM_CTA_CLICKS_FOR_CONFIDENT_FINDING,
     )
 
     landing_views = landing_result.get("landing_views")
@@ -755,7 +757,17 @@ def analyze_landing_funnel(
         "direct_clicks": direct_clicks,
         "landing_views": landing_views,
         "cta_clicks": cta_total,
+        # Telegram path (cta_hero_bot_clicks -> bot_starts_from_landing) и
+        # Web path (cta_hero_app_clicks -> web_register_opened) -- две
+        # РАЗНЫЕ ветки воронки, не должны смешиваться при анализе. cta_total
+        # остаётся в snapshot для общей картины (используется правилом B,
+        # где сумма обоснована -- оба типа CTA одинаково означают "ушёл с
+        # лендинга"), но дальше по цепочке (правило C) сравнение идёт
+        # ТОЛЬКО с cta_bot, не с суммой.
+        "cta_bot_clicks": cta_bot,
+        "cta_app_clicks": cta_app,
         "bot_starts_from_landing": bot_starts,
+        "web_register_opened": landing_result.get("web_register_opened"),
         "register_success": register_success,
         "activation_1": activation_1,
     }
@@ -877,19 +889,36 @@ def analyze_landing_funnel(
             instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
         )
 
-    # Правило C: CTA кликают, но bot_starts_from_landing сильно меньше --
-    # проблема В TELEGRAM-OPEN PATH (interstitial, iOS prompt, startapp,
-    # Mini App), НЕ в самом лендинге. affects_landing_or_ads=False.
-    if cta_total > 0 and bot_starts is not None:
-        bot_start_ratio = bot_starts / cta_total if cta_total > 0 else 0
+    # Правило C: Telegram CTA кликают, но bot_starts_from_landing сильно
+    # меньше -- проблема В TELEGRAM-OPEN PATH (interstitial, iOS prompt,
+    # startapp, Mini App), НЕ в самом лендинге. affects_landing_or_ads=False.
+    #
+    # ВАЖНО: denominator -- ИСКЛЮЧИТЕЛЬНО cta_bot (cta_hero_bot_clicks),
+    # НЕ cta_total (сумма Telegram + Web CTA). Web CTA (cta_hero_app_clicks)
+    # ведёт в другую ветку (web_register_opened, см. ниже), не в
+    # bot_starts_from_landing -- складывать их при проверке именно этого
+    # перехода методологически неверно: пользователь, кликнувший Web CTA,
+    # физически не должен запускать бота, и его присутствие в знаменателе
+    # искусственно завышает кажущийся "провал" Telegram-пути.
+    if cta_bot is not None and cta_bot > 0 and bot_starts is not None:
+        bot_start_ratio = bot_starts / cta_bot if cta_bot > 0 else 0
         if bot_start_ratio < BOT_STARTS_VS_CTA_MIN_RATIO:
+            # Confidence низкий при малом объёме cta_bot -- требование E:
+            # "если Telegram CTA clicks мало, не делать уверенный вывод".
+            # Это не блокирует finding целиком (severity всё равно отражает
+            # серьёзность), но текст явно говорит "предварительно".
+            confidence = "low" if cta_bot < MIN_TELEGRAM_CTA_CLICKS_FOR_CONFIDENT_FINDING else "high"
+            confidence_note = (
+                f" Объём кликов пока небольшой ({cta_bot}), вывод предварительный."
+                if confidence == "low" else ""
+            )
             finding = LandingFunnelStepResult(
                 rule_id="c_cta_no_bot_start",
                 step_label="Открытие Telegram-бота после клика",
                 severity="P1" if bot_starts == 0 else "P2",
                 detail=(
-                    f"{cta_total} кликов по CTA, но только {bot_starts} запусков бота "
-                    f"({round(bot_start_ratio * 100)}%)."
+                    f"{cta_bot} кликов по Telegram CTA, но только {bot_starts} запусков бота "
+                    f"({round(bot_start_ratio * 100)}%).{confidence_note}"
                 ),
                 probable_cause=(
                     "Проблема в пути открытия Telegram: промежуточный экран t.me, "
@@ -898,6 +927,42 @@ def analyze_landing_funnel(
                 recommended_action="Проверить сам путь открытия бота из CTA на мобильном устройстве, включая iOS.",
                 metric_to_recheck="bot_starts_from_landing относительно cta_hero_bot_clicks",
                 affects_landing_or_ads=False,
+                confidence=confidence,
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=finding, data_quality_warning=data_quality_warning,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+    # Правило C-web: Web CTA кликают, но web_register_opened сильно меньше --
+    # отдельная ветка от Telegram-пути (требование C задачи). Использует
+    # тот же относительный порог, что Telegram-путь (BOT_STARTS_VS_CTA_MIN_RATIO),
+    # потому что методологически это тот же тип перехода ("клик -> следующий
+    # экран"), просто в другой ветке воронки -- не вижу причины вводить
+    # отдельный порог без emпирических данных, которые показали бы, что
+    # web-путь и telegram-путь ведут себя статистически по-разному.
+    web_register_opened = landing_result.get("web_register_opened")
+    if cta_app is not None and cta_app > 0 and web_register_opened is not None:
+        web_open_ratio = web_register_opened / cta_app if cta_app > 0 else 0
+        if web_open_ratio < BOT_STARTS_VS_CTA_MIN_RATIO:
+            confidence = "low" if cta_app < MIN_TELEGRAM_CTA_CLICKS_FOR_CONFIDENT_FINDING else "high"
+            confidence_note = (
+                f" Объём кликов пока небольшой ({cta_app}), вывод предварительный."
+                if confidence == "low" else ""
+            )
+            finding = LandingFunnelStepResult(
+                rule_id="c_web_cta_no_register_open",
+                step_label="Открытие формы регистрации (web path)",
+                severity="P1" if web_register_opened == 0 else "P2",
+                detail=(
+                    f"{cta_app} кликов по Web CTA, но только {web_register_opened} открытий формы "
+                    f"регистрации ({round(web_open_ratio * 100)}%).{confidence_note}"
+                ),
+                probable_cause="Проблема в пути от клика по веб-CTA до открытия формы регистрации на сайте.",
+                recommended_action="Проверить, открывается ли форма регистрации после клика на Web CTA на мобильном устройстве.",
+                metric_to_recheck="web_register_opened относительно cta_hero_app_clicks",
+                affects_landing_or_ads=False,
+                confidence=confidence,
             )
             return LandingFunnelDiagnosticsResult(
                 status="ok", main_finding=finding, data_quality_warning=data_quality_warning,
