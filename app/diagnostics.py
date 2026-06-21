@@ -586,3 +586,273 @@ def analyze_onboarding(connector_result: dict) -> OnboardingDiagnosticsResult:
         recommended_actions=actions,
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Landing Funnel Diagnostics
+# ---------------------------------------------------------------------------
+#
+# Третий тип read-only диагностики, симметричный Direct Deep Diagnostics и
+# Product Onboarding Diagnostics выше. Разница: воронка тут полностью
+# последовательная (Direct clicks -> landing_views -> CTA -> bot_starts ->
+# register_success -> activation_1), поэтому правила A-F проверяются по
+# порядку, и при первом найденном разрыве остальные шаги дальше по цепочке
+# не диагностируются отдельно -- если человек не открыл лендинг, бессмысленно
+# отдельно говорить "и до регистрации не дошёл" как самостоятельную проблему,
+# это следствие первой найденной причины, не вторая независимая проблема.
+#
+# Ключевое правило из задачи: агент НЕ должен предлагать менять лендинг/
+# рекламу, если проблема локализована ПОСЛЕ клика по CTA (правила C, D, E) --
+# это технические/продуктовые проблемы (Mini App, registration flow,
+# onboarding), не вопрос текста лендинга или качества трафика.
+
+
+@dataclass
+class LandingFunnelStepResult:
+    """Один найденный разрыв в воронке лендинга."""
+
+    rule_id: str  # "a_clicks_no_views" | "b_views_no_cta" | "c_cta_no_bot_start" | "d_bot_start_no_register" | "e_register_no_activation"
+    step_label: str
+    severity: str  # "P1" | "P2" | "info"
+    detail: str
+    probable_cause: str
+    recommended_action: str
+    metric_to_recheck: str
+    affects_landing_or_ads: bool  # False для правил C/D/E -- проблема ПОСЛЕ клика, не повод трогать лендинг/рекламу
+
+
+@dataclass
+class LandingFunnelDiagnosticsResult:
+    """
+    status: "ok" (есть данные, см. main_finding) | "insufficient_data"
+    (landing_views < MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS) | "error".
+    """
+
+    status: str
+    main_finding: Optional[LandingFunnelStepResult] = None
+    instrumentation_warnings: list = field(default_factory=list)  # правило F, отдельно от воронки
+    no_critical_issue: bool = False  # явный сигнал "критической проблемы нет" (acceptance criteria #5)
+    funnel_snapshot: dict = field(default_factory=dict)  # сырые числа воронки для отображения
+    error_detail: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "main_finding": vars(self.main_finding) if self.main_finding else None,
+            "instrumentation_warnings": self.instrumentation_warnings,
+            "no_critical_issue": self.no_critical_issue,
+            "funnel_snapshot": self.funnel_snapshot,
+            "error_detail": self.error_detail,
+        }
+
+
+def _check_raw_vs_unique_warnings(landing_result: dict) -> list:
+    """
+    Правило F: если raw сильно выше unique -- instrumentation warning, не
+    бизнес-проблема. Возвращает список текстовых предупреждений (может
+    быть пустым). Используется отдельно от основной цепочки A-E, потому
+    что это не разрыв воронки, а сигнал "тречкингу есть дубли, относитесь
+    к unique-числам с долей осторожности".
+    """
+    from app.config import RAW_VS_UNIQUE_WARNING_MULTIPLIER
+
+    warnings = []
+    raw_values = landing_result.get("_raw_values", {})
+
+    field_labels = {
+        "landing_views": "просмотры лендинга",
+        "cta_hero_bot_clicks": "клики по CTA (бот)",
+        "cta_hero_app_clicks": "клики по CTA (приложение)",
+        "bot_starts_from_landing": "запуски бота с лендинга",
+        "web_register_opened": "открытие формы регистрации",
+        "register_success": "успешные регистрации",
+        "activation_1": "активация (шаг 1)",
+    }
+
+    for field, label in field_labels.items():
+        unique_value = landing_result.get(field)
+        raw_value = raw_values.get(field)
+        if unique_value is None or raw_value is None or unique_value == 0:
+            continue
+        if raw_value > unique_value * RAW_VS_UNIQUE_WARNING_MULTIPLIER:
+            warnings.append(
+                f"«{label}»: raw-счётчик ({raw_value}) заметно выше unique ({unique_value}) -- "
+                f"возможны дубли событий в трекинге. Для анализа используются unique-числа."
+            )
+
+    return warnings
+
+
+def analyze_landing_funnel(
+    landing_result: dict,
+    direct_clicks: Optional[int] = None,
+) -> LandingFunnelDiagnosticsResult:
+    """
+    landing_result -- результат connectors/landing.fetch_landing_funnel_diagnostics()
+    (уже успешный; ошибки/недоступность обрабатываются ДО вызова этой
+    функции, на уровне scheduler.py, как и для остальных диагностик).
+
+    direct_clicks -- клики из Director за ТОТ ЖЕ период (NormalizedMetrics.clicks),
+    передаются отдельно, не достаются из landing_result, потому что они
+    приходят из другого источника (Direct connector, не TruePost) -- этой
+    функции явно даются оба входа, не угадывается связь между коннекторами
+    внутри неё.
+    """
+    from app.config import (
+        LANDING_VIEWS_VS_CLICKS_MIN_RATIO,
+        CTA_CLICKS_VS_VIEWS_MIN_RATIO,
+        BOT_STARTS_VS_CTA_MIN_RATIO,
+        REGISTER_VS_BOT_STARTS_MIN_RATIO,
+        MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS,
+    )
+
+    landing_views = landing_result.get("landing_views")
+    cta_bot = landing_result.get("cta_hero_bot_clicks")
+    cta_app = landing_result.get("cta_hero_app_clicks")
+    cta_total = (cta_bot or 0) + (cta_app or 0)
+    bot_starts = landing_result.get("bot_starts_from_landing")
+    register_success = landing_result.get("register_success")
+    activation_1 = landing_result.get("activation_1")
+
+    instrumentation_warnings = _check_raw_vs_unique_warnings(landing_result)
+
+    funnel_snapshot = {
+        "direct_clicks": direct_clicks,
+        "landing_views": landing_views,
+        "cta_clicks": cta_total,
+        "bot_starts_from_landing": bot_starts,
+        "register_success": register_success,
+        "activation_1": activation_1,
+    }
+
+    # Правило A: Direct clicks есть, landing_views сильно меньше -- проблема
+    # ДО лендинга (переход из рекламы / загрузка / tracking). Проверяется
+    # первой, до проверки MIN_LANDING_VIEWS -- даже 0 просмотров при наличии
+    # кликов это сильный сигнал сам по себе, не "недостаточно данных".
+    if direct_clicks is not None and direct_clicks > 0 and landing_views is not None:
+        ratio = landing_views / direct_clicks if direct_clicks > 0 else 0
+        if ratio < LANDING_VIEWS_VS_CLICKS_MIN_RATIO:
+            finding = LandingFunnelStepResult(
+                rule_id="a_clicks_no_views",
+                step_label="Переход с рекламы на лендинг",
+                severity="P1" if landing_views == 0 else "P2",
+                detail=(
+                    f"За период {direct_clicks} кликов из Директа, но только {landing_views} "
+                    f"просмотров лендинга ({round(ratio * 100)}% от кликов)."
+                ),
+                probable_cause="Проблема в переходе из рекламы, загрузке лендинга, либо в трекинге просмотров.",
+                recommended_action="Проверить, открывается ли лендинг по рекламной ссылке, и установлен ли счётчик корректно.",
+                metric_to_recheck="landing_views относительно Direct clicks",
+                affects_landing_or_ads=True,
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=finding,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+    if landing_views is None or landing_views < MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS:
+        return LandingFunnelDiagnosticsResult(
+            status="insufficient_data",
+            instrumentation_warnings=instrumentation_warnings,
+            funnel_snapshot=funnel_snapshot,
+        )
+
+    # Правило B: landing_views есть, но мало CTA-кликов -- проблема в первом
+    # экране/оффере/CTA. Это и есть зона ответственности самого лендинга.
+    cta_ratio = cta_total / landing_views if landing_views > 0 else 0
+    if cta_ratio < CTA_CLICKS_VS_VIEWS_MIN_RATIO:
+        finding = LandingFunnelStepResult(
+            rule_id="b_views_no_cta",
+            step_label="Клик по CTA на лендинге",
+            severity="P1" if cta_total == 0 else "P2",
+            detail=(
+                f"{landing_views} просмотров лендинга, но только {cta_total} кликов по CTA "
+                f"({round(cta_ratio * 100, 1)}%)."
+            ),
+            probable_cause="Проблема в первом экране, оффере или заметности CTA.",
+            recommended_action="Проверить, виден ли главный оффер и кнопка действия в первые секунды на мобильном.",
+            metric_to_recheck="cta_hero_bot_clicks + cta_hero_app_clicks относительно landing_views",
+            affects_landing_or_ads=True,
+        )
+        return LandingFunnelDiagnosticsResult(
+            status="ok", main_finding=finding,
+            instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+        )
+
+    # Правило C: CTA кликают, но bot_starts_from_landing сильно меньше --
+    # проблема В TELEGRAM-OPEN PATH (interstitial, iOS prompt, startapp,
+    # Mini App), НЕ в самом лендинге. affects_landing_or_ads=False.
+    if cta_total > 0 and bot_starts is not None:
+        bot_start_ratio = bot_starts / cta_total if cta_total > 0 else 0
+        if bot_start_ratio < BOT_STARTS_VS_CTA_MIN_RATIO:
+            finding = LandingFunnelStepResult(
+                rule_id="c_cta_no_bot_start",
+                step_label="Открытие Telegram-бота после клика",
+                severity="P1" if bot_starts == 0 else "P2",
+                detail=(
+                    f"{cta_total} кликов по CTA, но только {bot_starts} запусков бота "
+                    f"({round(bot_start_ratio * 100)}%)."
+                ),
+                probable_cause=(
+                    "Проблема в пути открытия Telegram: промежуточный экран t.me, "
+                    "запрос подтверждения на iOS, параметр startapp, или загрузка Mini App."
+                ),
+                recommended_action="Проверить сам путь открытия бота из CTA на мобильном устройстве, включая iOS.",
+                metric_to_recheck="bot_starts_from_landing относительно cta_hero_bot_clicks",
+                affects_landing_or_ads=False,
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=finding,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+    # Правило D: бот открыт, но мало register_success -- проблема в Mini App
+    # onboarding / registration flow, не в лендинге и не в рекламе.
+    if bot_starts is not None and bot_starts > 0 and register_success is not None:
+        register_ratio = register_success / bot_starts if bot_starts > 0 else 0
+        if register_ratio < REGISTER_VS_BOT_STARTS_MIN_RATIO:
+            finding = LandingFunnelStepResult(
+                rule_id="d_bot_start_no_register",
+                step_label="Регистрация после открытия бота",
+                severity="P1" if register_success == 0 else "P2",
+                detail=(
+                    f"{bot_starts} запусков бота, но только {register_success} успешных регистраций "
+                    f"({round(register_ratio * 100)}%)."
+                ),
+                probable_cause="Проблема в процессе регистрации внутри Mini App или в самом registration flow.",
+                recommended_action="Пройти регистрацию самостоятельно от старта бота до конца, проверить на ошибки.",
+                metric_to_recheck="register_success относительно bot_starts_from_landing",
+                affects_landing_or_ads=False,
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=finding,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+    # Правило E: регистрация есть, активации нет -- проблема ПОСЛЕ
+    # регистрации (подключение канала, первый пост, publishing bot).
+    # Это та же зона, что Product Onboarding Diagnostics выше -- здесь
+    # фиксируется как находка landing funnel, чтобы не заставлять
+    # пользователя коррелировать два разных отчёта вручную.
+    if register_success is not None and register_success > 0 and activation_1 is not None and activation_1 == 0:
+        finding = LandingFunnelStepResult(
+            rule_id="e_register_no_activation",
+            step_label="Активация после регистрации",
+            severity="P2",
+            detail=f"{register_success} успешных регистраций, но 0 прошли первый шаг активации.",
+            probable_cause="Проблема после регистрации: подключение канала, создание первого поста, добавление publishing-бота.",
+            recommended_action="Проверить путь от регистрации до первого поста -- см. также /check_onboarding для детальной диагностики.",
+            metric_to_recheck="activation_1 относительно register_success",
+            affects_landing_or_ads=False,
+        )
+        return LandingFunnelDiagnosticsResult(
+            status="ok", main_finding=finding,
+            instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+        )
+
+    # Ни одно правило не сработало -- воронка технически в порядке.
+    # Явный позитивный сигнал (acceptance criteria #5), не пустота.
+    return LandingFunnelDiagnosticsResult(
+        status="ok", main_finding=None, no_critical_issue=True,
+        instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+    )

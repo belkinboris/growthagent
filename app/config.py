@@ -65,6 +65,25 @@ DEEP_DIAGNOSTICS_CACHE_TTL_HOURS = 6
 # всё равно доступна как принудительный запуск с явной пометкой "предварительно").
 MIN_CLICKS_FOR_DEEP_DIAGNOSTICS = 30
 
+# Пороги для landing funnel diagnostics (правила A-F). Каждый порог --
+# "доля, ниже которой считаем переход на этом шаге воронки проблемным".
+# Например LANDING_VIEWS_VS_CLICKS_MIN_RATIO=0.5 означает: если landing_views
+# меньше 50% от Direct-кликов за тот же период, это сигнал A (проблема в
+# переходе/загрузке/tracking). Эти числа -- разумные дефолты, не результат
+# A/B теста на реальных данных АвтоПоста (на момент написания трафика мало
+# для статистической калибровки) -- если станут давать слишком много
+# ложных тревог на реальных данных, имеет смысл их пересмотреть.
+LANDING_VIEWS_VS_CLICKS_MIN_RATIO = 0.5
+CTA_CLICKS_VS_VIEWS_MIN_RATIO = 0.05
+BOT_STARTS_VS_CTA_MIN_RATIO = 0.5
+REGISTER_VS_BOT_STARTS_MIN_RATIO = 0.3
+# Минимальный объём (landing_views), ниже которого правила B-F не
+# применяются вообще -- слишком мало данных для процентных порогов,
+# 1-2 события дают случайный шум, не сигнал.
+MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS = 10
+# Если raw в N+ раз больше unique -- instrumentation warning (правило F).
+RAW_VS_UNIQUE_WARNING_MULTIPLIER = 1.5
+
 # Словарь кластеров поисковых запросов по умолчанию -- используется, если
 # в Project.settings_json["query_clusters"] ничего не задано. Per-project
 # словарь почти всегда нужен (у каждого продукта свой релевантный intent),

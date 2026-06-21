@@ -103,6 +103,8 @@ class CycleResult:
     # "вообще не запускался в этом цикле" (отличается от status="not_available",
     # которое означает "запускался, но endpoint отсутствует в TruePost").
     onboarding_diagnostics: dict | None = None
+    # Симметрично onboarding_diagnostics, для landing funnel diagnostics.
+    landing_funnel_diagnostics: dict | None = None
     # Независимо от того, запускалась ли диагностика автоматически в этом
     # цикле -- показывать ли кнопки ручного запуска. См. service.
     # should_show_deep_direct_button/should_show_onboarding_button: кнопки
@@ -110,6 +112,7 @@ class CycleResult:
     # проверить рекламу/онбординг, даже если сейчас главный сигнал другой.
     show_deep_direct_button: bool = False
     show_onboarding_button: bool = False
+    show_landing_funnel_button: bool = False
 
     @property
     def has_notifiable_changes(self) -> bool:
@@ -510,6 +513,47 @@ def should_show_onboarding_button(product_configured: bool, metrics_7d) -> bool:
     if metrics_7d is None:
         return False
     return metrics_7d.signup is not None and metrics_7d.signup > 0
+
+
+# ---------------------------------------------------------------------------
+# Landing Funnel Diagnostics: триггер, показ кнопки и кэш
+# ---------------------------------------------------------------------------
+
+# Landing funnel объединяет обе стороны воронки (Direct clicks -> landing ->
+# CTA -> bot -> register -> activation), поэтому триггерится ОБОИМИ
+# наборами категорий -- traffic_no_signups (правила A/B про переход с
+# рекламы и CTA на лендинге) и signups_no_activation (правило E про
+# активацию после регистрации). Не вводим отдельное множество с тем же
+# содержимым -- строим объединением существующих, чтобы при добавлении
+# новой категории в любое из двух множеств landing funnel не "отстала"
+# и не пришлось помнить про третье место для синхронизации.
+LANDING_FUNNEL_TRIGGER_CATEGORIES = DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES | ONBOARDING_DIAGNOSTICS_TRIGGER_CATEGORIES
+
+LANDING_FUNNEL_CACHE_PERIOD_KEY = "landing_funnel_24h"
+
+
+def should_run_landing_funnel_diagnostics(primary_candidate: AlertCandidate | None) -> bool:
+    """Автозапуск landing funnel diagnostics -- срабатывает на обеих сторонах воронки."""
+    if primary_candidate is None:
+        return False
+    return primary_candidate.category in LANDING_FUNNEL_TRIGGER_CATEGORIES
+
+
+def should_show_landing_funnel_button(product_configured: bool, metrics_7d) -> bool:
+    """
+    Решает, показывать ли кнопку "Проверить лендинг" -- НЕЗАВИСИМО от
+    primary alert. Условие: product connector настроен (landing funnel
+    endpoint -- часть TruePost internal API) И есть либо клики из Director,
+    либо регистрации за 7d -- то есть хоть что-то происходит в воронке,
+    что можно диагностировать.
+    """
+    if not product_configured:
+        return False
+    if metrics_7d is None:
+        return False
+    has_clicks = metrics_7d.clicks is not None and metrics_7d.clicks > 0
+    has_signups = metrics_7d.signup is not None and metrics_7d.signup > 0
+    return has_clicks or has_signups
 
 
 def get_cached_diagnostics(session: Session, project_id: int, period_key: str) -> DeepDiagnosticsCache | None:

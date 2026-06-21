@@ -512,6 +512,113 @@ def format_onboarding_diagnostics_details(onboarding_diagnostics: dict, project_
     return "\n".join(lines)
 
 
+def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) -> str:
+    """
+    Детальная диагностика лендинга по кнопке "Проверить лендинг" /
+    команде /check_landing. Формат симметричен format_onboarding_diagnostics_details
+    и format_deep_diagnostics_details: главный сигнал, что проверил,
+    результат, вероятная причина, что сделать.
+
+    Ключевое: если main_finding.affects_landing_or_ads == False (правила
+    C/D/E -- проблема ПОСЛЕ клика по CTA), агент НЕ пишет "проверить
+    лендинг" в рекомендациях -- явно следует acceptance criteria #3/#4:
+    "если проблема локализована после клика, не предлагать менять
+    лендинг/рекламу".
+    """
+    status = landing_diagnostics.get("status")
+
+    if status == "not_configured":
+        return (
+            "Growth Agent — диагностика лендинга\n"
+            f"Проект: {project_name}\n\n"
+            "TruePost не настроен (нет base_url или internal API token) -- "
+            "диагностика воронки лендинга недоступна."
+        )
+
+    if status == "insufficient_data":
+        snapshot = landing_diagnostics.get("funnel_snapshot", {})
+        views = snapshot.get("landing_views")
+        return (
+            "Growth Agent — диагностика лендинга\n"
+            f"Проект: {project_name}\n\n"
+            f"Данных пока мало для диагностики воронки: {views if views is not None else 0} просмотров лендинга "
+            "за период. Можно запустить проверку вручную позже, когда накопится больше трафика."
+        )
+
+    if status == "error":
+        return (
+            "Growth Agent — диагностика лендинга\n"
+            f"Проект: {project_name}\n\n"
+            f"Не удалось получить данные воронки лендинга: {landing_diagnostics.get('error_detail', 'техническая ошибка')}.\n\n"
+            "Это техническая проблема с подключением, не вывод о лендинге. Можно попробовать ещё раз позже."
+        )
+
+    main_finding = landing_diagnostics.get("main_finding")
+    snapshot = landing_diagnostics.get("funnel_snapshot", {})
+
+    snapshot_lines = [
+        f"Клики из Директа: {snapshot.get('direct_clicks') if snapshot.get('direct_clicks') is not None else '—'}",
+        f"Просмотры лендинга: {snapshot.get('landing_views') if snapshot.get('landing_views') is not None else '—'}",
+        f"Клики по CTA: {snapshot.get('cta_clicks') if snapshot.get('cta_clicks') is not None else '—'}",
+        f"Запуски бота: {snapshot.get('bot_starts_from_landing') if snapshot.get('bot_starts_from_landing') is not None else '—'}",
+        f"Регистрации: {snapshot.get('register_success') if snapshot.get('register_success') is not None else '—'}",
+        f"Активация: {snapshot.get('activation_1') if snapshot.get('activation_1') is not None else '—'}",
+    ]
+
+    if main_finding is None:
+        lines = [
+            "Growth Agent — диагностика лендинга",
+            f"Проект: {project_name}",
+            "",
+            "Главный сигнал:",
+            "Критической проблемы в воронке лендинга нет, продолжаем наблюдать.",
+            "",
+            "Воронка за период:",
+        ]
+        lines.extend(snapshot_lines)
+    else:
+        lines = [
+            "Growth Agent — диагностика лендинга",
+            f"Проект: {project_name}",
+            "",
+            "Главный сигнал:",
+            f"Разрыв на шаге: {main_finding['step_label']}.",
+            "",
+            "Что проверил:",
+            "Прошёл по всей воронке лендинга: клики из Директа → просмотры → CTA → открытие бота → регистрация → активация.",
+            "",
+            "Результат:",
+            main_finding["detail"],
+            "",
+            "Вероятная причина:",
+            main_finding["probable_cause"],
+            "",
+            "Что сделать:",
+            main_finding["recommended_action"],
+            "",
+            f"Что проверить после исправления: {main_finding['metric_to_recheck']}.",
+        ]
+
+        if not main_finding["affects_landing_or_ads"]:
+            lines.append("")
+            lines.append(
+                "Важно: проблема локализована ПОСЛЕ клика по CTA — менять текст лендинга "
+                "или настройки рекламы на основании этого сигнала не нужно."
+            )
+
+        lines.append("")
+        lines.append("Воронка за период:")
+        lines.extend(snapshot_lines)
+
+    warnings = landing_diagnostics.get("instrumentation_warnings", [])
+    if warnings:
+        lines.append("")
+        lines.append("Замечания по трекингу:")
+        lines.extend(f"— {w}" for w in warnings)
+
+    return "\n".join(lines)
+
+
 def format_negative_keywords_suggestion(deep_diagnostics: dict, query_clusters: Optional[dict] = None) -> str:
     """
     "Подготовить минус-фразы" -- по задаче, это MVP-заглушка: формирует
@@ -632,12 +739,21 @@ def _get_onboarding_diagnostics_for_keyboard(session, project_id: int) -> dict |
     return cached.result_json if cached else None
 
 
+def _get_landing_funnel_diagnostics_for_keyboard(session, project_id: int) -> dict | None:
+    """Симметрично для landing funnel diagnostics -- LANDING_FUNNEL_CACHE_PERIOD_KEY."""
+    from app.service import get_cached_diagnostics, LANDING_FUNNEL_CACHE_PERIOD_KEY
+    cached = get_cached_diagnostics(session, project_id, LANDING_FUNNEL_CACHE_PERIOD_KEY)
+    return cached.result_json if cached else None
+
+
 def build_alert_keyboard(
     alert_id: int,
     has_deep_diagnostics: bool = False,
     deep_diagnostics_available: bool = False,
     has_onboarding_diagnostics: bool = False,
     onboarding_diagnostics_available: bool = False,
+    has_landing_funnel_diagnostics: bool = False,
+    landing_funnel_diagnostics_available: bool = False,
 ) -> InlineKeyboardMarkup:
     """
     has_deep_diagnostics -- diagnostics уже запускался в этом цикле
@@ -647,15 +763,18 @@ def build_alert_keyboard(
     рекламу глубже" как force refresh.
 
     has_onboarding_diagnostics / onboarding_diagnostics_available --
-    симметрично для onboarding diagnostics, отдельная строка кнопок.
+    симметрично для onboarding diagnostics.
 
-    ВАЖНО: обе пары кнопок (Direct и onboarding) показываются НЕЗАВИСИМО
-    друг от друга и независимо от того, что сейчас primary alert -- по
-    решению: пользователь может вручную проверить рекламу/онбординг, даже
-    если главный сигнал сейчас про другую часть воронки (см. should_show_
-    deep_direct_button / should_show_onboarding_button в service.py).
-    Это secondary diagnostic utilities -- они read-only и не относятся к
-    основным действиям над алертом (Понял/Отложить/Создать задачу).
+    has_landing_funnel_diagnostics / landing_funnel_diagnostics_available --
+    симметрично для landing funnel diagnostics (третья диагностика).
+
+    ВАЖНО: все три пары кнопок показываются НЕЗАВИСИМО друг от друга и
+    независимо от того, что сейчас primary alert -- по решению:
+    пользователь может вручную проверить рекламу/онбординг/лендинг, даже
+    если главный сигнал сейчас про другую часть воронки (см. should_show_*
+    в service.py). Это secondary diagnostic utilities -- они read-only и
+    не относятся к основным действиям над алертом (Понял/Отложить/Создать
+    задачу).
     """
     rows = [
         [
@@ -679,15 +798,15 @@ def build_alert_keyboard(
     elif onboarding_diagnostics_available:
         diagnostic_row.append(InlineKeyboardButton("Проверить онбординг", callback_data=f"onboarding_check:{alert_id}"))
 
-    if diagnostic_row:
-        # Если обе кнопки попали в одну строку и текст длинный -- Telegram
-        # сам перенесёт их визуально, но лучше не больше двух кнопок на
-        # ряд для читаемости на мобильном экране.
-        if len(diagnostic_row) <= 2:
-            rows.append(diagnostic_row)
-        else:
-            rows.append([diagnostic_row[0]])
-            rows.append(diagnostic_row[1:])
+    if has_landing_funnel_diagnostics:
+        diagnostic_row.append(InlineKeyboardButton("Детали лендинга", callback_data=f"show_landing:{alert_id}"))
+    elif landing_funnel_diagnostics_available:
+        diagnostic_row.append(InlineKeyboardButton("Проверить лендинг", callback_data=f"landing_check:{alert_id}"))
+
+    # Разбиваем диагностические кнопки по 2 на ряд для читаемости на
+    # мобильном экране -- независимо от того, сколько их всего (2 или 3).
+    for i in range(0, len(diagnostic_row), 2):
+        rows.append(diagnostic_row[i:i + 2])
 
     return InlineKeyboardMarkup(rows)
 
@@ -840,6 +959,35 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             await query.message.reply_text(details_text)
 
+        elif action == "show_landing":
+            landing_diagnostics = _get_landing_funnel_diagnostics_for_keyboard(session, alert.project_id)
+            if landing_diagnostics is None:
+                await query.message.reply_text(
+                    "Детали лендинга не найдены (кэш устарел между нажатиями). Попробуйте /run заново."
+                )
+            else:
+                project = session.get(Project, alert.project_id)
+                project_name = project.name if project else "Проект"
+                details_text = format_landing_funnel_details(landing_diagnostics, project_name)
+                await query.message.reply_text(details_text)
+
+        elif action == "landing_check":
+            # Force refresh -- минуя кэш, симметрично deep_check/onboarding_check.
+            await query.message.reply_text("Проверяю воронку лендинга...")
+            from app.scheduler import force_refresh_landing_funnel_diagnostics
+            outcome = await force_refresh_landing_funnel_diagnostics(alert.project_id)
+
+            project = session.get(Project, alert.project_id)
+            project_name = project.name if project else "Проект"
+
+            if outcome["status"] == "ok":
+                details_text = format_landing_funnel_details(outcome["result"], project_name)
+            else:
+                payload_for_details = {"status": outcome["status"], "error_detail": outcome.get("error")}
+                details_text = format_landing_funnel_details(payload_for_details, project_name)
+
+            await query.message.reply_text(details_text)
+
         else:
             await query.edit_message_text("Неизвестное действие.")
 
@@ -868,7 +1016,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_metrika — проверить подключение к Яндекс.Метрике\n"
         "/test_direct — проверить подключение к Яндекс.Директу\n"
         "/deep_direct — глубокая диагностика Директа (группы, запросы) независимо от текущего alert\n"
-        "/check_onboarding — диагностика онбординга (путь после регистрации) независимо от текущего alert"
+        "/check_onboarding — диагностика онбординга (путь после регистрации) независимо от текущего alert\n"
+        "/check_landing — диагностика воронки лендинга (Direct → лендинг → CTA → бот → регистрация → активация)"
     )
 
 
@@ -942,6 +1091,9 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     has_onboarding_diagnostics=result.onboarding_diagnostics is not None
                     and result.onboarding_diagnostics.get("status") == "ok",
                     onboarding_diagnostics_available=result.show_onboarding_button,
+                    has_landing_funnel_diagnostics=result.landing_funnel_diagnostics is not None
+                    and result.landing_funnel_diagnostics.get("status") == "ok",
+                    landing_funnel_diagnostics_available=result.show_landing_funnel_button,
                 )
             else:
                 keyboard = None
@@ -1140,6 +1292,42 @@ async def cmd_check_onboarding(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(details_text)
 
 
+async def cmd_check_landing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Принудительный запуск Landing Funnel Diagnostics НЕЗАВИСИМО от primary
+    alert -- симметрично cmd_deep_direct/cmd_check_onboarding. Проверяет
+    всю цепочку Direct clicks -> landing -> CTA -> bot -> register ->
+    activation за один проход.
+
+    Read-only: только чтение через TruePost internal API, никаких
+    изменений в лендинге, рекламе или продукте.
+    """
+    settings = get_settings()
+
+    if not settings.project_internal_api_token:
+        await update.message.reply_text(
+            "TruePost не настроен (нет PROJECT_INTERNAL_API_TOKEN) -- диагностика лендинга недоступна."
+        )
+        return
+
+    await update.message.reply_text("Проверяю воронку лендинга...")
+
+    from app.scheduler import force_refresh_landing_funnel_diagnostics
+    outcome = await force_refresh_landing_funnel_diagnostics()
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        project_name = project.name if project else "Проект"
+
+    if outcome["status"] == "ok":
+        details_text = format_landing_funnel_details(outcome["result"], project_name)
+    else:
+        payload_for_details = {"status": outcome["status"], "error_detail": outcome.get("error")}
+        details_text = format_landing_funnel_details(payload_for_details, project_name)
+
+    await update.message.reply_text(details_text)
+
+
 async def cmd_test_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Проверка подключения к Яндекс.Директу без полного цикла -- использует
@@ -1280,6 +1468,9 @@ async def send_cycle_notification(app: Application, result: CycleResult, project
                     has_onboarding_diagnostics=result.onboarding_diagnostics is not None
                     and result.onboarding_diagnostics.get("status") == "ok",
                     onboarding_diagnostics_available=result.show_onboarding_button,
+                    has_landing_funnel_diagnostics=result.landing_funnel_diagnostics is not None
+                    and result.landing_funnel_diagnostics.get("status") == "ok",
+                    landing_funnel_diagnostics_available=result.show_landing_funnel_button,
                 )
                 if alert.status == AlertStatus.open:
                     alert.status = AlertStatus.sent
@@ -1318,6 +1509,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("test_direct", cmd_test_direct))
     app.add_handler(CommandHandler("deep_direct", cmd_deep_direct))
     app.add_handler(CommandHandler("check_onboarding", cmd_check_onboarding))
+    app.add_handler(CommandHandler("check_landing", cmd_check_landing))
     app.add_handler(CallbackQueryHandler(on_button_press))
 
     return app
