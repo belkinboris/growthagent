@@ -606,13 +606,38 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
     data_quality_warning = landing_diagnostics.get("data_quality_warning")
     snapshot = landing_diagnostics.get("funnel_snapshot", {})
 
+    def _fmt(value):
+        return value if value is not None else "—"
+
+    cta_bot_clicks = snapshot.get("cta_bot_clicks")
+    bot_starts = snapshot.get("bot_starts_from_landing")
+    cta_app_clicks = snapshot.get("cta_app_clicks")
+    web_register_opened = snapshot.get("web_register_opened")
+
+    # Telegram path и Web path показываются ОТДЕЛЬНО (требование D) -- это
+    # две разные ветки воронки, смешивать их в одну строку "Клики по CTA"
+    # вводит в заблуждение ровно так же, как смешивать их в самом анализе
+    # (см. diagnostics.analyze_landing_funnel: правило C использует только
+    # cta_bot, не сумму).
+    telegram_open_rate = None
+    if cta_bot_clicks and cta_bot_clicks > 0 and bot_starts is not None:
+        telegram_open_rate = round(bot_starts / cta_bot_clicks * 100)
+
     snapshot_lines = [
-        f"Клики из Директа: {snapshot.get('direct_clicks') if snapshot.get('direct_clicks') is not None else '—'}",
-        f"Просмотры лендинга: {snapshot.get('landing_views') if snapshot.get('landing_views') is not None else '—'}",
-        f"Клики по CTA: {snapshot.get('cta_clicks') if snapshot.get('cta_clicks') is not None else '—'}",
-        f"Запуски бота: {snapshot.get('bot_starts_from_landing') if snapshot.get('bot_starts_from_landing') is not None else '—'}",
-        f"Регистрации: {snapshot.get('register_success') if snapshot.get('register_success') is not None else '—'}",
-        f"Активация: {snapshot.get('activation_1') if snapshot.get('activation_1') is not None else '—'}",
+        f"Клики из Директа: {_fmt(snapshot.get('direct_clicks'))}",
+        f"Просмотры лендинга: {_fmt(snapshot.get('landing_views'))}",
+        "",
+        "Telegram path:",
+        f"  Telegram CTA clicks: {_fmt(cta_bot_clicks)}",
+        f"  Mini App opens (bot_starts_from_landing): {_fmt(bot_starts)}",
+        f"  Open rate: {telegram_open_rate if telegram_open_rate is not None else '—'}%",
+        "",
+        "Web path:",
+        f"  Web CTA clicks: {_fmt(cta_app_clicks)}",
+        f"  Web register opened: {_fmt(web_register_opened)}",
+        f"  Register success: {_fmt(snapshot.get('register_success'))}",
+        "",
+        f"Активация: {_fmt(snapshot.get('activation_1'))}",
     ]
 
     # data_quality_warning и main_finding теперь НЕ взаимоисключающие --
