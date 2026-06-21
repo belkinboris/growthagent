@@ -60,7 +60,18 @@ async def fetch_landing_funnel_diagnostics(
     плюс "_raw_values" -- отдельный dict с raw-значениями для расчёта
     instrumentation warning, плюс "dropoff_summary"/"diagnostic_notes" из
     самого TruePost (передаются как есть, TruePost уже умеет их формулировать),
-    плюс "as_of".
+    плюс "as_of", "tracking_started_at" (или None, если TruePost это поле
+    пока не отдаёт -- см. ниже).
+
+    tracking_started_at -- момент, с которого landing tracking реально
+    собирает данные (поле "tracking_started_at" или "first_event_at" в
+    ответе, в порядке предпочтения). Это поле ЖЕЛАТЕЛЬНОЕ, не обязательное:
+    TruePost может пока не отдавать его вовсе -- тогда tracking_started_at
+    будет None, и вызывающий код (diagnostics.py) обязан считать это
+    "зрелость трекинга неизвестна", не "трекинг зрелый". См. правило A в
+    diagnostics.analyze_landing_funnel -- без этого поля сравнение Direct
+    clicks (за весь period_hours) с landing_views (которые могли начать
+    собираться позже) даёт ложный сигнал "переход с рекламы сломан".
 
     Бросает NotConfiguredError, если token/base_url не заданы.
     Бросает LandingConnectorError при сетевой ошибке/таймауте/невалидном
@@ -101,6 +112,21 @@ async def fetch_landing_funnel_diagnostics(
     except (ValueError, AttributeError) as exc:
         raise LandingConnectorError(f"Invalid 'as_of' format: {exc}") from exc
 
+    # tracking_started_at -- ЖЕЛАТЕЛЬНОЕ поле, не обязательное (см. п.3
+    # задачи: "желательно должен возвращать"). Принимаем оба варианта
+    # названия поля, в порядке предпочтения, и graceful игнорируем, если
+    # ни одного нет или формат невалиден -- это не повод ронять весь запрос,
+    # просто зрелость трекинга останется неизвестной для diagnostics.py.
+    tracking_started_at = None
+    for field_name in ("tracking_started_at", "first_event_at", "earliest_landing_event_at"):
+        if raw.get(field_name):
+            try:
+                tracking_started_at = datetime.fromisoformat(raw[field_name].replace("Z", "+00:00"))
+                break
+            except (ValueError, AttributeError):
+                logger.warning("Invalid format for %s in landing funnel response: %r", field_name, raw.get(field_name))
+                continue
+
     unique_values = {}
     raw_values = {}
     missing_fields = []
@@ -127,5 +153,6 @@ async def fetch_landing_funnel_diagnostics(
         "dropoff_summary": raw.get("dropoff_summary"),
         "diagnostic_notes": raw.get("diagnostic_notes", []),
         "as_of": as_of,
+        "tracking_started_at": tracking_started_at,
         "_raw": raw,
     }
