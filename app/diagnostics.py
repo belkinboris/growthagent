@@ -622,6 +622,27 @@ class LandingFunnelStepResult:
 
 
 @dataclass
+class DataQualityWarning:
+    """
+    Отдельная категория результата -- НЕ продуктовая/рекламная проблема,
+    а сигнал "сравнение метрик за этот период ненадёжно". Возвращается
+    вместо LandingFunnelStepResult, когда правило A не может быть оценено
+    корректно (period mismatch между Direct-кликами и landing tracking).
+
+    Это явно ДРУГОЙ тип, не просто LandingFunnelStepResult с другим текстом --
+    чтобы вызывающий код (telegram_bot.py) не мог случайно отформатировать
+    это как "найдена проблема, вот что починить", а форматировал как
+    предупреждение о качестве данных.
+    """
+
+    reason: str  # "tracking_too_new" | "tracking_maturity_unknown" | "insufficient_volume"
+    message: str
+    direct_clicks: Optional[int] = None
+    landing_views: Optional[int] = None
+    tracking_started_at: Optional[str] = None  # ISO-строка для сериализации
+
+
+@dataclass
 class LandingFunnelDiagnosticsResult:
     """
     status: "ok" (есть данные, см. main_finding) | "insufficient_data"
@@ -630,6 +651,7 @@ class LandingFunnelDiagnosticsResult:
 
     status: str
     main_finding: Optional[LandingFunnelStepResult] = None
+    data_quality_warning: Optional[DataQualityWarning] = None
     instrumentation_warnings: list = field(default_factory=list)  # правило F, отдельно от воронки
     no_critical_issue: bool = False  # явный сигнал "критической проблемы нет" (acceptance criteria #5)
     funnel_snapshot: dict = field(default_factory=dict)  # сырые числа воронки для отображения
@@ -639,6 +661,7 @@ class LandingFunnelDiagnosticsResult:
         return {
             "status": self.status,
             "main_finding": vars(self.main_finding) if self.main_finding else None,
+            "data_quality_warning": vars(self.data_quality_warning) if self.data_quality_warning else None,
             "instrumentation_warnings": self.instrumentation_warnings,
             "no_critical_issue": self.no_critical_issue,
             "funnel_snapshot": self.funnel_snapshot,
@@ -686,17 +709,26 @@ def _check_raw_vs_unique_warnings(landing_result: dict) -> list:
 def analyze_landing_funnel(
     landing_result: dict,
     direct_clicks: Optional[int] = None,
+    period_hours: int = 24,
 ) -> LandingFunnelDiagnosticsResult:
     """
     landing_result -- результат connectors/landing.fetch_landing_funnel_diagnostics()
     (уже успешный; ошибки/недоступность обрабатываются ДО вызова этой
     функции, на уровне scheduler.py, как и для остальных диагностик).
 
-    direct_clicks -- клики из Director за ТОТ ЖЕ период (NormalizedMetrics.clicks),
-    передаются отдельно, не достаются из landing_result, потому что они
-    приходят из другого источника (Direct connector, не TruePost) -- этой
-    функции явно даются оба входа, не угадывается связь между коннекторами
-    внутри неё.
+    direct_clicks -- клики из Director за period_hours (тот же период,
+    за который запрошен landing_result) -- передаются отдельно, не
+    достаются из landing_result, потому что приходят из другого источника
+    (Direct connector, не TruePost).
+
+    period_hours -- период, за который был запрошен landing_result и
+    direct_clicks (по предположению вызывающего кода -- см. scheduler.py,
+    где оба запроса делаются за один и тот же период_hours). Используется
+    для проверки зрелости tracking: если landing_result["tracking_started_at"]
+    указывает, что трекинг начал работать ПОЗЖЕ начала запрошенного периода,
+    правило A не делает вывод о проблеме перехода с рекламы -- это
+    означало бы сравнивать Direct clicks за весь период с landing_views,
+    которые физически не могли накопиться за часть этого периода.
     """
     from app.config import (
         LANDING_VIEWS_VS_CLICKS_MIN_RATIO,
@@ -704,6 +736,7 @@ def analyze_landing_funnel(
         BOT_STARTS_VS_CTA_MIN_RATIO,
         REGISTER_VS_BOT_STARTS_MIN_RATIO,
         MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS,
+        LANDING_TRACKING_MIN_MATURITY_HOURS,
     )
 
     landing_views = landing_result.get("landing_views")
@@ -713,6 +746,8 @@ def analyze_landing_funnel(
     bot_starts = landing_result.get("bot_starts_from_landing")
     register_success = landing_result.get("register_success")
     activation_1 = landing_result.get("activation_1")
+    tracking_started_at = landing_result.get("tracking_started_at")
+    as_of = landing_result.get("as_of")
 
     instrumentation_warnings = _check_raw_vs_unique_warnings(landing_result)
 
@@ -727,9 +762,59 @@ def analyze_landing_funnel(
 
     # Правило A: Direct clicks есть, landing_views сильно меньше -- проблема
     # ДО лендинга (переход из рекламы / загрузка / tracking). Проверяется
-    # первой, до проверки MIN_LANDING_VIEWS -- даже 0 просмотров при наличии
-    # кликов это сильный сигнал сам по себе, не "недостаточно данных".
+    # первой, но ТОЛЬКО если period mismatch исключён -- иначе классифицируем
+    # как data_quality_warning, не как продуктовую/рекламную проблему
+    # (см. требования №6, №7).
     if direct_clicks is not None and direct_clicks > 0 and landing_views is not None:
+
+        # Зрелость трекинга НЕИЗВЕСТНА -- TruePost пока не отдаёт
+        # tracking_started_at/first_event_at вовсе. Не можем утверждать,
+        # что сравнение корректно -- мягкая формулировка по требованию №5,
+        # а не молчание и не ложный вывод о проблеме.
+        if tracking_started_at is None:
+            warning = DataQualityWarning(
+                reason="tracking_maturity_unknown",
+                message=(
+                    "Данные landing funnel собираются недавно, сравнение с историческими "
+                    "Direct clicks может быть некорректным."
+                ),
+                direct_clicks=direct_clicks,
+                landing_views=landing_views,
+                tracking_started_at=None,
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=None, data_quality_warning=warning,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+        # Зрелость трекинга ИЗВЕСТНА -- проверяем, покрывает ли он весь
+        # запрошенный период с запасом LANDING_TRACKING_MIN_MATURITY_HOURS.
+        # Если as_of отсутствует (не должно происходить в норме, но не
+        # падаем), используем текущий момент как приближение.
+        reference_now = as_of if as_of is not None else datetime.now(tracking_started_at.tzinfo or None)
+        tracking_age_hours = (reference_now - tracking_started_at).total_seconds() / 3600
+
+        if tracking_age_hours < period_hours - LANDING_TRACKING_MIN_MATURITY_HOURS:
+            # Трекинг моложе запрошенного периода -- Direct clicks включают
+            # время ДО внедрения tracking. Сравнивать напрямую нельзя.
+            warning = DataQualityWarning(
+                reason="tracking_too_new",
+                message=(
+                    f"Landing tracking начал собирать данные {round(tracking_age_hours, 1)} ч назад, "
+                    f"а запрошенный период -- {period_hours} ч. Direct clicks включают период до "
+                    f"внедрения tracking, поэтому сравнение landing_views с полным объёмом кликов "
+                    f"за весь период не отражает реальную картину перехода с рекламы."
+                ),
+                direct_clicks=direct_clicks,
+                landing_views=landing_views,
+                tracking_started_at=tracking_started_at.isoformat(),
+            )
+            return LandingFunnelDiagnosticsResult(
+                status="ok", main_finding=None, data_quality_warning=warning,
+                instrumentation_warnings=instrumentation_warnings, funnel_snapshot=funnel_snapshot,
+            )
+
+        # Трекинг зрелый, период совпадает -- можно делать вывод правила A.
         ratio = landing_views / direct_clicks if direct_clicks > 0 else 0
         if ratio < LANDING_VIEWS_VS_CLICKS_MIN_RATIO:
             finding = LandingFunnelStepResult(

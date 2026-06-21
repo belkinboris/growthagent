@@ -405,14 +405,24 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # Landing funnel diagnostics: триггерится обеими сторонами воронки
         # (traffic_no_signups И signups_no_activation), потому что сама
         # диагностика покрывает всю цепочку Direct clicks -> ... -> activation.
+        #
+        # ВАЖНО: используем 7d-окно (168ч) для ОБОИХ источников -- Direct
+        # clicks (metrics_7d.clicks) и landing funnel (period_hours=168 ниже).
+        # Раньше здесь был баг: landing запрашивался с дефолтным period_hours=24,
+        # а клики брались за 7d -- это давало false positive "переход с
+        # рекламы сломан" при сравнении кликов за неделю с просмотрами за
+        # сутки. period_hours передаётся явно в обе стороны, чтобы это
+        # несоответствие не могло повториться незаметно.
         if product_configured and should_run_landing_funnel_diagnostics(result.primary_candidate):
             cached_landing = get_cached_diagnostics(session, project.id, LANDING_FUNNEL_CACHE_PERIOD_KEY)
             if cached_landing is not None:
                 result.landing_funnel_diagnostics = cached_landing.result_json
                 result.landing_funnel_diagnostics["_from_cache"] = True
             else:
+                landing_period_hours = ANALYSIS_WINDOWS_HOURS["7d"]
                 landing_outcome = await run_landing_funnel_diagnostics_for_project(
                     project, settings, metrics_7d.clicks if metrics_7d else None,
+                    period_hours=landing_period_hours,
                 )
                 if landing_outcome["status"] == "ok":
                     landing_outcome["result"]["_from_cache"] = False
@@ -620,7 +630,7 @@ async def force_refresh_onboarding_diagnostics(project_id: int | None = None) ->
 
 
 async def run_landing_funnel_diagnostics_for_project(
-    project: Project, settings, direct_clicks_7d: int | None, period_hours: int = 24,
+    project: Project, settings, direct_clicks: int | None, period_hours: int = 24,
 ) -> dict:
     """
     Запускает landing funnel diagnostics. Возвращает {"status": "ok"|
@@ -632,11 +642,13 @@ async def run_landing_funnel_diagnostics_for_project(
     означает только "product connector не настроен вообще" (нет base_url/
     token), не "endpoint отсутствует".
 
-    direct_clicks_7d передаётся явно -- клики Director за 7d-окно, нужны
-    для правила A (см. diagnostics.analyze_landing_funnel). Используется
-    7d-окно для кликов независимо от period_hours самого landing-запроса,
-    потому что воронка лендинга анализируется за 24h (более свежий снимок),
-    а Direct-контекст -- за более длинное окно для устойчивости сравнения.
+    ВАЖНО: direct_clicks ОБЯЗАН быть посчитан за ТОТ ЖЕ period_hours, что
+    передаётся сюда -- иначе сравнение Direct clicks (например, за 7 дней)
+    с landing_views (например, за 24 часа) даёт false positive "переход с
+    рекламы сломан", когда на самом деле это просто два разных окна.
+    Вызывающий код (run_cycle_once / force_refresh_landing_funnel_diagnostics)
+    обязан запрашивать оба за один и тот же period_hours -- не передавать
+    сюда клики за другое окно, даже если оно "более показательное".
     """
     if not project.base_url or not settings.project_internal_api_token:
         return {"status": "not_configured", "result": None, "error": None}
@@ -652,7 +664,7 @@ async def run_landing_funnel_diagnostics_for_project(
     except landing_connector.LandingConnectorError as exc:
         return {"status": "error", "result": None, "error": str(exc)}
 
-    diag_result = analyze_landing_funnel(connector_result, direct_clicks=direct_clicks_7d)
+    diag_result = analyze_landing_funnel(connector_result, direct_clicks=direct_clicks, period_hours=period_hours)
     return {"status": "ok", "result": diag_result.to_dict(), "error": None}
 
 
@@ -661,8 +673,14 @@ async def force_refresh_landing_funnel_diagnostics(project_id: int | None = None
     Принудительный запуск landing funnel diagnostics, минуя кэш -- для
     кнопки "Проверить лендинг" / команды /check_landing. Симметрично
     force_refresh_onboarding_diagnostics.
+
+    Использует 7d-окно (168ч) для ОБОИХ источников -- Direct clicks и
+    landing funnel -- по тем же причинам, что в run_cycle_once (см.
+    комментарий там): сравнение метрик за разные периоды даёт false
+    positive в правиле A. period_hours передаётся в оба запроса явно.
     """
     settings = get_settings()
+    period_hours = ANALYSIS_WINDOWS_HOURS["7d"]
 
     with get_session() as session:
         if project_id is not None:
@@ -673,23 +691,25 @@ async def force_refresh_landing_funnel_diagnostics(project_id: int | None = None
         if project is None:
             return {"status": "error", "result": None, "error": "Активный проект не найден"}
 
-        # Берём свежие Direct-клики за 7d для контекста правила A -- быстрый
-        # дополнительный запрос к campaign-level summary (лёгкий, не granular).
-        direct_clicks_7d = None
+        # Берём свежие Direct-клики за ТО ЖЕ окно, что landing funnel ниже --
+        # быстрый дополнительный запрос к campaign-level summary (лёгкий, не granular).
+        direct_clicks = None
         if settings.effective_direct_oauth_token and settings.direct_client_login:
             try:
                 direct_summary = await direct_connector.fetch_metrics(
                     oauth_token=settings.effective_direct_oauth_token,
                     client_login=settings.direct_client_login,
                     campaign_ids=settings.direct_campaign_ids_list,
-                    period_hours=ANALYSIS_WINDOWS_HOURS["7d"],
+                    period_hours=period_hours,
                     sandbox=settings.direct_sandbox,
                 )
-                direct_clicks_7d = direct_summary.get("clicks")
+                direct_clicks = direct_summary.get("clicks")
             except (direct_connector.NotConfiguredError, direct_connector.DirectConnectorError) as exc:
                 logger.warning("Could not fetch Direct clicks for landing funnel context: %s", exc)
 
-        outcome = await run_landing_funnel_diagnostics_for_project(project, settings, direct_clicks_7d)
+        outcome = await run_landing_funnel_diagnostics_for_project(
+            project, settings, direct_clicks, period_hours=period_hours,
+        )
 
         if outcome["status"] == "ok":
             outcome["result"]["_from_cache"] = False

@@ -280,6 +280,10 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         onboarding_summary = _format_onboarding_diagnostics_teaser(result.onboarding_diagnostics)
         if onboarding_summary:
             blocks.append(onboarding_summary)
+
+        landing_summary = _format_landing_funnel_teaser(result.landing_funnel_diagnostics)
+        if landing_summary:
+            blocks.append(landing_summary)
     elif not blocks:
         blocks.append(
             f"Growth Agent — watch-only\nПроект: {project_name}\n\n"
@@ -370,6 +374,43 @@ def _format_onboarding_diagnostics_teaser(onboarding_diagnostics: dict | None) -
         return f"Проверил путь после регистрации: {dropoff_summary} Детали — по кнопке ниже."
 
     return "Проверил путь после регистрации: явных проблем не нашёл."
+
+
+def _format_landing_funnel_teaser(landing_diagnostics: dict | None) -> str | None:
+    """
+    Короткая пометка про landing funnel diagnostics для основного сообщения,
+    симметрично тизерам выше. data_quality_warning -- ОТДЕЛЬНАЯ ветка от
+    "критической проблемы нет": если сравнение метрик ненадёжно из-за
+    period mismatch, агент должен сказать именно это, не молчать и не
+    говорить "всё хорошо" (см. format_landing_funnel_details -- та же
+    логика приоритета data_quality_warning над main_finding is None).
+    """
+    if landing_diagnostics is None:
+        return None
+
+    status = landing_diagnostics.get("status")
+
+    if status == "not_configured":
+        return None  # TruePost не настроен -- не упоминаем вовсе, не плодим лишние строки
+
+    if status == "insufficient_data":
+        return "Данных воронки лендинга пока мало для диагностики."
+
+    if status == "error":
+        return "Не удалось получить данные воронки лендинга в этот раз -- техническая ошибка."
+
+    data_quality_warning = landing_diagnostics.get("data_quality_warning")
+    if data_quality_warning is not None:
+        return (
+            "Проверил воронку лендинга: данные за этот период пока несопоставимы "
+            "(landing tracking внедрён недавно). Детали — по кнопке ниже."
+        )
+
+    main_finding = landing_diagnostics.get("main_finding")
+    if main_finding:
+        return f"Проверил воронку лендинга: разрыв на шаге «{main_finding['step_label'].lower()}». Детали — по кнопке ниже."
+
+    return "Проверил воронку лендинга: критической проблемы нет."
 
 
 def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -> str:
@@ -554,6 +595,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         )
 
     main_finding = landing_diagnostics.get("main_finding")
+    data_quality_warning = landing_diagnostics.get("data_quality_warning")
     snapshot = landing_diagnostics.get("funnel_snapshot", {})
 
     snapshot_lines = [
@@ -564,6 +606,40 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         f"Регистрации: {snapshot.get('register_success') if snapshot.get('register_success') is not None else '—'}",
         f"Активация: {snapshot.get('activation_1') if snapshot.get('activation_1') is not None else '—'}",
     ]
+
+    # data_quality_warning -- ОТДЕЛЬНАЯ ветка, проверяется раньше main_finding
+    # is None, потому что при этом предупреждении main_finding ВСЕГДА None
+    # (см. diagnostics.analyze_landing_funnel: правило A возвращает либо
+    # finding, либо warning, никогда оба). Если бы эта ветка не была
+    # отдельной, бот сказал бы "критической проблемы нет" вместо честного
+    # предупреждения о ненадёжности сравнения -- именно та ошибка, которую
+    # просили исправить.
+    if data_quality_warning is not None:
+        lines = [
+            "Growth Agent — диагностика лендинга",
+            f"Проект: {project_name}",
+            "",
+            "Главный сигнал:",
+            "Не могу надёжно сравнить рекламный трафик с воронкой лендинга за этот период.",
+            "",
+            "Что известно:",
+            data_quality_warning["message"],
+            "",
+            "Что НЕ делать:",
+            "Не делать вывод, что переход с рекламы на лендинг сломан, и не менять лендинг "
+            "или рекламу на основании этого сравнения, пока период не станет сопоставимым.",
+            "",
+            "Воронка за период (для справки, сравнение ненадёжно):",
+        ]
+        lines.extend(snapshot_lines)
+
+        warnings = landing_diagnostics.get("instrumentation_warnings", [])
+        if warnings:
+            lines.append("")
+            lines.append("Замечания по трекингу:")
+            lines.extend(f"— {w}" for w in warnings)
+
+        return "\n".join(lines)
 
     if main_finding is None:
         lines = [

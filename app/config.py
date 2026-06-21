@@ -84,6 +84,14 @@ MIN_LANDING_VIEWS_FOR_FUNNEL_DIAGNOSTICS = 10
 # Если raw в N+ раз больше unique -- instrumentation warning (правило F).
 RAW_VS_UNIQUE_WARNING_MULTIPLIER = 1.5
 
+# Минимальный возраст landing tracking, при котором сравнение с Direct
+# clicks за весь requested-период считается надёжным. Если tracking_started_at
+# моложе этого порога ОТНОСИТЕЛЬНО начала запрошенного периода (period_hours),
+# правило A не делает вывод "переход с рекламы сломан" -- классифицирует
+# это как data_quality_warning (period mismatch), потому что Direct clicks
+# включают время до того, как landing tracking начал что-либо считать.
+LANDING_TRACKING_MIN_MATURITY_HOURS = 1
+
 # Словарь кластеров поисковых запросов по умолчанию -- используется, если
 # в Project.settings_json["query_clusters"] ничего не задано. Per-project
 # словарь почти всегда нужен (у каждого продукта свой релевантный intent),
