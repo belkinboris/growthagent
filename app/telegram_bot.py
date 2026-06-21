@@ -379,11 +379,11 @@ def _format_onboarding_diagnostics_teaser(onboarding_diagnostics: dict | None) -
 def _format_landing_funnel_teaser(landing_diagnostics: dict | None) -> str | None:
     """
     Короткая пометка про landing funnel diagnostics для основного сообщения,
-    симметрично тизерам выше. data_quality_warning -- ОТДЕЛЬНАЯ ветка от
-    "критической проблемы нет": если сравнение метрик ненадёжно из-за
-    period mismatch, агент должен сказать именно это, не молчать и не
-    говорить "всё хорошо" (см. format_landing_funnel_details -- та же
-    логика приоритета data_quality_warning над main_finding is None).
+    симметрично тизерам выше. data_quality_warning и main_finding теперь
+    НЕ взаимоисключающие (см. diagnostics.analyze_landing_funnel) -- если
+    есть downstream finding (правила B-E, не зависят от Director), он
+    упоминается в тизере даже при наличии warning по правилу A, потому что
+    находка внутри TruePost-воронки важнее короткой строки "несопоставимо".
     """
     if landing_diagnostics is None:
         return None
@@ -400,15 +400,23 @@ def _format_landing_funnel_teaser(landing_diagnostics: dict | None) -> str | Non
         return "Не удалось получить данные воронки лендинга в этот раз -- техническая ошибка."
 
     data_quality_warning = landing_diagnostics.get("data_quality_warning")
+    main_finding = landing_diagnostics.get("main_finding")
+
+    if main_finding:
+        # Downstream finding есть -- упоминаем его первым, независимо от
+        # того, есть ли warning по правилу A. Если warning тоже есть,
+        # добавляем короткую пометку об этом, не разворачивая детали --
+        # полный текст обоих сигналов будет по кнопке "Детали лендинга".
+        text = f"Проверил воронку лендинга: разрыв на шаге «{main_finding['step_label'].lower()}»."
+        if data_quality_warning is not None:
+            text += " Сравнение с рекламным трафиком за этот период отдельно ненадёжно."
+        return text + " Детали — по кнопке ниже."
+
     if data_quality_warning is not None:
         return (
             "Проверил воронку лендинга: данные за этот период пока несопоставимы "
             "(landing tracking внедрён недавно). Детали — по кнопке ниже."
         )
-
-    main_finding = landing_diagnostics.get("main_finding")
-    if main_finding:
-        return f"Проверил воронку лендинга: разрыв на шаге «{main_finding['step_label'].lower()}». Детали — по кнопке ниже."
 
     return "Проверил воронку лендинга: критической проблемы нет."
 
@@ -607,73 +615,73 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         f"Активация: {snapshot.get('activation_1') if snapshot.get('activation_1') is not None else '—'}",
     ]
 
-    # data_quality_warning -- ОТДЕЛЬНАЯ ветка, проверяется раньше main_finding
-    # is None, потому что при этом предупреждении main_finding ВСЕГДА None
-    # (см. diagnostics.analyze_landing_funnel: правило A возвращает либо
-    # finding, либо warning, никогда оба). Если бы эта ветка не была
-    # отдельной, бот сказал бы "критической проблемы нет" вместо честного
-    # предупреждения о ненадёжности сравнения -- именно та ошибка, которую
-    # просили исправить.
-    if data_quality_warning is not None:
-        lines = [
-            "Growth Agent — диагностика лендинга",
-            f"Проект: {project_name}",
-            "",
-            "Главный сигнал:",
-            "Не могу надёжно сравнить рекламный трафик с воронкой лендинга за этот период.",
-            "",
-            "Что известно:",
-            data_quality_warning["message"],
-            "",
-            "Что НЕ делать:",
-            "Не делать вывод, что переход с рекламы на лендинг сломан, и не менять лендинг "
-            "или рекламу на основании этого сравнения, пока период не станет сопоставимым.",
-            "",
-            "Воронка за период (для справки, сравнение ненадёжно):",
-        ]
-        lines.extend(snapshot_lines)
+    # data_quality_warning и main_finding теперь НЕ взаимоисключающие --
+    # warning касается только сравнения Direct clicks vs landing_views
+    # (правило A), а main_finding может быть найден по правилам B-E, которые
+    # анализируют исключительно внутреннюю TruePost-воронку и не зависят
+    # от Director. Оба блока показываются вместе, если оба присутствуют --
+    # warning не подавляет downstream finding (ранее это было ошибкой).
+    lines = ["Growth Agent — диагностика лендинга", f"Проект: {project_name}", ""]
 
-        warnings = landing_diagnostics.get("instrumentation_warnings", [])
-        if warnings:
+    if data_quality_warning is not None and main_finding is not None:
+        # Оба сигнала есть -- формат из задачи: "Главный сигнал" про
+        # несопоставимость, "Дополнительный сигнал внутри TruePost" про
+        # находку B-E, общий "Что НЕ делать" и "Что проверить".
+        lines.append("Главный сигнал:")
+        lines.append(
+            "Данные Direct clicks vs landing_views пока несопоставимы, поэтому нельзя делать "
+            "вывод о проблеме перехода из рекламы."
+        )
+        lines.append("")
+        lines.append("Дополнительный сигнал внутри TruePost:")
+        lines.append(main_finding["detail"] + f" Вероятная зона проблемы — {main_finding['probable_cause'].lower()}")
+        lines.append("")
+        lines.append("Что НЕ делать:")
+        not_do = "Не менять рекламу и лендинг на основании сравнения Direct clicks vs landing_views."
+        if not main_finding["affects_landing_or_ads"]:
+            not_do += " Также не нужно менять лендинг или рекламу на основании дополнительного сигнала — он локализован после клика по CTA."
+        lines.append(not_do)
+        lines.append("")
+        lines.append("Что проверить:")
+        lines.append(main_finding["recommended_action"])
+
+    elif data_quality_warning is not None:
+        # Только warning, downstream-находок нет (внутренняя воронка либо
+        # в порядке, либо данных мало для неё).
+        lines.append("Главный сигнал:")
+        lines.append("Не могу надёжно сравнить рекламный трафик с воронкой лендинга за этот период.")
+        lines.append("")
+        lines.append("Что известно:")
+        lines.append(data_quality_warning["message"])
+        if landing_diagnostics.get("no_critical_issue"):
             lines.append("")
-            lines.append("Замечания по трекингу:")
-            lines.extend(f"— {w}" for w in warnings)
+            lines.append("Внутри отслеженной TruePost-воронки критической проблемы не нашлось.")
+        lines.append("")
+        lines.append("Что НЕ делать:")
+        lines.append(
+            "Не делать вывод, что переход с рекламы на лендинг сломан, и не менять лендинг "
+            "или рекламу на основании этого сравнения, пока период не станет сопоставимым."
+        )
 
-        return "\n".join(lines)
-
-    if main_finding is None:
-        lines = [
-            "Growth Agent — диагностика лендинга",
-            f"Проект: {project_name}",
-            "",
-            "Главный сигнал:",
-            "Критической проблемы в воронке лендинга нет, продолжаем наблюдать.",
-            "",
-            "Воронка за период:",
-        ]
-        lines.extend(snapshot_lines)
-    else:
-        lines = [
-            "Growth Agent — диагностика лендинга",
-            f"Проект: {project_name}",
-            "",
-            "Главный сигнал:",
-            f"Разрыв на шаге: {main_finding['step_label']}.",
-            "",
-            "Что проверил:",
-            "Прошёл по всей воронке лендинга: клики из Директа → просмотры → CTA → открытие бота → регистрация → активация.",
-            "",
-            "Результат:",
-            main_finding["detail"],
-            "",
-            "Вероятная причина:",
-            main_finding["probable_cause"],
-            "",
-            "Что сделать:",
-            main_finding["recommended_action"],
-            "",
-            f"Что проверить после исправления: {main_finding['metric_to_recheck']}.",
-        ]
+    elif main_finding is not None:
+        # Только downstream-находка, период с Director сопоставим (или
+        # Director не участвовал вовсе) -- обычный единый формат.
+        lines.append("Главный сигнал:")
+        lines.append(f"Разрыв на шаге: {main_finding['step_label']}.")
+        lines.append("")
+        lines.append("Что проверил:")
+        lines.append("Прошёл по всей воронке лендинга: клики из Директа → просмотры → CTA → открытие бота → регистрация → активация.")
+        lines.append("")
+        lines.append("Результат:")
+        lines.append(main_finding["detail"])
+        lines.append("")
+        lines.append("Вероятная причина:")
+        lines.append(main_finding["probable_cause"])
+        lines.append("")
+        lines.append("Что сделать:")
+        lines.append(main_finding["recommended_action"])
+        lines.append("")
+        lines.append(f"Что проверить после исправления: {main_finding['metric_to_recheck']}.")
 
         if not main_finding["affects_landing_or_ads"]:
             lines.append("")
@@ -682,9 +690,14 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
                 "или настройки рекламы на основании этого сигнала не нужно."
             )
 
-        lines.append("")
-        lines.append("Воронка за период:")
-        lines.extend(snapshot_lines)
+    else:
+        # Ни warning, ни finding -- всё технически в порядке.
+        lines.append("Главный сигнал:")
+        lines.append("Критической проблемы в воронке лендинга нет, продолжаем наблюдать.")
+
+    lines.append("")
+    lines.append("Воронка за период:" + (" (сравнение с рекламой ненадёжно)" if data_quality_warning else ""))
+    lines.extend(snapshot_lines)
 
     warnings = landing_diagnostics.get("instrumentation_warnings", [])
     if warnings:
