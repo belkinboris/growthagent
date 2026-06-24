@@ -417,6 +417,8 @@ async def fetch_ad_group_report(
     sandbox: bool = False,
     timeout_seconds: float = 30.0,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    date_from_override: Optional[str] = None,
+    date_to_override: Optional[str] = None,
 ) -> dict:
     """
     Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
@@ -427,12 +429,24 @@ async def fetch_ad_group_report(
     (diagnostics.py) должен решать, когда его реально запускать (см.
     should_run_deep_diagnostics() в service.py), не на каждый /run.
 
+    date_from_override/date_to_override -- явное окно в формате YYYY-MM-DD,
+    переопределяющее period_hours. Нужно для clean-period анализа (см.
+    service.get_latest_cutoff): если для сегмента зарегистрирован cutoff
+    внутри обычного периода, Growth Agent должен перезапросить Director
+    именно за окно cutoff_at -> сейчас, а не пытаться отфильтровать уже
+    агрегированные построчные данные постфактум -- Reports API не отдаёт
+    per-row timestamp клика, только дневные суммы, поэтому точная
+    постфактум-фильтрация физически невозможна без отдельного запроса.
+
     Бросает те же исключения, что fetch_metrics().
     """
     if not oauth_token or not client_login:
         raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
 
-    date_from, date_to = _period_to_dates(period_hours)
+    if date_from_override is not None and date_to_override is not None:
+        date_from, date_to = date_from_override, date_to_override
+    else:
+        date_from, date_to = _period_to_dates(period_hours)
     report_definition = _build_ad_group_report_definition(campaign_ids, date_from, date_to)
 
     text, attempt_statuses = await _execute_report_request(
@@ -470,6 +484,8 @@ async def fetch_search_query_report(
     sandbox: bool = False,
     timeout_seconds: float = 30.0,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    date_from_override: Optional[str] = None,
+    date_to_override: Optional[str] = None,
 ) -> dict:
     """
     Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
@@ -480,11 +496,17 @@ async def fetch_search_query_report(
     поисковыми показами -- для кампаний только в РСЯ запрос может вернуть
     пустой отчёт (graceful: нули/пустой список, не ошибка, см. обработку
     пустого TSV в _parse_tsv).
+
+    date_from_override/date_to_override -- см. docstring fetch_ad_group_report,
+    та же логика для clean-period.
     """
     if not oauth_token or not client_login:
         raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
 
-    date_from, date_to = _period_to_dates(period_hours)
+    if date_from_override is not None and date_to_override is not None:
+        date_from, date_to = date_from_override, date_to_override
+    else:
+        date_from, date_to = _period_to_dates(period_hours)
     report_definition = _build_search_query_report_definition(campaign_ids, date_from, date_to)
 
     text, attempt_statuses = await _execute_report_request(
