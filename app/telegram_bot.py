@@ -20,11 +20,18 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from sqlmodel import select
 
 from app.analyzer import AlertCandidate
-from app.config import BUILD_MARKER, RUN_CYCLE_TIMEOUT_SECONDS, get_settings, MIN_SIGNUP_CONVERSION_WARN_PERCENT, DEFAULT_QUERY_CLUSTERS
+from app.config import (
+    BUILD_MARKER,
+    MANUAL_RUN_STALE_AFTER_SECONDS,
+    MANUAL_RUN_TIMEOUT_SECONDS,
+    get_settings,
+    MIN_SIGNUP_CONVERSION_WARN_PERCENT,
+    DEFAULT_QUERY_CLUSTERS,
+)
 from app.db import get_session
-from app.models import Alert, AlertStatus, Integration, IntegrationStatus, Project
+from app.models import Alert, AlertStatus, Integration, IntegrationStatus, MetricSnapshot, Project
 from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
-from app.scheduler import run_cycle_once
+from app.scheduler import run_cycle_once_sync_with_timeout
 from app.service import AlertChange, AlertChangeType, CycleResult
 
 logger = logging.getLogger("growth_agent.telegram")
@@ -37,6 +44,11 @@ CONFIDENCE_RU = {
 }
 
 SNOOZE_HOURS = 24
+SERVICE_STARTED_AT = datetime.now(timezone.utc)
+_manual_run_lock = asyncio.Lock()
+_manual_run_task: asyncio.Task | None = None
+_manual_run_started_at: datetime | None = None
+
 
 
 # ---------------------------------------------------------------------------
@@ -1268,6 +1280,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Аналитик Воронки — режим наблюдения.\n"
         f"Версия: {BUILD_MARKER}\n\n"
         "Команды:\n"
+        "/ping — быстрая проверка, что бот отвечает\n"
+        "/build — версия и время запуска\n"
         "/status — состояние проекта\n"
         "/run — запустить проверку вручную\n"
         "/alerts — последние сигналы\n"
@@ -1278,6 +1292,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_direct — проверить подключение к Яндекс.Директу\n"
         "/deep_direct — глубокая диагностика Директа (группы, поисковые запросы)\n"
         "/check_landing — диагностика воронки лендинга (Яндекс.Директ → лендинг → кнопка → бот → регистрация → активация)"
+    )
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cheap liveness check: no external APIs and no DB-heavy logic."""
+    logger.info("Telegram /ping answered (build=%s)", BUILD_MARKER)
+    await update.message.reply_text("pong — бот отвечает")
+
+
+async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cheap build diagnostics: no external APIs."""
+    now = datetime.now(timezone.utc)
+    uptime = (now - SERVICE_STARTED_AT).total_seconds()
+    run_state = "не запущена"
+    if _manual_run_task is not None and not _manual_run_task.done() and _manual_run_started_at is not None:
+        run_state = f"идёт {_format_duration((now - _manual_run_started_at).total_seconds())}"
+    await update.message.reply_text(
+        "Сборка Аналитика Воронки\n"
+        f"Версия: {BUILD_MARKER}\n"
+        f"Запущен: {SERVICE_STARTED_AT.isoformat()}\n"
+        f"Uptime: {_format_duration(uptime)}\n"
+        f"Ручная проверка /run: {run_state}"
     )
 
 
@@ -1335,70 +1371,175 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ).all()
         status_lines.append("")
         status_lines.append(f"Открытых сигналов: {len(open_alerts_count)}")
+        if _manual_run_task is not None and not _manual_run_task.done() and _manual_run_started_at is not None:
+            elapsed = (datetime.now(timezone.utc) - _manual_run_started_at).total_seconds()
+            status_lines.append(f"Ручная проверка /run: идёт {_format_duration(elapsed)}")
+        else:
+            status_lines.append("Ручная проверка /run: не запущена")
 
         await update.message.reply_text("\n".join(status_lines))
 
 
-async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Запускаю проверку...")
-    logger.info("Manual /run started (build=%s)", BUILD_MARKER)
+def _format_duration(seconds: float) -> str:
+    seconds_int = max(0, int(seconds))
+    minutes, sec = divmod(seconds_int, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин {sec} сек"
+    if minutes:
+        return f"{minutes} мин {sec} сек"
+    return f"{sec} сек"
+
+
+def _build_cycle_response(result: CycleResult) -> tuple[str, InlineKeyboardMarkup | None]:
+    with get_session() as session:
+        project = _get_active_project(session)
+        project_name = project.name if project else "Проект"
+
+    text = format_cycle_message(result, project_name)
+
+    keyboard = None
+    if result.primary_candidate is not None:
+        with get_session() as session:
+            alert = session.exec(
+                select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
+            ).first()
+            if alert:
+                keyboard = build_alert_keyboard(
+                    alert.id,
+                    has_deep_diagnostics=result.deep_diagnostics is not None,
+                    deep_diagnostics_available=result.show_deep_direct_button,
+                    has_onboarding_diagnostics=result.onboarding_diagnostics is not None
+                    and result.onboarding_diagnostics.get("status") == "ok",
+                    onboarding_diagnostics_available=result.show_onboarding_button,
+                    has_landing_funnel_diagnostics=result.landing_funnel_diagnostics is not None
+                    and result.landing_funnel_diagnostics.get("status") == "ok",
+                    landing_funnel_diagnostics_available=result.show_landing_funnel_button,
+                )
+
+    return text, keyboard
+
+
+async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> None:
+    global _manual_run_task, _manual_run_started_at
+
+    current_task = asyncio.current_task()
+    logger.info("Manual /run started (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
 
     try:
-        result = await asyncio.wait_for(run_cycle_once(), timeout=RUN_CYCLE_TIMEOUT_SECONDS)
-
-        with get_session() as session:
-            project = _get_active_project(session)
-            project_name = project.name if project else "Проект"
-
-        text = format_cycle_message(result, project_name)
-
-        # /run показывает результат ВСЕГДА, даже если has_notifiable_changes
-        # False -- это явный запрос пользователя посмотреть текущее состояние,
-        # а не автоматическое уведомление, для которого молчание оправдано.
-        keyboard = None
-        if result.primary_candidate is not None:
-            # Нужен alert_id для кнопок -- берём его из БД по fingerprint primary candidate
-            with get_session() as session:
-                alert = session.exec(
-                    select(Alert).where(Alert.fingerprint == result.primary_candidate.fingerprint)
-                ).first()
-                if alert:
-                    # show_deep_direct_button/show_onboarding_button уже учитывают
-                    # и наличие интеграции, и наличие реальных данных за период
-                    # (не просто "токен задан") -- вычислены в scheduler.py.
-                    keyboard = build_alert_keyboard(
-                        alert.id,
-                        has_deep_diagnostics=result.deep_diagnostics is not None,
-                        deep_diagnostics_available=result.show_deep_direct_button,
-                        has_onboarding_diagnostics=result.onboarding_diagnostics is not None
-                        and result.onboarding_diagnostics.get("status") == "ok",
-                        onboarding_diagnostics_available=result.show_onboarding_button,
-                        has_landing_funnel_diagnostics=result.landing_funnel_diagnostics is not None
-                        and result.landing_funnel_diagnostics.get("status") == "ok",
-                        landing_funnel_diagnostics_available=result.show_landing_funnel_button,
-                    )
-
-        await update.message.reply_text(text, reply_markup=keyboard)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_cycle_once_sync_with_timeout,
+                None,
+                MANUAL_RUN_TIMEOUT_SECONDS,
+                "manual_telegram_run",
+            ),
+            timeout=MANUAL_RUN_TIMEOUT_SECONDS + 5.0,
+        )
+        text, keyboard = _build_cycle_response(result)
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
         logger.info(
-            "Manual /run finished (build=%s, primary=%s, milestones=%s)",
+            "Manual /run finished (build=%s, chat_id=%s, elapsed=%.1f sec, primary=%s, milestones=%s)",
             BUILD_MARKER,
+            chat_id,
+            (datetime.now(timezone.utc) - started_at).total_seconds(),
             result.primary_candidate.title if result.primary_candidate else None,
             len(result.milestone_notifications),
         )
-
     except asyncio.TimeoutError:
-        logger.warning("Manual /run timed out after %.1f sec (build=%s)", RUN_CYCLE_TIMEOUT_SECONDS, BUILD_MARKER)
-        await update.message.reply_text(
-            "Проверка заняла слишком много времени и была остановлена. "
-            "Вероятно, один из внешних источников данных отвечает медленно. "
-            "Бот жив, сбор данных не заблокирован. Повторите /run позже или проверьте логи Railway."
+        logger.warning(
+            "Manual /run timed out after %.1f sec (build=%s, chat_id=%s)",
+            MANUAL_RUN_TIMEOUT_SECONDS,
+            BUILD_MARKER,
+            chat_id,
         )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Проверка заняла слишком много времени и была остановлена. "
+                "Вероятно, один из внешних источников данных отвечает медленно. "
+                "Бот остаётся живым: /ping, /status, /funnel и /start должны отвечать. "
+                "Повторите /run позже или проверьте логи Railway."
+            ),
+        )
+    except asyncio.CancelledError:
+        logger.warning("Manual /run task cancelled (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        raise
     except Exception:
-        logger.exception("Manual /run failed (build=%s)", BUILD_MARKER)
-        await update.message.reply_text(
-            "Не удалось выполнить проверку из-за внутренней ошибки. "
-            "Я уже записал traceback в логи Railway. Проверьте свежий лог после /run."
-        )
+        logger.exception("Manual /run failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Не удалось выполнить проверку из-за внутренней ошибки. "
+                    "Traceback записан в Railway logs. Бот не заблокирован; можно проверить /ping или /status."
+                ),
+            )
+        except Exception:
+            logger.exception("Manual /run failed and final Telegram error message could not be sent")
+    finally:
+        async with _manual_run_lock:
+            if _manual_run_task is current_task:
+                _manual_run_task = None
+                _manual_run_started_at = None
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Manual /run is isolated from Telegram update processing.
+
+    The handler only accepts/rejects the run and schedules a background task.
+    The heavy collection/analyzer cycle is executed in a separate thread, so a
+    slow Direct/Metrika/product endpoint cannot block /ping, /status, /start or
+    other Telegram commands in the dispatcher event loop.
+    """
+    global _manual_run_task, _manual_run_started_at
+
+    if update.effective_chat is None or update.message is None:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    async with _manual_run_lock:
+        if _manual_run_task is not None and not _manual_run_task.done():
+            elapsed = (now - _manual_run_started_at).total_seconds() if _manual_run_started_at else 0.0
+            if elapsed <= MANUAL_RUN_STALE_AFTER_SECONDS:
+                logger.info(
+                    "Manual /run rejected because already running (build=%s, elapsed=%.1f sec)",
+                    BUILD_MARKER,
+                    elapsed,
+                )
+                await update.message.reply_text(
+                    "Проверка уже запущена. Дождитесь результата или попробуйте позже."
+                )
+                return
+
+            logger.warning(
+                "Manual /run stale lock cleanup (build=%s, elapsed=%.1f sec, stale_after=%.1f sec)",
+                BUILD_MARKER,
+                elapsed,
+                MANUAL_RUN_STALE_AFTER_SECONDS,
+            )
+            _manual_run_task.cancel()
+            _manual_run_task = None
+            _manual_run_started_at = None
+
+        await update.message.reply_text("Запускаю проверку...")
+        _manual_run_started_at = now
+        chat_id = update.effective_chat.id
+        try:
+            task = context.application.create_task(
+                _manual_run_background(chat_id, context.application.bot, now)
+            )
+        except Exception:
+            _manual_run_started_at = None
+            logger.exception("Manual /run failed before background task creation (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            await update.message.reply_text(
+                "Не удалось запустить проверку из-за внутренней ошибки. Traceback записан в Railway logs."
+            )
+            return
+        _manual_run_task = task
+        logger.info("Manual /run accepted (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1466,74 +1607,86 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Доводка по фидбэку архитектора (Аналитик Воронки 2.0, дешёвые видимые
-    улучшения): убраны технические названия ("Активация 1/2"), вместо
-    них -- vocabulary.py с явной пометкой пользователи/события. Добавлена
-    динамика день-к-дню относительно предыдущего сохранённого снэпшота.
+    Cheap funnel view from the latest saved snapshot. It deliberately does not
+    call run_cycle_once() or any external API, so /funnel remains responsive
+    while manual /run is slow, timed out, or waiting on Direct/Metrika/product.
     """
     from app.vocabulary import format_metric_line, get_metric_explain
     from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
 
-    try:
-        result = await run_cycle_once()
-    except Exception as exc:
-        await update.message.reply_text(f"Не удалось получить данные воронки: {exc}")
-        return
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            await update.message.reply_text("Активный проект не найден.")
+            return
 
-    metrics_7d = result.metrics_by_window.get("7d")
-    if metrics_7d is None:
-        await update.message.reply_text("Данных по воронке нет.")
-        return
+        latest_snapshot = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.period_key == "7d",
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
+
+        if latest_snapshot is None:
+            await update.message.reply_text(
+                "Данных по воронке пока нет: ещё нет сохранённого снэпшота за 7 дней. "
+                "Запустите /run один раз; после этого /funnel будет отвечать быстро без внешних API."
+            )
+            return
+
+        current = extract_normalized_metrics_from_snapshot(latest_snapshot)
+        prev_snapshot = get_previous_snapshot(session, project.id, "7d")
+        prev = None
+        if prev_snapshot is not None and prev_snapshot.id != latest_snapshot.id:
+            prev = extract_normalized_metrics_from_snapshot(prev_snapshot)
 
     lines = ["Воронка за 7 дней:", ""]
+    lines.append(f"Источник: последний сохранённый замер от {latest_snapshot.created_at.isoformat()}.")
+    if _manual_run_task is not None and not _manual_run_task.done():
+        lines.append("Примечание: сейчас идёт /run; этот отчёт не ждёт внешние API и показывает последний сохранённый замер.")
+    lines.append("")
 
-    if metrics_7d.clicks is not None:
-        lines.append(f"{metrics_7d.clicks} событий — клики из рекламы (по данным Яндекс.Директа)")
+    if current.get("clicks") is not None:
+        lines.append(f"{current.get('clicks')} событий — клики из рекламы (по данным Яндекс.Директа)")
 
-    lines.append(format_metric_line("signup", metrics_7d.signup))
-    lines.append(format_metric_line("activation_1", metrics_7d.activation_1))
-    lines.append(format_metric_line("activation_2", metrics_7d.activation_2))
-    lines.append(format_metric_line("payment_started", metrics_7d.payment_started))
-    lines.append(format_metric_line("payment_success", metrics_7d.payment_success))
+    lines.append(format_metric_line("signup", current.get("signup")))
+    lines.append(format_metric_line("activation_1", current.get("activation_1")))
+    lines.append(format_metric_line("activation_2", current.get("activation_2")))
+    lines.append(format_metric_line("payment_started", current.get("payment_started")))
+    lines.append(format_metric_line("payment_success", current.get("payment_success")))
 
-    # Поясняющая сноска про генерации постов -- именно та метрика, которая
-    # визуально может "не сходиться" с остальными (события, не пользователи).
     explain = get_metric_explain("activation_2")
-    if explain and metrics_7d.activation_2 is not None:
+    if explain and current.get("activation_2") is not None:
         lines.append("")
         lines.append(f"Примечание: {explain}")
 
-    # Динамика день-к-дню -- сравнение с предыдущим сохранённым снэпшотом
-    # того же окна. Если истории нет -- честно говорим об этом, не
-    # подставляем нули как "изменений нет" (это разные по смыслу вещи).
-    with get_session() as session:
-        project = _get_active_project(session)
-        if project:
-            prev_snapshot = get_previous_snapshot(session, project.id, "7d")
-            lines.append("")
-            if prev_snapshot is None:
-                lines.append("Динамика: нет данных для сравнения с предыдущим замером.")
-            else:
-                prev = extract_normalized_metrics_from_snapshot(prev_snapshot)
-                deltas = []
-                pairs = [
-                    ("signup", "регистрации", metrics_7d.signup),
-                    ("activation_1", "создали канал", metrics_7d.activation_1),
-                    ("activation_2", "генерации постов", metrics_7d.activation_2),
-                    ("payment_success", "оплатили", metrics_7d.payment_success),
-                ]
-                for key, label, current_value in pairs:
-                    prev_value = prev.get(key)
-                    if current_value is None or prev_value is None:
-                        continue
-                    diff = current_value - prev_value
-                    if diff != 0:
-                        sign = "+" if diff > 0 else ""
-                        deltas.append(f"{label} {sign}{diff}")
-                if deltas:
-                    lines.append(f"С прошлого замера: {', '.join(deltas)}.")
-                else:
-                    lines.append("С прошлого замера: без изменений по основным метрикам.")
+    lines.append("")
+    if prev is None:
+        lines.append("Динамика: нет данных для сравнения с предыдущим замером.")
+    else:
+        deltas = []
+        pairs = [
+            ("signup", "регистрации", current.get("signup")),
+            ("activation_1", "создали канал", current.get("activation_1")),
+            ("activation_2", "генерации постов", current.get("activation_2")),
+            ("payment_success", "оплатили", current.get("payment_success")),
+        ]
+        for key, label, current_value in pairs:
+            prev_value = prev.get(key)
+            if current_value is None or prev_value is None:
+                continue
+            diff = current_value - prev_value
+            if diff != 0:
+                sign = "+" if diff > 0 else ""
+                deltas.append(f"{label} {sign}{diff}")
+        if deltas:
+            lines.append(f"С прошлого замера: {', '.join(deltas)}.")
+        else:
+            lines.append("С прошлого замера: без изменений по основным метрикам.")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -1857,6 +2010,8 @@ def build_application() -> Application:
     app = Application.builder().token(settings.bot_token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("alerts", cmd_alerts))

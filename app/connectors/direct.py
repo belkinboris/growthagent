@@ -24,6 +24,8 @@ from typing import Optional
 
 import httpx
 
+from app.config import DIRECT_REPORT_RETRY_SLEEP_CAP_SECONDS
+
 logger = logging.getLogger("growth_agent.connectors.direct")
 
 
@@ -239,7 +241,13 @@ async def _execute_report_request(
 
         if response.status_code in (201, 202):
             retry_in = response.headers.get("retryIn") or response.headers.get("RetryIn")
-            wait_seconds = float(retry_in) if retry_in else DEFAULT_RETRY_FALLBACK_SECONDS
+            requested_wait_seconds = float(retry_in) if retry_in else DEFAULT_RETRY_FALLBACK_SECONDS
+            wait_seconds = min(requested_wait_seconds, DIRECT_REPORT_RETRY_SLEEP_CAP_SECONDS)
+            if wait_seconds < requested_wait_seconds:
+                logger.info(
+                    "Direct report requested retry in %s sec; capped to %s sec for runtime safety",
+                    requested_wait_seconds, wait_seconds,
+                )
             logger.info(
                 "Direct report not ready yet (status=%s), retrying in %s sec (attempt %d/%d)",
                 response.status_code, wait_seconds, attempt + 1, max_retries,

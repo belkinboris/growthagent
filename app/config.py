@@ -240,9 +240,12 @@ DIRECT_SUMMARY_TIMEOUT_SECONDS = 12.0
 DIRECT_SUMMARY_MAX_RETRIES = 2
 DEEP_DIAGNOSTICS_TIMEOUT_SECONDS = 35.0
 RUN_CYCLE_TIMEOUT_SECONDS = 75.0
+MANUAL_RUN_TIMEOUT_SECONDS = 75.0
+MANUAL_RUN_STALE_AFTER_SECONDS = 120.0
+DIRECT_REPORT_RETRY_SLEEP_CAP_SECONDS = 3.0
 
 # Метка версии для диагностики деплоя -- не семантический номер версии,
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-hotfix-2026-06-24"
+BUILD_MARKER = "growth-agent-emergencyfix-2026-06-24"

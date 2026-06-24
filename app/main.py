@@ -27,7 +27,7 @@ from telegram import Update
 from app.config import BUILD_MARKER, RUN_CYCLE_TIMEOUT_SECONDS, get_settings
 from app.db import get_session, init_db
 from app.models import Alert, Integration, MetricSnapshot, Project
-from app.scheduler import run_cycle_once, start_scheduler, stop_scheduler
+from app.scheduler import run_cycle_once_sync_with_timeout, start_scheduler, stop_scheduler
 from app.telegram_bot import build_application, send_cycle_notification
 
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +40,7 @@ _telegram_app = None  # инициализируется в startup, если BO
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    logger.info("Service startup started. Build: %s", BUILD_MARKER)
     init_db()
 
     settings = get_settings()
@@ -49,7 +50,7 @@ async def on_startup() -> None:
         _telegram_app = build_application()
         await _telegram_app.initialize()
         await _telegram_app.start()
-        logger.info("Telegram bot initialized")
+        logger.info("Telegram bot polling/dispatcher started. Build: %s", BUILD_MARKER)
     else:
         logger.warning("BOT_TOKEN not set -- Telegram bot disabled, HTTP API still works")
 
@@ -61,7 +62,12 @@ async def on_startup() -> None:
         где оба компонента (scheduler, telegram_bot) уже собраны вместе.
         """
         try:
-            result = await asyncio.wait_for(run_cycle_once(), timeout=RUN_CYCLE_TIMEOUT_SECONDS)
+            result = await asyncio.to_thread(
+                run_cycle_once_sync_with_timeout,
+                None,
+                RUN_CYCLE_TIMEOUT_SECONDS,
+                "scheduled_cycle",
+            )
             with get_session() as session:
                 project = session.exec(select(Project).where(Project.is_active == True)).first()
                 project_name = project.name if project else "Проект"
@@ -172,7 +178,12 @@ async def api_run():
     возвращает JSON, а не текст -- используется веб-интерфейсом (static/).
     """
     try:
-        result = await asyncio.wait_for(run_cycle_once(), timeout=RUN_CYCLE_TIMEOUT_SECONDS)
+        result = await asyncio.to_thread(
+            run_cycle_once_sync_with_timeout,
+            None,
+            RUN_CYCLE_TIMEOUT_SECONDS,
+            "api_run",
+        )
     except asyncio.TimeoutError:
         logger.warning("API /api/run timed out after %.1f sec", RUN_CYCLE_TIMEOUT_SECONDS)
         raise HTTPException(

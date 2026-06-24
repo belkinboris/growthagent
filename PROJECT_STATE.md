@@ -21,6 +21,33 @@
 
 ### Сделано
 
+- **Emergency runtime fix 2026-06-24 (`growth-agent-emergencyfix-2026-06-24`)** —
+  `/run` больше не выполняет тяжёлый цикл внутри Telegram handler. Команда
+  только принимает задачу, ставит single-flight guard и запускает сбор данных
+  в отдельном thread/background task; Telegram dispatcher остаётся свободным
+  для `/ping`, `/build`, `/status`, `/start` и `/funnel`. Повторный `/run`
+  во время активной проверки отклоняется сообщением «Проверка уже запущена...».
+  Добавлен stale-lock cleanup и внешний timeout над thread-await, чтобы даже
+  при зависшем внутреннем event loop пользователь получил финальное сообщение.
+  `/funnel` переведён на последний сохранённый snapshot и больше не вызывает
+  внешние API. Добавлены дешёвые команды `/ping` и `/build`. Direct Reports
+  retry sleep ограничен сверху, чтобы `RetryIn` не удерживал manual `/run`
+  слишком долго. Логи теперь явно фиксируют: accepted/rejected/started/source
+  timeout/finished/failed with traceback.
+
+- **Runtime hotfix 2026-06-24 (`growth-agent-hotfix-2026-06-24`)** —
+  добавлена явная метка версии в `/start` и `/status`; `/run` теперь
+  обёрнут верхнеуровневым timeout и всегда отвечает финальным сообщением:
+  либо отчётом, либо понятной ошибкой о медленном внешнем источнике.
+  Источники в одном окне (`TruePost`, Метрика, Директ, YooKassa) собираются
+  параллельно, каждый внешний вызов имеет runtime-fuse. Для Direct summary
+  снижены max retries/timeout в обычном `/run`, а глубокие Direct-отчёты
+  имеют отдельный timeout/fallback, чтобы Reports API не зависал в retry-цикле.
+  Причина hotfix: после предыдущего деплоя Telegram присылал только
+  «Запускаю проверку...» без итогового отчёта — вероятнее всего из-за
+  долгого внешнего API/Director Reports retry path либо старого build-marker,
+  который не позволял отличить старый билд от нового.
+
 - **`app/vocabulary.py`** (новый файл) — человекочитаемый словарь метрик.
   Расшифровка `activation_1`/`activation_2` взята из реального кода
   (`connectors/truepost.py`), не придумана: `activation_1` = создание

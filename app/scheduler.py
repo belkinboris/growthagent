@@ -15,6 +15,7 @@ run_cycle_once() -- главная функция, которую вызываю
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -64,10 +65,22 @@ from app.service import (
 )
 
 logger = logging.getLogger("growth_agent.scheduler")
+_RUN_CONTEXT: ContextVar[str] = ContextVar("growth_agent_run_context", default="scheduled_or_api")
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log_manual_source_failure(source_name: str, error: object) -> None:
+    """Extra lifecycle logging for manual /run, including connector-level HTTP timeouts."""
+    if _RUN_CONTEXT.get() != "manual_telegram_run":
+        return
+    message = str(error)
+    if "timeout" in message.lower() or "не ответ" in message.lower():
+        logger.warning("Manual /run source timeout: %s: %s", source_name, message)
+    else:
+        logger.warning("Manual /run source failed: %s: %s", source_name, message)
 
 
 async def _run_with_timeout(awaitable, timeout_seconds: float, source_name: str):
@@ -79,10 +92,17 @@ async def _run_with_timeout(awaitable, timeout_seconds: float, source_name: str)
     try:
         return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
     except asyncio.TimeoutError:
-        logger.warning(
-            "%s did not respond within %.1f sec -- continuing cycle with this source unavailable",
-            source_name, timeout_seconds,
-        )
+        context = _RUN_CONTEXT.get()
+        if context == "manual_telegram_run":
+            logger.warning(
+                "Manual /run source timeout: %s did not respond within %.1f sec -- continuing with this source unavailable",
+                source_name, timeout_seconds,
+            )
+        else:
+            logger.warning(
+                "%s did not respond within %.1f sec -- continuing cycle with this source unavailable",
+                source_name, timeout_seconds,
+            )
         raise
 
 
@@ -119,6 +139,7 @@ async def _fetch_product_metrics(project: Project, period_hours: int) -> tuple[d
     except asyncio.TimeoutError:
         return None, f"TruePost не ответил за {CONNECTOR_CALL_TIMEOUT_SECONDS:.0f} секунд", None
     except truepost_connector.TruePostConnectorError as exc:
+        _log_manual_source_failure("TruePost metrics", exc)
         return None, str(exc), None
 
 
@@ -147,6 +168,7 @@ async def _fetch_metrika_metrics(project: Project, period_hours: int) -> tuple[d
     except asyncio.TimeoutError:
         return None, f"Яндекс.Метрика не ответила за {CONNECTOR_CALL_TIMEOUT_SECONDS:.0f} секунд"
     except metrika_connector.MetrikaConnectorError as exc:
+        _log_manual_source_failure("Metrika metrics", exc)
         return None, str(exc)
 
 
@@ -172,6 +194,7 @@ async def _fetch_direct_metrics(period_hours: int) -> tuple[dict | None, str | N
     except asyncio.TimeoutError:
         return None, f"Яндекс.Директ не ответил за {CONNECTOR_CALL_TIMEOUT_SECONDS:.0f} секунд"
     except direct_connector.DirectConnectorError as exc:
+        _log_manual_source_failure("Direct summary", exc)
         return None, str(exc)
 
 
@@ -193,6 +216,7 @@ async def _fetch_yookassa_metrics(period_hours: int) -> tuple[dict | None, str |
     except asyncio.TimeoutError:
         return None, f"ЮKassa не ответила за {CONNECTOR_CALL_TIMEOUT_SECONDS:.0f} секунд"
     except yookassa_connector.YooKassaConnectorError as exc:
+        _log_manual_source_failure("YooKassa metrics", exc)
         return None, str(exc)
 
 
@@ -578,6 +602,7 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
     except asyncio.TimeoutError:
         return None, f"Директ не успел подготовить глубокий отчёт за {DEEP_DIAGNOSTICS_TIMEOUT_SECONDS:.0f} секунд"
     except direct_connector.DirectConnectorError as exc:
+        _log_manual_source_failure("Direct summary", exc)
         return None, str(exc)
 
     query_clusters = get_query_clusters(project.settings_json)
@@ -672,6 +697,24 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
 def run_cycle_once_sync(project_id: int | None = None) -> CycleResult:
     """Синхронная обёртка для вызова из не-async контекста (например APScheduler job)."""
     return asyncio.run(run_cycle_once(project_id))
+
+
+def run_cycle_once_sync_with_timeout(
+    project_id: int | None = None,
+    timeout_seconds: float = RUN_CYCLE_TIMEOUT_SECONDS,
+    context_label: str = "scheduled_or_api",
+) -> CycleResult:
+    """
+    Синхронный безопасный запуск полного цикла. Нужен для Telegram /run:
+    сам тяжёлый цикл выполняется в отдельном thread через asyncio.to_thread(),
+    поэтому Telegram dispatcher/event loop не блокируется внешними API.
+    """
+    token = _RUN_CONTEXT.set(context_label)
+    try:
+        return asyncio.run(asyncio.wait_for(run_cycle_once(project_id), timeout=timeout_seconds))
+    finally:
+        _RUN_CONTEXT.reset(token)
+
 
 
 async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
