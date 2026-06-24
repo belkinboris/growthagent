@@ -29,6 +29,7 @@ from app.config import (
     DIRECT_SUMMARY_TIMEOUT_SECONDS,
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
+    MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
 )
 from app.connectors import direct as direct_connector
 from app.connectors import landing as landing_connector
@@ -886,6 +887,38 @@ async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
         save_diagnostics_cache(session, project.id, "7d", "manual_refresh", result_dict)
 
         return {"ok": True, "result": result_dict}
+
+
+def force_refresh_deep_diagnostics_sync_with_timeout(
+    project_id: int | None = None,
+    timeout_seconds: float = MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+) -> dict:
+    """
+    Synchronous safe wrapper for manual /deep_direct.
+
+    Telegram handlers call this through asyncio.to_thread(), so a slow Direct
+    Reports API cannot block the bot event loop. The wrapper always returns a
+    structured dict; exceptions and timeouts do not leak into the handler.
+    """
+    token = _RUN_CONTEXT.set("manual_deep_direct")
+    try:
+        return asyncio.run(asyncio.wait_for(force_refresh_deep_diagnostics(project_id), timeout=timeout_seconds))
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Manual /deep_direct timed out after %.1f sec (project_id=%s)",
+            timeout_seconds,
+            project_id,
+        )
+        return {
+            "ok": False,
+            "timeout": True,
+            "error": f"Директ не успел подготовить глубокий отчёт за {timeout_seconds:.0f} секунд",
+        }
+    except Exception as exc:
+        logger.exception("Manual /deep_direct failed with traceback (project_id=%s)", project_id)
+        return {"ok": False, "timeout": False, "error": f"Внутренняя ошибка: {exc.__class__.__name__}"}
+    finally:
+        _RUN_CONTEXT.reset(token)
 
 
 # ---------------------------------------------------------------------------

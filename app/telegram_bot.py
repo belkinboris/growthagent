@@ -25,6 +25,9 @@ from app.config import (
     MANUAL_RUN_STALE_AFTER_SECONDS,
     MANUAL_RUN_TIMEOUT_SECONDS,
     STATUS_COMMAND_DB_TIMEOUT_SECONDS,
+    MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+    MANUAL_DEEP_DIRECT_STALE_AFTER_SECONDS,
+    TELEGRAM_MESSAGE_CHUNK_SIZE,
     get_settings,
     MIN_SIGNUP_CONVERSION_WARN_PERCENT,
     DEFAULT_QUERY_CLUSTERS,
@@ -56,6 +59,9 @@ SERVICE_STARTED_AT = datetime.now(timezone.utc)
 _manual_run_lock = asyncio.Lock()
 _manual_run_task: asyncio.Task | None = None
 _manual_run_started_at: datetime | None = None
+_deep_direct_lock = asyncio.Lock()
+_deep_direct_task: asyncio.Task | None = None
+_deep_direct_started_at: datetime | None = None
 
 
 
@@ -1477,6 +1483,64 @@ def _format_dt(dt: datetime | str | None) -> str:
     return _as_aware(dt).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _split_telegram_text(text: str, chunk_size: int = TELEGRAM_MESSAGE_CHUNK_SIZE) -> list[str]:
+    """Split long Telegram messages before hitting Bot API 4096-char limit."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > chunk_size:
+        cut = remaining.rfind("\n\n", 0, chunk_size)
+        if cut < chunk_size * 0.5:
+            cut = remaining.rfind("\n", 0, chunk_size)
+        if cut < chunk_size * 0.5:
+            cut = chunk_size
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def _send_long_message(bot, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    chunks = _split_telegram_text(text)
+    for idx, chunk in enumerate(chunks):
+        markup = reply_markup if idx == len(chunks) - 1 else None
+        await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
+
+
+def _deep_direct_state_text(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    if _deep_direct_task is not None and not _deep_direct_task.done() and _deep_direct_started_at is not None:
+        elapsed = (now - _deep_direct_started_at).total_seconds()
+        return f"идёт {_format_duration(elapsed)}"
+    return "не запущена"
+
+
+def _get_active_project_id_name_sync() -> tuple[int | None, str]:
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            return None, "Проект"
+        return project.id, project.name
+
+
+def _get_cached_deep_direct_sync(project_id: int | None = None) -> tuple[dict | None, str]:
+    with get_session() as session:
+        project = session.get(Project, project_id) if project_id is not None else _get_active_project(session)
+        if project is None:
+            return None, "Проект"
+        cached = get_cached_diagnostics(session, project.id, "7d")
+        if cached is None:
+            return None, project.name
+        result = dict(cached.result_json or {})
+        result["_from_cache"] = True
+        if cached.created_at is not None:
+            result["_cache_created_at"] = _format_dt(cached.created_at)
+        return result, project.name
+
+
 def _get_latest_combined_snapshot(session, project_id: int, period_key: str = "7d") -> MetricSnapshot | None:
     return session.exec(
         select(MetricSnapshot)
@@ -1961,63 +2025,199 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
-async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Принудительный запуск Директ deep diagnostics НЕЗАВИСИМО от главного
-    сигнала. Нужна, потому что обычная кнопка "Проверить глубже" привязана
-    к конкретному alert_id и появляется только если этот alert относится к
-    триггерящей категории (DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES) -- если
-    сейчас главный сигнал продуктовый (например, "Регистрации без
-    активации"), кнопки не будет вообще, хотя Директ может быть подключён
-    и его стоит проверить отдельно для теста/диагностики.
+async def _send_deep_direct_result(chat_id: int, bot, deep_result: dict, project_name: str) -> None:
+    details_text = format_deep_diagnostics_details(deep_result, project_name)
 
-    Read-only, как и весь Директ-анализ: только granular-отчёты (ad group,
-    search query) и поиск находок, никаких изменений в кампаниях.
-    """
-    settings = get_settings()
-
-    if not (settings.effective_direct_oauth_token and settings.direct_client_login):
-        await update.message.reply_text(
-            "Директ не настроен (нет OAuth-токена или DIRECT_CLIENT_LOGIN) -- "
-            "глубокая диагностика недоступна."
+    if deep_result.get("_from_cache"):
+        cache_time = deep_result.get("_cache_created_at") or "неизвестное время"
+        details_text = (
+            "Live-обновление глубокой диагностики сейчас не завершилось, "
+            f"поэтому показываю последний кэш от {cache_time}.\n\n"
+            + details_text
         )
-        return
 
-    await update.message.reply_text(
-        "Запускаю глубокую диагностику Директа (группы объявлений, поисковые запросы)...\n"
-        "Может занять до 30 секунд."
-    )
-
-    from app.scheduler import force_refresh_deep_diagnostics
-    refresh_result = await force_refresh_deep_diagnostics()
-
-    if not refresh_result["ok"]:
-        await update.message.reply_text(f"Не удалось выполнить глубокую проверку: {refresh_result['error']}")
-        return
-
-    with get_session() as session:
-        project = _get_active_project(session)
-        project_name = project.name if project else "Проект"
-
-    details_text = format_deep_diagnostics_details(refresh_result["result"], project_name)
-
-    # Кнопка "Подготовить минус-фразы" имеет смысл и здесь, если находка --
-    # irrelevant_query_cluster, поэтому используем тот же конструктор
-    # клавиатуры, что и для обычной детальной диагностики. alert_id здесь
-    # не привязан к реальному Alert -- ставим 0 как заглушку, потому что
-    # "Создать задачу"/"Отклонить" в контексте ручной диагностики без
-    # привязки к конкретному алерту неприменимы так же буквально; кнопка
-    # минус-фраз использует project-контекст из кэша, не alert_id напрямую.
-    if refresh_result["result"].get("main_finding", {}).get("finding_type") == "irrelevant_query_cluster":
+    if deep_result.get("main_finding", {}).get("finding_type") == "irrelevant_query_cluster":
         from app.diagnostics import get_query_clusters
         with get_session() as session:
             project = _get_active_project(session)
             project_query_clusters = get_query_clusters(project.settings_json if project else {})
-        suggestion_text = format_negative_keywords_suggestion(refresh_result["result"], project_query_clusters)
-        await update.message.reply_text(details_text)
-        await update.message.reply_text(suggestion_text)
+        suggestion_text = format_negative_keywords_suggestion(deep_result, project_query_clusters)
+        await _send_long_message(bot, chat_id, details_text)
+        await _send_long_message(bot, chat_id, suggestion_text)
     else:
-        await update.message.reply_text(details_text)
+        await _send_long_message(bot, chat_id, details_text)
+
+
+async def _deep_direct_background(chat_id: int, bot, project_id: int | None, started_at: datetime) -> None:
+    global _deep_direct_task, _deep_direct_started_at
+
+    current_task = asyncio.current_task()
+    logger.info("Manual /deep_direct started (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+
+    try:
+        from app.scheduler import force_refresh_deep_diagnostics_sync_with_timeout
+
+        refresh_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                force_refresh_deep_diagnostics_sync_with_timeout,
+                project_id,
+                MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+            ),
+            timeout=MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS + 5.0,
+        )
+
+        if refresh_result.get("ok"):
+            with get_session() as session:
+                project = session.get(Project, project_id) if project_id is not None else _get_active_project(session)
+                project_name = project.name if project else "Проект"
+            await _send_deep_direct_result(chat_id, bot, refresh_result["result"], project_name)
+            logger.info(
+                "Manual /deep_direct finished (build=%s, chat_id=%s, elapsed=%.1f sec)",
+                BUILD_MARKER,
+                chat_id,
+                (datetime.now(timezone.utc) - started_at).total_seconds(),
+            )
+            return
+
+        logger.warning(
+            "Manual /deep_direct live refresh failed (build=%s, chat_id=%s, timeout=%s, error=%s)",
+            BUILD_MARKER,
+            chat_id,
+            refresh_result.get("timeout"),
+            refresh_result.get("error"),
+        )
+        cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+        if cached_result is not None:
+            logger.info("Manual /deep_direct cached fallback used (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Глубокая диагностика Директа сейчас не завершилась.\n\n"
+                    f"Причина: {refresh_result.get('error') or 'источник не ответил вовремя'}.\n\n"
+                    "Кэша глубокой диагностики пока нет, поэтому показать прошлый результат не могу. "
+                    "Обычный /run и /funnel продолжают работать; попробуйте /deep_direct позже."
+                ),
+            )
+        logger.info("Manual /deep_direct final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Manual /deep_direct outer timeout after %.1f sec (build=%s, chat_id=%s)",
+            MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS + 5.0,
+            BUILD_MARKER,
+            chat_id,
+        )
+        cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+        if cached_result is not None:
+            logger.info("Manual /deep_direct cached fallback used after outer timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Глубокая диагностика Директа заняла слишком много времени и была остановлена. "
+                    "Кэша пока нет. Бот не заблокирован: /ping, /status, /run и /funnel должны отвечать."
+                ),
+            )
+        logger.info("Manual /deep_direct final timeout message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+    except asyncio.CancelledError:
+        logger.warning("Manual /deep_direct task cancelled (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        raise
+    except Exception:
+        logger.exception("Manual /deep_direct failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        try:
+            cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+            if cached_result is not None:
+                logger.info("Manual /deep_direct cached fallback used after exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+                await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Глубокая диагностика Директа упала из-за внутренней ошибки. "
+                        "Traceback записан в Railway logs. Бот не заблокирован."
+                    ),
+                )
+            logger.info("Manual /deep_direct final message sent after exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        except Exception:
+            logger.exception("Manual /deep_direct failed and final Telegram message could not be sent")
+    finally:
+        async with _deep_direct_lock:
+            if _deep_direct_task is current_task:
+                _deep_direct_task = None
+                _deep_direct_started_at = None
+
+
+async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Manual deep Direct diagnostics is isolated from Telegram polling.
+
+    This command is heavier than /run because it requests granular Direct
+    Reports API data (ad groups and search queries). It must still never leave
+    the user with only the initial message: the background task always sends a
+    live result, cached fallback, timeout, or clear error.
+    """
+    global _deep_direct_task, _deep_direct_started_at
+
+    if update.effective_chat is None or update.message is None:
+        return
+
+    logger.info("Deep Direct command received (build=%s, chat_id=%s)", BUILD_MARKER, update.effective_chat.id)
+
+    settings = get_settings()
+    if not (settings.effective_direct_oauth_token and settings.direct_client_login):
+        await update.message.reply_text(
+            "Директ не настроен (нет OAuth-токена или DIRECT_CLIENT_LOGIN) — "
+            "глубокая диагностика недоступна."
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+
+    async with _deep_direct_lock:
+        if _deep_direct_task is not None and not _deep_direct_task.done():
+            elapsed = (now - _deep_direct_started_at).total_seconds() if _deep_direct_started_at else 0.0
+            if elapsed <= MANUAL_DEEP_DIRECT_STALE_AFTER_SECONDS:
+                logger.info(
+                    "Manual /deep_direct rejected because already running (build=%s, elapsed=%.1f sec)",
+                    BUILD_MARKER,
+                    elapsed,
+                )
+                await update.message.reply_text(
+                    "Глубокая диагностика Директа уже запущена. Дождитесь результата или попробуйте позже."
+                )
+                return
+
+            logger.warning(
+                "Manual /deep_direct stale lock cleanup (build=%s, elapsed=%.1f sec)",
+                BUILD_MARKER,
+                elapsed,
+            )
+            _deep_direct_task.cancel()
+            _deep_direct_task = None
+            _deep_direct_started_at = None
+
+        await update.message.reply_text(
+            "Запускаю глубокую диагностику Директа (группы объявлений, поисковые запросы)...\n"
+            "Если Директ отвечает медленно, покажу последний сохранённый результат или понятную ошибку."
+        )
+
+        try:
+            project_id, _project_name = await asyncio.to_thread(_get_active_project_id_name_sync)
+            chat_id = update.effective_chat.id
+            _deep_direct_started_at = now
+            task = context.application.create_task(
+                _deep_direct_background(chat_id, context.application.bot, project_id, now)
+            )
+            _deep_direct_task = task
+            logger.info("Manual /deep_direct accepted (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        except Exception:
+            _deep_direct_started_at = None
+            logger.exception("Manual /deep_direct failed before background task creation (build=%s)", BUILD_MARKER)
+            await update.message.reply_text(
+                "Не удалось запустить глубокую диагностику из-за внутренней ошибки. Traceback записан в Railway logs."
+            )
 
 
 async def cmd_check_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
