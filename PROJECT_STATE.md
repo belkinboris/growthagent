@@ -21,6 +21,23 @@
 
 ### Сделано
 
+- **Cached fallback fix 2026-06-24 (`growth-agent-cachefallback-2026-06-24`)** —
+  `/run` изменён с модели «live refresh или timeout» на модель «лучший
+  доступный бизнес-отчёт сейчас». Если живой сбор данных или отдельный
+  источник зависает/падает, команда использует последний сохранённый
+  snapshot/cache и всё равно присылает управленческий вывод по воронке.
+  В отчёте явно показывается свежесть источников: свежие данные текущего
+  запуска, кэш с timestamp или недоступный/не настроенный источник.
+  Timeout-only сообщение теперь допускается только если нет usable snapshot
+  с продуктовыми метриками. Regular `/run` больше не запускает тяжёлые
+  deep Direct / onboarding / landing diagnostics live; использует только
+  быстрый кэш, если он уже есть. `/status` больше не показывает
+  «Telegram: не настроено» для живого бота: runtime-статус Telegram-бота
+  выводится отдельной строкой «Telegram-бот: работает». Логи фиксируют
+  `/run live refresh started`, `source fresh`, `source timeout`,
+  `cached fallback used`, `report generated from ... data`,
+  `final message sent`.
+
 - **Emergency runtime fix 2026-06-24 (`growth-agent-emergencyfix-2026-06-24`)** —
   `/run` больше не выполняет тяжёлый цикл внутри Telegram handler. Команда
   только принимает задачу, ставит single-flight guard и запускает сбор данных
