@@ -270,3 +270,24 @@
 **Проверки:** `python -m compileall app`; `pytest -q` — 36 passed.
 
 **Оставшиеся риски:** Direct-блок в `/run` зависит от наличия свежего кэша deep diagnostics; без него `/run` честно пишет, что не делает выводы по отдельным запросам. Сквозной атрибуции запрос → регистрация/оплата пока нет, поэтому рекомендации по запросам остаются осторожными и read-only.
+
+
+---
+
+## 2026-06-25 — Deep Direct runtime fix
+
+**Причина:** после Owner Decision Layer обычный `/run` стал работать, но `/deep_direct` остался тяжёлой live-командой: Telegram handler напрямую ждал granular Direct Reports API (`force_refresh_deep_diagnostics`). Если Директ долго готовил отчёт, команда могла оставить пользователя только с начальным сообщением. Дополнительный риск — длинный отчёт мог превысить лимит Telegram message size и упасть при отправке.
+
+**Изменено:**
+- `/deep_direct` вынесен в background task + отдельный thread, по аналогии с `/run`; Telegram event loop не должен блокироваться.
+- Добавлен single-flight guard для `/deep_direct`: повторный запуск отклоняется, пока текущая глубокая проверка идёт.
+- Добавлены timeout/fallback/finalization: live result, cached deep Direct result, timeout message или clear error — пользователь всегда получает финальный ответ.
+- Длинные сообщения deep diagnostics режутся на безопасные части перед отправкой в Telegram.
+- Добавлен sync-wrapper `force_refresh_deep_diagnostics_sync_with_timeout()` в `scheduler.py`.
+- Build marker обновлён: `growth-agent-deepdirectfix-2026-06-25`.
+
+**Проверки:**
+- `python -m compileall app` — passed.
+- `pytest -q` — 38 passed.
+
+**Риск:** live Direct Reports API всё ещё может быть медленным; в этом случае команда должна показать кэш или понятную ошибку, а не молчать.
