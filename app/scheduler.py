@@ -27,6 +27,8 @@ from app.config import (
     DEEP_DIAGNOSTICS_TIMEOUT_SECONDS,
     DIRECT_SUMMARY_MAX_RETRIES,
     DIRECT_SUMMARY_TIMEOUT_SECONDS,
+    DIRECT_DEEP_REPORT_MAX_RETRIES,
+    DIRECT_DEEP_REPORT_TIMEOUT_SECONDS,
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
     MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
@@ -681,70 +683,126 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
     """
     Запускает granular Direct отчёты (ad_group + search_query) и
     diagnostics.run_diagnostics(). Возвращает (DiagnosticsResult, None) при
-    успехе или (None, error_message) при сбое -- не бросает исключение
-    наружу, чтобы вызывающий код (run_cycle_once или Telegram-кнопка force
-    refresh) мог решить, что делать с ошибкой, не оборачивая каждый вызов
-    в try/except по отдельности.
+    успехе или (None, error_message) при сбое.
+
+    Важно для runtime: отчёты Директа по группам и поисковым запросам могут
+    готовиться медленно. Поэтому два granular-запроса запускаются параллельно
+    и обрабатываются по принципу best-effort: если один отчёт пришёл, а второй
+    не успел, показываем частичную диагностику, а не пустой timeout.
     """
     campaign_ids = settings.direct_campaign_ids_list
 
     if not campaign_ids:
-        # В отличие от fetch_metrics() (campaign-level summary), где "без
-        # фильтра -- видим весь аккаунт" безопасно как агрегат, для deep
-        # diagnostics это рискованнее: если в Director-аккаунте есть другие
-        # кампании, не относящиеся к этому проекту, granular-анализ начнёт
-        # искать "проблемные группы" и "нерелевантные запросы" в чужой
-        # рекламе и присылать по ней находки. Логируем явно, чтобы это не
-        # прошло незаметно при первом включении на новом аккаунте.
         logger.warning(
             "DIRECT_CAMPAIGN_IDS not set -- deep diagnostics will analyze ALL campaigns "
             "in the Direct account, not just this project. Set DIRECT_CAMPAIGN_IDS to scope "
             "the analysis if the account has campaigns for other projects."
         )
 
-    try:
-        ad_group_report = await _run_with_timeout(
-            direct_connector.fetch_ad_group_report(
-                oauth_token=settings.effective_direct_oauth_token,
-                client_login=settings.direct_client_login,
-                campaign_ids=campaign_ids,
-                period_hours=period_hours,
-                sandbox=settings.direct_sandbox,
-                timeout_seconds=DIRECT_SUMMARY_TIMEOUT_SECONDS,
-                max_retries=DIRECT_SUMMARY_MAX_RETRIES,
-            ),
-            DEEP_DIAGNOSTICS_TIMEOUT_SECONDS,
-            "Direct ad group report",
-        )
-        query_report = await _run_with_timeout(
-            direct_connector.fetch_search_query_report(
-                oauth_token=settings.effective_direct_oauth_token,
-                client_login=settings.direct_client_login,
-                campaign_ids=campaign_ids,
-                period_hours=period_hours,
-                sandbox=settings.direct_sandbox,
-                timeout_seconds=DIRECT_SUMMARY_TIMEOUT_SECONDS,
-                max_retries=DIRECT_SUMMARY_MAX_RETRIES,
-            ),
-            DEEP_DIAGNOSTICS_TIMEOUT_SECONDS,
-            "Direct search query report",
-        )
-    except direct_connector.NotConfiguredError as exc:
-        return None, str(exc)
-    except asyncio.TimeoutError:
-        return None, f"Директ не успел подготовить глубокий отчёт за {DEEP_DIAGNOSTICS_TIMEOUT_SECONDS:.0f} секунд"
-    except direct_connector.DirectConnectorError as exc:
-        _log_manual_source_failure("Direct summary", exc)
-        return None, str(exc)
+    async def _fetch_ad_groups() -> tuple[str, dict | None, str | None]:
+        try:
+            report = await _run_with_timeout(
+                direct_connector.fetch_ad_group_report(
+                    oauth_token=settings.effective_direct_oauth_token,
+                    client_login=settings.direct_client_login,
+                    campaign_ids=campaign_ids,
+                    period_hours=period_hours,
+                    sandbox=settings.direct_sandbox,
+                    timeout_seconds=DIRECT_DEEP_REPORT_TIMEOUT_SECONDS,
+                    max_retries=DIRECT_DEEP_REPORT_MAX_RETRIES,
+                ),
+                DEEP_DIAGNOSTICS_TIMEOUT_SECONDS,
+                "Direct ad group report",
+            )
+            return "ad_group", report, None
+        except direct_connector.NotConfiguredError as exc:
+            return "ad_group", None, str(exc)
+        except asyncio.TimeoutError:
+            return "ad_group", None, f"отчёт по группам не готов за {DEEP_DIAGNOSTICS_TIMEOUT_SECONDS:.0f} секунд"
+        except direct_connector.DirectConnectorError as exc:
+            _log_manual_source_failure("Direct ad group report", exc)
+            return "ad_group", None, str(exc)
+
+    async def _fetch_queries() -> tuple[str, dict | None, str | None]:
+        try:
+            report = await _run_with_timeout(
+                direct_connector.fetch_search_query_report(
+                    oauth_token=settings.effective_direct_oauth_token,
+                    client_login=settings.direct_client_login,
+                    campaign_ids=campaign_ids,
+                    period_hours=period_hours,
+                    sandbox=settings.direct_sandbox,
+                    timeout_seconds=DIRECT_DEEP_REPORT_TIMEOUT_SECONDS,
+                    max_retries=DIRECT_DEEP_REPORT_MAX_RETRIES,
+                ),
+                DEEP_DIAGNOSTICS_TIMEOUT_SECONDS,
+                "Direct search query report",
+            )
+            return "query", report, None
+        except direct_connector.NotConfiguredError as exc:
+            return "query", None, str(exc)
+        except asyncio.TimeoutError:
+            return "query", None, f"отчёт по поисковым запросам не готов за {DEEP_DIAGNOSTICS_TIMEOUT_SECONDS:.0f} секунд"
+        except direct_connector.DirectConnectorError as exc:
+            _log_manual_source_failure("Direct search query report", exc)
+            return "query", None, str(exc)
+
+    ad_group_report = None
+    query_report = None
+    partial_errors: dict[str, str] = {}
+
+    for report_name, report, error in await asyncio.gather(_fetch_ad_groups(), _fetch_queries()):
+        if report_name == "ad_group":
+            ad_group_report = report
+        elif report_name == "query":
+            query_report = report
+        if error:
+            partial_errors[report_name] = error
+
+    if ad_group_report is None and query_report is None:
+        joined = "; ".join(partial_errors.values()) or "Директ не вернул granular-отчёты"
+        return None, joined
+
+    ad_group_rows = (ad_group_report or {}).get("rows") or []
+    query_rows = (query_report or {}).get("rows") or []
+
+    # Если отчёт по группам не успел, но отчёт по запросам пришёл, строим
+    # pseudo ad-group rows из query rows. Это позволяет посчитать total_clicks
+    # и найти query-cluster сигналы, вместо ошибочного "данных мало: 0 кликов".
+    if not ad_group_rows and query_rows:
+        grouped: dict[tuple[str, str], dict] = {}
+        for row in query_rows:
+            key = (row.get("ad_group_id") or "unknown", row.get("ad_group_name") or "Без названия")
+            if key not in grouped:
+                grouped[key] = {
+                    "campaign_id": row.get("campaign_id", ""),
+                    "campaign_name": row.get("campaign_name", ""),
+                    "ad_group_id": key[0],
+                    "ad_group_name": key[1],
+                    "impressions": 0,
+                    "clicks": 0,
+                    "cost": 0.0,
+                    "ctr": 0.0,
+                    "cpc": 0.0,
+                }
+            target = grouped[key]
+            target["impressions"] += int(row.get("impressions") or 0)
+            target["clicks"] += int(row.get("clicks") or 0)
+            target["cost"] += float(row.get("cost") or 0.0)
+        for target in grouped.values():
+            impressions = target["impressions"]
+            clicks = target["clicks"]
+            cost = target["cost"]
+            target["ctr"] = round((clicks / impressions * 100) if impressions else 0.0, 2)
+            target["cpc"] = round((cost / clicks) if clicks else 0.0, 2)
+            target["cost"] = round(cost, 2)
+        ad_group_rows = list(grouped.values())
+        partial_errors.setdefault("ad_group", "отчёт по группам не пришёл; группировка восстановлена из отчёта по запросам")
 
     query_clusters = get_query_clusters(project.settings_json)
 
-    # Clean-period: собираем активные cutoff'ы ТОЛЬКО для ad_group_id,
-    # реально присутствующих в этом отчёте -- не для всех событий проекта
-    # сразу, иначе пришлось бы делать отдельный Director-запрос на каждую
-    # зарегистрированную точку изменения, даже нерелевантную текущим данным.
     clean_period_cutoffs: dict[str, str] = {}
-    present_ad_group_ids = {row.get("ad_group_id") for row in ad_group_report["rows"] if row.get("ad_group_id")}
+    present_ad_group_ids = {row.get("ad_group_id") for row in ad_group_rows if row.get("ad_group_id")}
     if present_ad_group_ids:
         with get_session() as cp_session:
             for ad_group_id in present_ad_group_ids:
@@ -752,39 +810,17 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
                 if cutoff is not None:
                     clean_period_cutoffs[ad_group_id] = cutoff.strftime("%d.%m.%Y %H:%M")
 
-    # attribution_status: в v1 у нас нет сквозной UTM-атрибуции между
-    # Direct и TruePost (TruePost отдаёт просто число регистраций за
-    # период, не привязанное к источнику трафика) -- поэтому всегда
-    # not_available. Это явное, не угаданное значение: если в будущем
-    # появится UTM-трекинг, здесь будет реальная проверка, не константа.
     attribution_status = AttributionStatus.not_available
 
     diag_result = run_diagnostics(
         period_key="7d",
-        ad_group_rows=ad_group_report["rows"],
-        query_rows=query_report["rows"],
+        ad_group_rows=ad_group_rows,
+        query_rows=query_rows,
         attribution_status=attribution_status,
         query_clusters=query_clusters,
         clean_period_cutoffs=clean_period_cutoffs,
     )
 
-    # Anti-repetition (window-based, по решению архитектора): находка не
-    # должна быть главным выводом больше MAX_MAIN_REPEATS_IN_WINDOW раз за
-    # последние REPEAT_WINDOW_DAYS дней -- НЕ "подряд без перерыва" (старая
-    # версия логики), а именно по календарному окну, чтобы находка не
-    # могла "отдохнуть один день и вернуться" и тем самым обойти лимит.
-    # Снимается подавление, если её ключевая метрика изменилась существенно
-    # (RESURFACE_IF_METRIC_CHANGED_BY) -- это и есть "появились новые данные"
-    # из требования архитектора.
-    #
-    # Находки НЕ удаляются из findings -- они остаются доступны через
-    # known_risks (см. ниже) для отображения как "известные риски", не
-    # пропадают совсем, просто не становятся главным выводом повторно.
-    #
-    # Итеративный обход по приоритету сохранён из предыдущей версии (баг,
-    # уже найденный тестированием: один-единственный переключение на
-    # "вторую по приоритету" находку при подавлении первой -- недостаточно,
-    # если эта вторая тоже была главной слишком много раз).
     known_risks: list = []
 
     if diag_result.findings:
@@ -814,17 +850,10 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
                 )
                 break
 
-            # Если ВСЕ находки подавлены (редкий случай -- все варианты уже
-            # были главными максимальное число раз за окно без изменений),
-            # main_finding становится None. Это лучше, чем насильно
-            # показывать заведомо повторяющийся вывод -- агент в этом
-            # случае должен честно сказать "новых выводов нет", не
-            # выдумывать причину продолжать ту же рекомендацию.
             diag_result.main_finding = chosen
 
     diag_result.known_risks = known_risks
-    return diag_result, None
-
+    return diag_result, partial_errors or None
 
 def run_cycle_once_sync(project_id: int | None = None) -> CycleResult:
     """Синхронная обёртка для вызова из не-async контекста (например APScheduler job)."""
@@ -884,6 +913,9 @@ async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
 
         result_dict = diag_result.to_dict()
         result_dict["_from_cache"] = False
+        if diag_error:
+            result_dict["_partial"] = True
+            result_dict["_partial_errors"] = diag_error
         save_diagnostics_cache(session, project.id, "7d", "manual_refresh", result_dict)
 
         return {"ok": True, "result": result_dict}

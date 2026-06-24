@@ -608,6 +608,65 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
         "",
     ]
 
+    if deep_diagnostics.get("_fallback_kind") == "direct_summary_snapshot":
+        direct = deep_diagnostics.get("direct") or {}
+        product = deep_diagnostics.get("product") or {}
+        cache_time = deep_diagnostics.get("_cache_created_at") or "неизвестное время"
+        spend = float(direct.get("spend") or 0)
+        clicks = int(direct.get("clicks") or 0)
+        impressions = int(direct.get("impressions") or 0)
+        ctr = direct.get("ctr")
+        cpc = direct.get("cpc")
+        signups = int(product.get("signup") or 0) if product.get("signup") is not None else None
+        cpa = (spend / signups) if signups and spend else None
+
+        lines.append(
+            "Гранулярный отчёт Директа по группам и поисковым запросам сейчас не готов. "
+            f"Показываю быстрый fallback по последнему сохранённому замеру от {cache_time}."
+        )
+        lines.append("")
+        lines.append("Что известно по рекламе за 7 дней:")
+        if spend or clicks or impressions:
+            base = f"— расход: {spend:.0f} ₽ / клики: {clicks}"
+            if impressions:
+                base += f" / показы: {impressions}"
+            if ctr is not None:
+                base += f" / CTR: {float(ctr):.1f}%"
+            if cpc is not None:
+                base += f" / CPC: {float(cpc):.1f} ₽"
+            lines.append(base + ".")
+        else:
+            lines.append("— в последнем замере нет агрегированных данных Директа.")
+        if signups is not None:
+            line = f"— регистрации продукта: {signups}"
+            if cpa is not None:
+                line += f" / ориентировочный CPA: {cpa:.0f} ₽"
+            lines.append(line + ".")
+
+        lines.append(
+            "\nВывод: пока нельзя честно сказать, какие именно группы или поисковые запросы дают мусор, "
+            "потому что granular-отчёт не пришёл. Но общий Direct-трафик уже даёт регистрации, "
+            "поэтому рекламу сейчас нельзя чистить вслепую."
+        )
+        lines.append(
+            "\nЧто делать: не минусовать одиночные низкозатратные запросы, не менять резко ставки/бюджет, "
+            "а повторить /deep_direct позже. Если granular-отчёт Директа стабильно не готовится, "
+            "нужно смотреть Railway logs по Manual /deep_direct и отдельно проверить Direct Reports API."
+        )
+        return "\n".join(lines)
+
+    partial_errors = deep_diagnostics.get("_partial_errors") or {}
+    if partial_errors:
+        parts = []
+        if partial_errors.get("ad_group"):
+            parts.append(f"группы: {partial_errors['ad_group']}")
+        if partial_errors.get("query"):
+            parts.append(f"запросы: {partial_errors['query']}")
+        if parts:
+            lines.append("Часть данных пришла не полностью: " + "; ".join(parts) + ".")
+            lines.append("Показываю частичную диагностику, не жду повторно медленный отчёт.")
+            lines.append("")
+
     if deep_diagnostics.get("insufficient_data"):
         clicks = deep_diagnostics.get("total_clicks", 0)
         lines.append(
@@ -1541,6 +1600,55 @@ def _get_cached_deep_direct_sync(project_id: int | None = None) -> tuple[dict | 
         return result, project.name
 
 
+def _get_direct_summary_fallback_sync(project_id: int | None = None) -> tuple[dict | None, str]:
+    """
+    Lightweight fallback for /deep_direct when granular Direct reports are not ready
+    and there is no valid deep diagnostics cache yet. It uses the latest combined
+    snapshot, so the command still gives the owner a useful Direct summary instead
+    of a dead-end timeout message.
+    """
+    with get_session() as session:
+        project = session.get(Project, project_id) if project_id is not None else _get_active_project(session)
+        if project is None:
+            return None, "Проект"
+
+        snapshot = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.period_key == "7d",
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
+        if snapshot is None:
+            return None, project.name
+
+        raw = snapshot.metrics_json or {}
+        direct = raw.get("direct") or {}
+        product = raw.get("product") or {}
+        if not direct and not product:
+            return None, project.name
+
+        fallback = {
+            "_fallback_kind": "direct_summary_snapshot",
+            "_from_cache": True,
+            "_cache_created_at": _format_dt(snapshot.created_at),
+            "period_key": snapshot.period_key,
+            "direct": direct,
+            "product": product,
+        }
+        return fallback, project.name
+
+
+def _get_best_deep_direct_fallback_sync(project_id: int | None = None) -> tuple[dict | None, str]:
+    cached, project_name = _get_cached_deep_direct_sync(project_id)
+    if cached is not None:
+        return cached, project_name
+    return _get_direct_summary_fallback_sync(project_id)
+
+
 def _get_latest_combined_snapshot(session, project_id: int, period_key: str = "7d") -> MetricSnapshot | None:
     return session.exec(
         select(MetricSnapshot)
@@ -2028,7 +2136,7 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def _send_deep_direct_result(chat_id: int, bot, deep_result: dict, project_name: str) -> None:
     details_text = format_deep_diagnostics_details(deep_result, project_name)
 
-    if deep_result.get("_from_cache"):
+    if deep_result.get("_from_cache") and not deep_result.get("_fallback_kind"):
         cache_time = deep_result.get("_cache_created_at") or "неизвестное время"
         details_text = (
             "Live-обновление глубокой диагностики сейчас не завершилось, "
@@ -2086,9 +2194,9 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             refresh_result.get("timeout"),
             refresh_result.get("error"),
         )
-        cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+        cached_result, project_name = await asyncio.to_thread(_get_best_deep_direct_fallback_sync, project_id)
         if cached_result is not None:
-            logger.info("Manual /deep_direct cached fallback used (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            logger.info("Manual /deep_direct cached/summary fallback used (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
             await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
         else:
             await bot.send_message(
@@ -2096,8 +2204,9 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
                 text=(
                     "Глубокая диагностика Директа сейчас не завершилась.\n\n"
                     f"Причина: {refresh_result.get('error') or 'источник не ответил вовремя'}.\n\n"
-                    "Кэша глубокой диагностики пока нет, поэтому показать прошлый результат не могу. "
-                    "Обычный /run и /funnel продолжают работать; попробуйте /deep_direct позже."
+                    "Нет ни granular-кэша, ни последнего агрегированного замера Директа, "
+                    "поэтому показать полезный fallback не могу. Обычный /run и /funnel продолжают работать; "
+                    "попробуйте /deep_direct позже."
                 ),
             )
         logger.info("Manual /deep_direct final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
@@ -2108,16 +2217,17 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             BUILD_MARKER,
             chat_id,
         )
-        cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+        cached_result, project_name = await asyncio.to_thread(_get_best_deep_direct_fallback_sync, project_id)
         if cached_result is not None:
-            logger.info("Manual /deep_direct cached fallback used after outer timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            logger.info("Manual /deep_direct cached/summary fallback used after outer timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
             await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
         else:
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
                     "Глубокая диагностика Директа заняла слишком много времени и была остановлена. "
-                    "Кэша пока нет. Бот не заблокирован: /ping, /status, /run и /funnel должны отвечать."
+                    "Нет ни granular-кэша, ни последнего агрегированного замера Директа. "
+                    "Бот не заблокирован: /ping, /status, /run и /funnel должны отвечать."
                 ),
             )
         logger.info("Manual /deep_direct final timeout message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
@@ -2127,9 +2237,9 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
     except Exception:
         logger.exception("Manual /deep_direct failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         try:
-            cached_result, project_name = await asyncio.to_thread(_get_cached_deep_direct_sync, project_id)
+            cached_result, project_name = await asyncio.to_thread(_get_best_deep_direct_fallback_sync, project_id)
             if cached_result is not None:
-                logger.info("Manual /deep_direct cached fallback used after exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+                logger.info("Manual /deep_direct cached/summary fallback used after exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
                 await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
             else:
                 await bot.send_message(

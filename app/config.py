@@ -239,6 +239,8 @@ CONNECTOR_CALL_TIMEOUT_SECONDS = 20.0
 DIRECT_SUMMARY_TIMEOUT_SECONDS = 12.0
 DIRECT_SUMMARY_MAX_RETRIES = 2
 DEEP_DIAGNOSTICS_TIMEOUT_SECONDS = 35.0
+DIRECT_DEEP_REPORT_TIMEOUT_SECONDS = 18.0
+DIRECT_DEEP_REPORT_MAX_RETRIES = 2
 MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS = 55.0
 MANUAL_DEEP_DIRECT_STALE_AFTER_SECONDS = 120.0
 TELEGRAM_MESSAGE_CHUNK_SIZE = 3600
@@ -252,4 +254,4 @@ STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-deepdirectfix-2026-06-25"
+BUILD_MARKER = "growth-agent-deepdirect-fallback-2026-06-25"
