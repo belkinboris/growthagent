@@ -304,6 +304,55 @@ def _rule_query_clusters(query_rows: list, query_clusters: dict) -> tuple[list, 
     good_findings = []
     irrelevant_ad_group_ids: set = set()
 
+    total_clicks = sum(row.get("clicks", 0) for row in query_rows)
+    total_cost = sum(row.get("cost", 0.0) for row in query_rows)
+
+    def _business_weight(agg: dict) -> tuple[str, str, dict]:
+        """
+        Возвращает (severity, confidence, extra_payload) для query-кластера.
+
+        Старое правило поднимало кластер в P1 только по кликам. На раннем
+        трафике это создавало ложную важность: один низкозатратный мусорный
+        запрос мог стать главным выводом, хотя бизнес-вес маленький.
+
+        Теперь учитываются: клики, расход, доля расхода, повторяемость
+        (несколько разных запросов/групп), и ограничение текущей системы:
+        влияния на регистрации/оплаты здесь нет, потому что сквозной
+        атрибуции по запросам пока нет.
+        """
+        clicks = agg["clicks"]
+        cost = agg["cost"]
+        unique_queries = len(set(agg["queries"]))
+        ad_group_count = len(agg["ad_group_ids"])
+        clicks_share = (clicks / total_clicks) if total_clicks > 0 else 0
+        cost_share = (cost / total_cost) if total_cost > 0 else 0
+
+        repeated = unique_queries >= 2 or ad_group_count >= 2
+        high_weight = (
+            clicks >= max(MIN_CLICKS_FOR_DEEP_DIAGNOSTICS, 50)
+            and (cost >= 500 or cost_share >= 0.25)
+            and repeated
+        )
+        medium_weight = (
+            clicks >= MIN_CLICKS_FOR_DEEP_DIAGNOSTICS
+            and (cost >= 300 or cost_share >= 0.15)
+            and repeated
+        )
+
+        extra = {
+            "query_count": unique_queries,
+            "ad_group_count": ad_group_count,
+            "clicks_share": round(clicks_share, 2),
+            "cost_share": round(cost_share, 2),
+            "has_conversion_attribution": False,
+        }
+
+        if high_weight:
+            return "P1", "high", extra
+        if medium_weight:
+            return "P2", "medium", extra
+        return "info", "medium", extra
+
     for (group, cluster_key), agg in cluster_aggregates.items():
         if agg["clicks"] == 0:
             continue  # показы были, кликов не было -- не основание для finding на этом уровне
@@ -311,19 +360,35 @@ def _rule_query_clusters(query_rows: list, query_clusters: dict) -> tuple[list, 
         top_queries = sorted(set(agg["queries"]))[:5]
 
         if group == "irrelevant":
-            irrelevant_ad_group_ids |= agg["ad_group_ids"]
+            severity, confidence, weight_payload = _business_weight(agg)
+            if severity in ("P1", "P2"):
+                # Только средне/высоковесовые нерелевантные кластеры служат
+                # подтверждением для budget_drain. Низковесовой шум не должен
+                # искусственно усиливать другую находку.
+                irrelevant_ad_group_ids |= agg["ad_group_ids"]
+
+            low_weight_note = ""
+            if severity == "info":
+                low_weight_note = (
+                    " Бизнес-вес низкий: расход/доля расхода малы или сигнал пока не повторяется. "
+                    "Это не повод срочно менять кампанию."
+                )
+
             irrelevant_findings.append(DiagnosticFinding(
                 finding_type="irrelevant_query_cluster",
-                severity="P1" if agg["clicks"] >= MIN_CLICKS_FOR_DEEP_DIAGNOSTICS else "P2",
-                confidence="high" if agg["clicks"] >= MIN_CLICKS_FOR_DEEP_DIAGNOSTICS else "medium",
+                severity=severity,
+                confidence=confidence,
                 title=f"Нерелевантный кластер запросов: {agg['label']}",
                 detail=(
                     f"Кластер «{agg['label']}» дал {agg['clicks']} кликов и {round(agg['cost'], 2)} ₽ "
-                    f"расхода. Запросы не похожи на целевую аудиторию продукта."
+                    f"расхода. Запросы не похожи на целевую аудиторию продукта.{low_weight_note}"
                 ),
-                recommended_action="Рассмотреть минус-фразы для этих запросов.",
+                recommended_action=(
+                    "Рассмотреть точечные фразовые минус-слова для этих запросов. "
+                    "Не добавлять одиночные широкие слова."
+                ) if severity in ("P1", "P2") else "Наблюдать; не выносить в срочные правки без роста расхода или повторяемости.",
                 payload={"cluster_key": cluster_key, "clicks": agg["clicks"], "cost": round(agg["cost"], 2),
-                         "top_queries": top_queries, "ad_group_ids": sorted(agg["ad_group_ids"])},
+                         "top_queries": top_queries, "ad_group_ids": sorted(agg["ad_group_ids"]), **weight_payload},
             ))
         elif group == "good":
             good_findings.append(DiagnosticFinding(
@@ -374,7 +439,7 @@ def finding_key_metric_value(finding: DiagnosticFinding) -> Optional[float]:
     напрямую (объект), там -- с уже сериализованным payload (dict), но поля
     одинаковые (clicks/clicks_share/cost), поэтому просто передаём payload дальше.
     """
-    for key in ("clicks", "clicks_share", "cost"):
+    for key in ("cost", "cost_share", "clicks", "clicks_share"):
         if key in finding.payload and finding.payload[key] is not None:
             try:
                 return float(finding.payload[key])
@@ -395,10 +460,25 @@ def _pick_main_finding(findings: list) -> Optional[DiagnosticFinding]:
     if not findings:
         return None
 
-    severity_rank = {"P1": 0, "P2": 1, "info": 2}
+    eligible = [f for f in findings if f.severity in ("P1", "P2")]
+    if not eligible:
+        return None
+
+    severity_rank = {"P1": 0, "P2": 1}
     confidence_rank = {"high": 0, "medium": 1, "low": 2}
 
-    return sorted(findings, key=lambda f: (severity_rank.get(f.severity, 99), confidence_rank.get(f.confidence, 99)))[0]
+    def business_weight_sort(f: DiagnosticFinding) -> tuple:
+        payload = f.payload or {}
+        return (
+            severity_rank.get(f.severity, 99),
+            confidence_rank.get(f.confidence, 99),
+            -float(payload.get("cost_share") or 0),
+            -float(payload.get("cost") or 0),
+            -int(payload.get("clicks") or 0),
+            -int(payload.get("query_count") or 0),
+        )
+
+    return sorted(eligible, key=business_weight_sort)[0]
 
 
 def explain_selection(chosen: DiagnosticFinding, all_findings: list) -> str:
@@ -424,7 +504,7 @@ def explain_selection(chosen: DiagnosticFinding, all_findings: list) -> str:
 
     if not same_severity_others:
         return (
-            f"Выбрано как главный сигнал: самый высокий уровень важности (P1) "
+            f"Выбрано как главный сигнал: самый высокий уровень важности ({chosen.severity}) "
             f"среди {len(all_findings)} найденных сигналов."
         )
 

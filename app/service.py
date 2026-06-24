@@ -67,6 +67,10 @@ _CONFIDENCE_RANK = {
 # неделю на одном уровне, никогда не подаст голос второй раз.
 PERSISTENCE_ESCALATION_THRESHOLD = 5
 
+# Онбординг endpoint в TruePost ещё не реализован. Пока это False, агент не
+# показывает кнопку и не пытается делать вид, что диагностика доступна.
+ONBOARDING_DIAGNOSTICS_ENABLED = False
+
 
 class AlertChangeType(str, Enum):
     new = "new"
@@ -116,6 +120,7 @@ class CycleResult:
     show_deep_direct_button: bool = False
     show_onboarding_button: bool = False
     show_landing_funnel_button: bool = False
+    milestone_notifications: list[str] = field(default_factory=list)
 
     @property
     def has_notifiable_changes(self) -> bool:
@@ -127,7 +132,7 @@ class CycleResult:
         """
         notifiable = {AlertChangeType.new, AlertChangeType.escalated, AlertChangeType.resolved}
         all_changes = self.changes + self.integration_down_changes
-        return any(c.change_type in notifiable for c in all_changes)
+        return any(c.change_type in notifiable for c in all_changes) or bool(self.milestone_notifications)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +504,8 @@ ONBOARDING_CACHE_PERIOD_KEY = "onboarding_24h"
 
 def should_run_onboarding_diagnostics(primary_candidate: AlertCandidate | None) -> bool:
     """Автозапуск onboarding diagnostics -- симметрично should_run_deep_diagnostics()."""
+    if not ONBOARDING_DIAGNOSTICS_ENABLED:
+        return False
     if primary_candidate is None:
         return False
     return primary_candidate.category in ONBOARDING_DIAGNOSTICS_TRIGGER_CATEGORIES
@@ -511,11 +518,139 @@ def should_show_onboarding_button(product_configured: bool, metrics_7d) -> bool:
     одна регистрация за 7d-окно -- иначе нет смысла запускать диагностику
     пути, по которому никто не прошёл.
     """
+    if not ONBOARDING_DIAGNOSTICS_ENABLED:
+        return False
     if not product_configured:
         return False
     if metrics_7d is None:
         return False
     return metrics_7d.signup is not None and metrics_7d.signup > 0
+
+
+# ---------------------------------------------------------------------------
+# Milestone notifications
+# ---------------------------------------------------------------------------
+
+
+def _milestone_already_sent(session: Session, project_id: int, fingerprint: str) -> bool:
+    existing = session.exec(
+        select(AlertRepeatTracker).where(
+            AlertRepeatTracker.project_id == project_id,
+            AlertRepeatTracker.surface == "milestone",
+            AlertRepeatTracker.finding_fingerprint == fingerprint,
+        )
+    ).first()
+    return existing is not None
+
+
+def _record_milestone(session: Session, project_id: int, fingerprint: str, metric_value: float | None, payload: dict) -> None:
+    record_finding_shown(
+        session=session,
+        project_id=project_id,
+        finding_fingerprint=fingerprint,
+        surface="milestone",
+        payload=payload,
+        key_metric_value=metric_value,
+    )
+
+
+def collect_milestone_notifications(
+    session: Session,
+    project_id: int,
+    metrics_7d,
+    previous_metrics: dict | None = None,
+) -> list[str]:
+    """
+    Возвращает новые milestone-уведомления и сразу помечает их как показанные.
+
+    Это не алерты и не проблемы. Задача -- дать владельцу бизнеса важные
+    отметки без спама: первая регистрация, каждые +5 регистраций, первая
+    генерация, первая начатая оплата, первая успешная оплата, резкое изменение CPA.
+    """
+    if metrics_7d is None:
+        return []
+
+    notifications: list[str] = []
+
+    signups = int(metrics_7d.signup or 0)
+    activation_2 = int(metrics_7d.activation_2 or 0)
+    payment_started = int(metrics_7d.payment_started or 0)
+    payment_success = int(metrics_7d.payment_success or 0)
+    spend = float(metrics_7d.spend or 0)
+
+    def maybe_send(fingerprint: str, text: str, metric_value: float | None, payload: dict) -> None:
+        if _milestone_already_sent(session, project_id, fingerprint):
+            return
+        _record_milestone(session, project_id, fingerprint, metric_value, payload)
+        notifications.append(text)
+
+    if signups > 0:
+        if signups < 5:
+            maybe_send(
+                "signup:first",
+                f"Первая регистрация зафиксирована: сейчас {signups}.",
+                signups,
+                {"metric": "signup", "value": signups},
+            )
+        else:
+            signup_bucket = (signups // 5) * 5
+            maybe_send(
+                f"signup:bucket:{signup_bucket}",
+                f"Регистраций стало {signup_bucket}+ за 7 дней.",
+                signups,
+                {"metric": "signup", "value": signups, "bucket": signup_bucket},
+            )
+
+    if activation_2 > 0:
+        maybe_send(
+            "activation_2:first",
+            f"Появилась первая генерация поста: событий генерации сейчас {activation_2}.",
+            activation_2,
+            {"metric": "activation_2", "value": activation_2},
+        )
+
+    if payment_started > 0:
+        maybe_send(
+            "payment_started:first",
+            f"Появилась первая начатая оплата: попыток оплаты сейчас {payment_started}. Это контрольная отметка, не P1-проблема.",
+            payment_started,
+            {"metric": "payment_started", "value": payment_started},
+        )
+
+    if payment_success > 0:
+        maybe_send(
+            "payment_success:first",
+            f"Появилась первая успешная оплата: успешных оплат сейчас {payment_success}.",
+            payment_success,
+            {"metric": "payment_success", "value": payment_success},
+        )
+
+    # CPA считаем осторожно: только если есть расход и регистрации. Сравнение
+    # идёт с предыдущим сохранённым снэпшотом, если он достаточно старый.
+    if signups > 0 and spend > 0 and previous_metrics:
+        current_cpa = spend / signups
+        prev_signups = previous_metrics.get("signup") or 0
+        prev_spend = previous_metrics.get("spend") or 0
+        if prev_signups and prev_spend:
+            previous_cpa = float(prev_spend) / int(prev_signups)
+            if previous_cpa > 0:
+                relative_change = (current_cpa - previous_cpa) / previous_cpa
+                if abs(relative_change) >= 0.35 and abs(current_cpa - previous_cpa) >= 50:
+                    direction = "рост" if relative_change > 0 else "снижение"
+                    bucket = int(round(current_cpa / 50) * 50)
+                    maybe_send(
+                        f"cpa:{direction}:{bucket}",
+                        f"Резкое {direction} CPA: было примерно {previous_cpa:.0f} ₽, стало примерно {current_cpa:.0f} ₽.",
+                        current_cpa,
+                        {
+                            "metric": "cpa",
+                            "current_cpa": round(current_cpa, 2),
+                            "previous_cpa": round(previous_cpa, 2),
+                            "relative_change": round(relative_change, 2),
+                        },
+                    )
+
+    return notifications
 
 
 # ---------------------------------------------------------------------------
@@ -947,10 +1082,13 @@ def extract_normalized_metrics_from_snapshot(snapshot: MetricSnapshot) -> dict:
     вызывающий код получит пустой dict и честно скажет "нет данных".
     """
     product = snapshot.metrics_json.get("product") or {}
+    direct = snapshot.metrics_json.get("direct") or {}
     return {
         "signup": product.get("signup"),
         "activation_1": product.get("activation_1"),
         "activation_2": product.get("activation_2"),
         "payment_started": product.get("payment_started"),
         "payment_success": product.get("payment_success"),
+        "spend": direct.get("spend"),
+        "clicks": direct.get("clicks"),
     }

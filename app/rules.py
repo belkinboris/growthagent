@@ -21,6 +21,12 @@ from app.config import MIN_CLICKS_FOR_CONVERSION_CHECK, MIN_SIGNUP_CONVERSION_WA
 from app.models import AlertCategory, AlertSeverity
 
 
+# Минимум попыток оплаты, после которого отсутствие успешных оплат можно
+# считать проблемой платёжного шага. Одна попытка -- это milestone/ранний
+# сигнал для наблюдения, но не P1-проблема и не главный вывод /run.
+MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT = 3
+
+
 @dataclass
 class NormalizedMetrics:
     """
@@ -193,7 +199,7 @@ RULES: list[Rule] = [
             "{signup} регистраций, но ни один пользователь не дошёл до первого "
             "шага активации. Вероятная зона проблемы -- онбординг сразу после регистрации."
         ),
-        check_action_template="Проверить путь после регистрации -- Growth Agent попробует сделать это автоматически по доступным данным.",
+        check_action_template="Проверить путь после регистрации — Аналитик Воронки попробует сделать это автоматически по доступным данным.",
         do_not_action_template="Не менять рекламу на основании этого сигнала -- текущий главный сигнал указывает на онбординг после регистрации, но данных пока мало.",
         sample_size_fn=lambda m: m.signup or 0,
         payload_fn=lambda m: {"signup": m.signup or 0},
@@ -232,7 +238,7 @@ RULES: list[Rule] = [
         required_sources=("product",),
         condition=lambda m: (
             _has("product")(m)
-            and (m.payment_started or 0) > 0
+            and (m.payment_started or 0) >= MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT
             and (m.payment_success or 0) == 0
         ),
         hypothesis_template=(

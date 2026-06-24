@@ -37,8 +37,11 @@ from app.service import (
     LANDING_FUNNEL_CACHE_PERIOD_KEY,
     ONBOARDING_CACHE_PERIOD_KEY,
     check_integration_freshness,
+    collect_milestone_notifications,
+    extract_normalized_metrics_from_snapshot,
     get_cached_diagnostics,
     get_latest_cutoff,
+    get_previous_snapshot,
     process_cycle,
     record_finding_shown,
     save_diagnostics_cache,
@@ -352,6 +355,18 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         result.show_deep_direct_button = should_show_deep_direct_button(direct_configured, metrics_7d)
         result.show_onboarding_button = should_show_onboarding_button(product_configured, metrics_7d)
         result.show_landing_funnel_button = should_show_landing_funnel_button(product_configured, metrics_7d)
+
+        previous_metrics_7d = None
+        previous_snapshot_7d = get_previous_snapshot(session, project.id, "7d")
+        if previous_snapshot_7d is not None:
+            previous_metrics_7d = extract_normalized_metrics_from_snapshot(previous_snapshot_7d)
+
+        result.milestone_notifications = collect_milestone_notifications(
+            session=session,
+            project_id=project.id,
+            metrics_7d=metrics_7d,
+            previous_metrics=previous_metrics_7d,
+        )
 
         if direct_configured and should_run_deep_diagnostics(result.primary_candidate):
             cached = get_cached_diagnostics(session, project.id, "7d")

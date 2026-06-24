@@ -22,7 +22,7 @@ from app.analyzer import AlertCandidate
 from app.config import get_settings, MIN_SIGNUP_CONVERSION_WARN_PERCENT, DEFAULT_QUERY_CLUSTERS
 from app.db import get_session
 from app.models import Alert, AlertStatus, Integration, IntegrationStatus, Project
-from app.rules import NormalizedMetrics
+from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
 from app.scheduler import run_cycle_once
 from app.service import AlertChange, AlertChangeType, CycleResult
 
@@ -120,7 +120,7 @@ def _explain_metrics_discrepancy(payload: dict) -> str:
         "а цель в Яндекс.Метрике — 0.\n\n"
         "Вероятная причина: не настроена цель или счётчик не стоит на странице успеха.\n\n"
         "Что проверить:\n"
-        "1. Настройку цели register_success в Метрике.\n"
+        "1. Настройку цели регистрации в Метрике.\n"
         "2. Установлен ли счётчик на странице после регистрации."
     )
 
@@ -207,8 +207,102 @@ def _format_metrics_line(metrics: NormalizedMetrics) -> str:
     act1_str = metrics.activation_1 if metrics.activation_1 is not None else "—"
     act2_str = metrics.activation_2 if metrics.activation_2 is not None else "—"
     pay_str = metrics.payment_success if metrics.payment_success is not None else "—"
-    parts.append(f"Продукт: {signup_str} регистраций / {act1_str} / {act2_str} / {pay_str} оплат")
+    parts.append(
+        f"Продукт: {signup_str} регистраций / {act1_str} создали канал / "
+        f"{act2_str} генераций постов / {pay_str} успешных оплат"
+    )
     return "\n".join(parts)
+
+
+def _current_business_stage(metrics: NormalizedMetrics | None) -> dict | None:
+    """
+    Определяет стадию бизнеса для /run. Это слой управленческого вывода над
+    обычными rule-based алертами: владелец должен сначала понять, что сейчас
+    происходит с бизнесом, а уже потом смотреть granular-диагностики.
+    """
+    if metrics is None:
+        return None
+
+    signups = int(metrics.signup or 0)
+    activation_1 = int(metrics.activation_1 or 0)
+    activation_2 = int(metrics.activation_2 or 0)
+    payment_started = int(metrics.payment_started or 0)
+    payment_success = int(metrics.payment_success or 0)
+    spend = float(metrics.spend or 0)
+    clicks = int(metrics.clicks or 0)
+
+    if (
+        signups > 0
+        and (activation_1 > 0 or activation_2 > 0)
+        and payment_success == 0
+        and payment_started < MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT
+    ):
+        cpa_text = ""
+        if spend > 0:
+            cpa = spend / signups
+            cpa_text = f" Расход на регистрацию примерно {cpa:.0f} ₽."
+
+        payment_note = ""
+        if 0 < payment_started < MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT:
+            payment_note = (
+                f" Есть {payment_started} начатая оплата, но это пока ранняя отметка, "
+                f"а не проблема платёжного шага: для P1 нужно минимум "
+                f"{MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT} попытки без успешной оплаты."
+            )
+
+        return {
+            "stage": "регистрации и активации пошли, успешных оплат пока нет",
+            "main": (
+                f"Привлечение начало работать: за 7 дней есть {signups} регистраций, "
+                f"{activation_1} созданий канала и {activation_2} генераций постов.{cpa_text}{payment_note}"
+            ),
+            "action": (
+                "Следующий фокус — качество регистраций и путь до оплаты: посмотреть, "
+                "какие пользователи создали канал/сгенерировали пост, видят ли они тарифы, "
+                "понятен ли момент перехода к оплате и нет ли технического разрыва на платёжном шаге."
+            ),
+            "do_not": (
+                "Не трогать резко рекламу, лендинг, ставки, бюджет, цены и тарифы. "
+                "Сначала накопить ещё данные по активациям и попыткам оплаты."
+            ),
+            "facts": {
+                "clicks": clicks,
+                "signups": signups,
+                "activation_1": activation_1,
+                "activation_2": activation_2,
+                "payment_started": payment_started,
+                "payment_success": payment_success,
+            },
+        }
+
+    return None
+
+
+def _format_business_stage_block(stage: dict, project_name: str) -> str:
+    return "\n".join([
+        "Аналитик Воронки — проверка бизнеса",
+        f"Проект: {project_name}",
+        "",
+        "Стадия:",
+        stage["stage"].capitalize() + ".",
+        "",
+        "Главный вывод:",
+        stage["main"],
+        "",
+        "Что сделать:",
+        stage["action"],
+        "",
+        "Что не трогать:",
+        stage["do_not"],
+    ])
+
+
+def _format_milestone_block(milestones: list[str]) -> str | None:
+    if not milestones:
+        return None
+    lines = ["Новые отметки:"]
+    lines.extend(f"— {m}" for m in milestones)
+    return "\n".join(lines)
 
 
 def format_alert_block(candidate: AlertCandidate, project_name: str, is_primary: bool = True) -> str:
@@ -216,7 +310,7 @@ def format_alert_block(candidate: AlertCandidate, project_name: str, is_primary:
 
     if is_primary:
         lines = [
-            "Growth Agent — watch-only",
+            "Аналитик Воронки — режим наблюдения",
             f"Проект: {project_name}",
             "",
             "Главный сигнал:",
@@ -261,13 +355,26 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     if new_or_escalated_integration:
         c = new_or_escalated_integration[0]
         blocks.append(
-            "Growth Agent — внимание\n"
+            "Аналитик Воронки — внимание\n"
             f"Проект: {project_name}\n\n"
             f"{c.alert.title}\n"
             f"{c.alert.message}"
         )
 
-    if result.primary_candidate is not None:
+    metrics_7d = result.metrics_by_window.get("7d")
+    milestone_block = _format_milestone_block(result.milestone_notifications)
+    if milestone_block:
+        blocks.append(milestone_block)
+
+    business_stage = _current_business_stage(metrics_7d)
+    if business_stage is not None:
+        blocks.append(_format_business_stage_block(business_stage, project_name))
+
+        landing_summary = _format_landing_funnel_teaser(result.landing_funnel_diagnostics)
+        if landing_summary:
+            blocks.append(landing_summary)
+
+    elif result.primary_candidate is not None:
         blocks.append(format_alert_block(result.primary_candidate, project_name, is_primary=True))
         for sec in result.secondary:
             dedup_line = _format_secondary_dedup_or_full(sec, result.primary_candidate, project_name)
@@ -286,11 +393,10 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
             blocks.append(landing_summary)
     elif not blocks:
         blocks.append(
-            f"Growth Agent — watch-only\nПроект: {project_name}\n\n"
+            f"Аналитик Воронки — режим наблюдения\nПроект: {project_name}\n\n"
             "Главный сигнал: пока всё спокойно, явных проблем не найдено."
         )
 
-    metrics_7d = result.metrics_by_window.get("7d")
     if metrics_7d:
         blocks.append(f"Метрики (7д):\n{_format_metrics_line(metrics_7d)}")
 
@@ -327,7 +433,7 @@ def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None
     НЕ полная детализация (та идёт по кнопке, см. format_deep_diagnostics_details).
     Возвращает None, если diagnostics не запускался вовсе -- тогда в
     основном сообщении про него вообще не упоминается, чтобы не плодить
-    лишние строки для тех, у кого Direct не настроен.
+    лишние строки для тех, у кого Директ не настроен.
     """
     if deep_diagnostics is None:
         return None
@@ -365,7 +471,7 @@ def _format_onboarding_diagnostics_teaser(onboarding_diagnostics: dict | None) -
     """
     Короткая пометка про onboarding diagnostics для основного сообщения,
     симметрично _format_deep_diagnostics_teaser выше. status="not_available"
-    -- честная формулировка, что endpoint ещё не реализован в TruePost, НЕ
+    -- честная формулировка, что диагностический интерфейс ещё не реализован в TruePost, НЕ
     финальная рекомендация "проверьте сами" -- агент явно говорит, что
     пытался получить данные сам и не смог технически, а не отказался пытаться.
     """
@@ -376,9 +482,9 @@ def _format_onboarding_diagnostics_teaser(onboarding_diagnostics: dict | None) -
 
     if status == "not_available":
         return (
-            "Онбординг-диагностика пока недоступна: продуктовый endpoint ещё не реализован. "
+            "Онбординг-диагностика пока недоступна: продуктовый диагностический интерфейс ещё не реализован. "
             "Сейчас известно только, что есть регистрации без активации. Для точной диагностики "
-            "нужно добавить tracking/endpoint в TruePost."
+            "нужно добавить события и продуктовый диагностический интерфейс."
         )
 
     if status == "error":
@@ -396,7 +502,7 @@ def _format_landing_funnel_teaser(landing_diagnostics: dict | None) -> str | Non
     Короткая пометка про landing funnel diagnostics для основного сообщения,
     симметрично тизерам выше. data_quality_warning и main_finding теперь
     НЕ взаимоисключающие (см. diagnostics.analyze_landing_funnel) -- если
-    есть downstream finding (правила B-E, не зависят от Director), он
+    есть downstream finding (правила B-E, не зависят от Директor), он
     упоминается в тизере даже при наличии warning по правилу A, потому что
     находка внутри TruePost-воронки важнее короткой строки "несопоставимо".
     """
@@ -463,7 +569,7 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
     confidence_ru = {"low": "низкая", "medium": "средняя", "high": "высокая"}
 
     lines = [
-        "Growth Agent — рекламная диагностика",
+        "Аналитик Воронки — рекламная диагностика",
         f"Проект: {project_name}",
         "",
     ]
@@ -545,34 +651,34 @@ def format_onboarding_diagnostics_details(onboarding_diagnostics: dict, project_
     зона проблемы (список причин), что сделать, что НЕ делать.
 
     status="not_available" -- отдельная, более короткая ветка: если
-    endpoint не реализован, не показываем "результат"/"вероятная зона" по
+    диагностический интерфейс не реализован, не показываем "результат"/"вероятная зона" по
     пустым данным, честно говорим, что нечего показать технически.
     """
     status = onboarding_diagnostics.get("status")
 
     if status == "not_available":
         return (
-            "Growth Agent — диагностика онбординга\n"
+            "Аналитик Воронки — диагностика онбординга\n"
             f"Проект: {project_name}\n\n"
-            "Онбординг-диагностика пока недоступна: продуктовый endpoint "
-            "(/api/internal/onboarding-diagnostics) ещё не реализован в TruePost.\n\n"
+            "Онбординг-диагностика пока недоступна: продуктовый диагностический интерфейс "
+            "ещё не реализован в продукте.\n\n"
             "Что известно: есть регистрации без подтверждённой активации, но без "
             "событий онбординга нельзя точно сказать, на каком шаге останавливаются пользователи.\n\n"
             "Что сделать:\n"
-            "Добавить tracking событий onboarding_started и channel_created в TruePost, "
+            "Добавить события начала онбординга и создания канала, "
             "чтобы агент мог анализировать путь пользователя автоматически."
         )
 
     if status == "error":
         return (
-            "Growth Agent — диагностика онбординга\n"
+            "Аналитик Воронки — диагностика онбординга\n"
             f"Проект: {project_name}\n\n"
             f"Не удалось получить данные онбординга: {onboarding_diagnostics.get('error_detail', 'техническая ошибка')}.\n\n"
             "Это техническая проблема с подключением, не вывод о продукте. Можно попробовать ещё раз позже."
         )
 
     lines = [
-        "Growth Agent — диагностика онбординга",
+        "Аналитик Воронки — диагностика онбординга",
         f"Проект: {project_name}",
         "",
         "Главный сигнал:",
@@ -623,7 +729,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
     результат, вероятная причина, что сделать.
 
     Ключевое: если main_finding.affects_landing_or_ads == False (правила
-    C/D/E -- проблема ПОСЛЕ клика по CTA), агент НЕ пишет "проверить
+    C/D/E -- проблема ПОСЛЕ клика по кнопке), агент НЕ пишет "проверить
     лендинг" в рекомендациях -- явно следует acceptance criteria #3/#4:
     "если проблема локализована после клика, не предлагать менять
     лендинг/рекламу".
@@ -632,9 +738,9 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
 
     if status == "not_configured":
         return (
-            "Growth Agent — диагностика лендинга\n"
+            "Аналитик Воронки — диагностика лендинга\n"
             f"Проект: {project_name}\n\n"
-            "TruePost не настроен (нет base_url или internal API token) -- "
+            "Продуктовый источник данных не настроен — "
             "диагностика воронки лендинга недоступна."
         )
 
@@ -642,7 +748,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         snapshot = landing_diagnostics.get("funnel_snapshot", {})
         views = snapshot.get("landing_views")
         return (
-            "Growth Agent — диагностика лендинга\n"
+            "Аналитик Воронки — диагностика лендинга\n"
             f"Проект: {project_name}\n\n"
             f"Данных пока мало для диагностики воронки: {views if views is not None else 0} просмотров лендинга "
             "за период. Можно запустить проверку вручную позже, когда накопится больше трафика."
@@ -650,7 +756,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
 
     if status == "error":
         return (
-            "Growth Agent — диагностика лендинга\n"
+            "Аналитик Воронки — диагностика лендинга\n"
             f"Проект: {project_name}\n\n"
             f"Не удалось получить данные воронки лендинга: {landing_diagnostics.get('error_detail', 'техническая ошибка')}.\n\n"
             "Это техническая проблема с подключением, не вывод о лендинге. Можно попробовать ещё раз позже."
@@ -669,7 +775,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
     web_register_opened = snapshot.get("web_register_opened")
 
     # Telegram path и Web path показываются ОТДЕЛЬНО (требование D) -- это
-    # две разные ветки воронки, смешивать их в одну строку "Клики по CTA"
+    # две разные ветки воронки, смешивать их в одну строку "Клики по кнопке"
     # вводит в заблуждение ровно так же, как смешивать их в самом анализе
     # (см. diagnostics.analyze_landing_funnel: правило C использует только
     # cta_bot, не сумму).
@@ -681,26 +787,26 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         f"Клики из Директа: {_fmt(snapshot.get('direct_clicks'))}",
         f"Просмотры лендинга: {_fmt(snapshot.get('landing_views'))}",
         "",
-        "Telegram path:",
-        f"  Telegram CTA clicks: {_fmt(cta_bot_clicks)}",
-        f"  Mini App opens (bot_starts_from_landing): {_fmt(bot_starts)}",
-        f"  Open rate: {telegram_open_rate if telegram_open_rate is not None else '—'}%",
+        "Путь через Telegram:",
+        f"  Клики по кнопке Telegram: {_fmt(cta_bot_clicks)}",
+        f"  Запуски бота из лендинга: {_fmt(bot_starts)}",
+        f"  Доля открытия: {telegram_open_rate if telegram_open_rate is not None else '—'}%",
         "",
-        "Web path:",
-        f"  Web CTA clicks: {_fmt(cta_app_clicks)}",
-        f"  Web register opened: {_fmt(web_register_opened)}",
-        f"  Register success: {_fmt(snapshot.get('register_success'))}",
+        "Путь через веб-версию:",
+        f"  Клики по кнопке веб-версии: {_fmt(cta_app_clicks)}",
+        f"  Открытия регистрации в веб-версии: {_fmt(web_register_opened)}",
+        f"  Успешные регистрации: {_fmt(snapshot.get('register_success'))}",
         "",
         f"Активация: {_fmt(snapshot.get('activation_1'))}",
     ]
 
     # data_quality_warning и main_finding теперь НЕ взаимоисключающие --
-    # warning касается только сравнения Direct clicks vs landing_views
+    # warning касается только сравнения клики из Директа и просмотры лендинга
     # (правило A), а main_finding может быть найден по правилам B-E, которые
     # анализируют исключительно внутреннюю TruePost-воронку и не зависят
-    # от Director. Оба блока показываются вместе, если оба присутствуют --
+    # от Директor. Оба блока показываются вместе, если оба присутствуют --
     # warning не подавляет downstream finding (ранее это было ошибкой).
-    lines = ["Growth Agent — диагностика лендинга", f"Проект: {project_name}", ""]
+    lines = ["Аналитик Воронки — диагностика лендинга", f"Проект: {project_name}", ""]
 
     if data_quality_warning is not None and main_finding is not None:
         # Оба сигнала есть -- формат из задачи: "Главный сигнал" про
@@ -708,17 +814,17 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         # находку B-E, общий "Что НЕ делать" и "Что проверить".
         lines.append("Главный сигнал:")
         lines.append(
-            "Данные Direct clicks vs landing_views пока несопоставимы, поэтому нельзя делать "
+            "Данные клики из Директа и просмотры лендинга пока несопоставимы, поэтому нельзя делать "
             "вывод о проблеме перехода из рекламы."
         )
         lines.append("")
-        lines.append("Дополнительный сигнал внутри TruePost:")
+        lines.append("Дополнительный сигнал внутри продукта:")
         lines.append(main_finding["detail"] + f" Вероятная зона проблемы — {main_finding['probable_cause'].lower()}")
         lines.append("")
         lines.append("Что НЕ делать:")
-        not_do = "Не менять рекламу и лендинг на основании сравнения Direct clicks vs landing_views."
+        not_do = "Не менять рекламу и лендинг на основании сравнения кликов из Директа и просмотров лендинга."
         if not main_finding["affects_landing_or_ads"]:
-            not_do += " Также не нужно менять лендинг или рекламу на основании дополнительного сигнала — он локализован после клика по CTA."
+            not_do += " Также не нужно менять лендинг или рекламу на основании дополнительного сигнала — он локализован после клика по кнопке."
         lines.append(not_do)
         lines.append("")
         lines.append("Что проверить:")
@@ -734,7 +840,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         lines.append(data_quality_warning["message"])
         if landing_diagnostics.get("no_critical_issue"):
             lines.append("")
-            lines.append("Внутри отслеженной TruePost-воронки критической проблемы не нашлось.")
+            lines.append("Внутри отслеженной продуктовой воронки критической проблемы не нашлось.")
         lines.append("")
         lines.append("Что НЕ делать:")
         lines.append(
@@ -743,13 +849,13 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         )
 
     elif main_finding is not None:
-        # Только downstream-находка, период с Director сопоставим (или
-        # Director не участвовал вовсе) -- обычный единый формат.
+        # Только downstream-находка, период с Директor сопоставим (или
+        # Директor не участвовал вовсе) -- обычный единый формат.
         lines.append("Главный сигнал:")
         lines.append(f"Разрыв на шаге: {main_finding['step_label']}.")
         lines.append("")
         lines.append("Что проверил:")
-        lines.append("Прошёл по всей воронке лендинга: клики из Директа → просмотры → CTA → открытие бота → регистрация → активация.")
+        lines.append("Прошёл по всей воронке лендинга: клики из Директа → просмотры → кнопка → открытие бота → регистрация → активация.")
         lines.append("")
         lines.append("Результат:")
         lines.append(main_finding["detail"])
@@ -765,7 +871,7 @@ def format_landing_funnel_details(landing_diagnostics: dict, project_name: str) 
         if not main_finding["affects_landing_or_ads"]:
             lines.append("")
             lines.append(
-                "Важно: проблема локализована ПОСЛЕ клика по CTA — менять текст лендинга "
+                "Важно: проблема локализована ПОСЛЕ клика по кнопке — менять текст лендинга "
                 "или настройки рекламы на основании этого сигнала не нужно."
             )
 
@@ -824,53 +930,40 @@ def format_negative_keywords_suggestion(deep_diagnostics: dict, query_clusters: 
 
     _STOP_WORDS = {"для", "как", "что", "это", "или", "если", "при", "без", "под", "над"}
 
-    def _is_safe_candidate(phrase: str) -> bool:
+    def _is_safe_phrase_candidate(phrase: str) -> bool:
         phrase_lower = phrase.lower()
+        words = [w for w in phrase_lower.split() if w.strip(".,!?—-")]
+        if len(words) < 2:
+            return False  # одиночные слова запрещены: слишком высокий риск срезать релевантный трафик
         if any(good_term in phrase_lower for good_term in good_terms):
             return False  # пересекается с релевантным intent -- не предлагаем
-        if phrase_lower in _STOP_WORDS:
+        if all(w in _STOP_WORDS for w in words):
             return False
         if len(phrase_lower) < 4:
             return False
         return True
 
-    # Кандидаты -- ПОЛНЫЕ запросы (не отдельные слова) плюс отдельные
-    # значимые слова, которые сами по себе безопасны (прошли white-list).
-    # Полные запросы как минус-фразы безопаснее единичных слов почти всегда,
-    # поэтому идут первыми и это основной рекомендуемый вариант.
-    full_query_candidates = [q for q in top_queries if _is_safe_candidate(q)]
-
-    single_word_candidates = []
-    seen_words = set()
-    for query in top_queries:
-        for word in query.lower().split():
-            word = word.strip(".,!?")
-            if word in seen_words:
-                continue
-            if _is_safe_candidate(word):
-                seen_words.add(word)
-                single_word_candidates.append(word)
+    # Кандидаты -- только полные/фразовые запросы. Одиночные минус-слова
+    # запрещены: «генерация», «текст», «поста», «онлайн» могут убить
+    # релевантную семантику вроде «генерация постов для Telegram».
+    full_query_candidates = [q for q in top_queries if _is_safe_phrase_candidate(q)]
 
     lines = ["Кандидаты в минус-фразы (черновик для ручной проверки):", ""]
 
     if full_query_candidates:
-        lines.append("Рекомендуется (целые фразы, безопаснее):")
+        lines.append("Рекомендуется (только целые фразы, безопаснее):")
         lines.extend(f"-{q}" for q in full_query_candidates)
         lines.append("")
 
-    if single_word_candidates:
-        lines.append("Можно рассмотреть отдельно (проверьте, не слишком ли широко):")
-        lines.extend(f"-{w}" for w in single_word_candidates)
-        lines.append("")
-
-    if not full_query_candidates and not single_word_candidates:
+    if not full_query_candidates:
         lines.append("Не нашлось безопасных кандидатов — все слова из найденных запросов пересекаются с релевантными.")
         lines.append("")
 
     lines.append(
         "Это черновик, требующий проверки человеком. Минус-фразы НЕ применены "
         "автоматически — добавьте вручную в интерфейсе Директа, если согласны. "
-        "Слова, совпадающие с релевантными запросами продукта, уже исключены из списка."
+        "Одиночные широкие слова намеренно не предлагаются. Слова, совпадающие "
+        "с релевантными запросами продукта, уже исключены из списка."
     )
     return "\n".join(lines)
 
@@ -900,7 +993,7 @@ def _get_onboarding_diagnostics_for_keyboard(session, project_id: int) -> dict |
     Симметрично _get_deep_diagnostics_for_keyboard, но для onboarding --
     смотрит в ONBOARDING_CACHE_PERIOD_KEY ("onboarding_24h"), отдельный
     namespace в той же таблице DeepDiagnosticsCache, чтобы не путать с
-    кэшем Direct deep diagnostics (см. service.py).
+    кэшем Директ deep diagnostics (см. service.py).
     """
     from app.service import get_cached_diagnostics, ONBOARDING_CACHE_PERIOD_KEY
     cached = get_cached_diagnostics(session, project_id, ONBOARDING_CACHE_PERIOD_KEY)
@@ -926,7 +1019,7 @@ def build_alert_keyboard(
     """
     has_deep_diagnostics -- diagnostics уже запускался в этом цикле
     (автоматически или из кэша), есть что показать по кнопке "Показать
-    детали". deep_diagnostics_available -- Direct настроен и в принципе
+    детали". deep_diagnostics_available -- Директ настроен и в принципе
     может быть запущен по требованию -- тогда показываем "Проверить
     рекламу глубже" как force refresh.
 
@@ -1012,7 +1105,7 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     with get_session() as session:
         alert = session.get(Alert, alert_id)
         if alert is None:
-            await query.edit_message_text("Алерт не найден (возможно, уже обработан).")
+            await query.edit_message_text("Сигнал не найден (возможно, уже обработан).")
             return
 
         if action == "ack":
@@ -1105,7 +1198,7 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.message.reply_text(details_text)
 
         elif action == "onboarding_check":
-            # Force refresh -- минуя кэш, симметрично deep_check для Direct.
+            # Force refresh -- минуя кэш, симметрично deep_check для Директ.
             await query.message.reply_text("Проверяю путь после регистрации...")
             from app.scheduler import force_refresh_onboarding_diagnostics
             outcome = await force_refresh_onboarding_diagnostics(alert.project_id)
@@ -1172,20 +1265,19 @@ def _get_active_project(session) -> Project | None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from app.config import BUILD_MARKER
     await update.message.reply_text(
-        "Growth Agent — watch-only.\n"
+        "Аналитик Воронки — режим наблюдения.\n"
         f"Версия: {BUILD_MARKER}\n\n"
         "Команды:\n"
         "/status — состояние проекта\n"
         "/run — запустить проверку вручную\n"
-        "/alerts — последние алерты\n"
+        "/alerts — последние сигналы\n"
         "/funnel — воронка\n"
         "/mode — текущий режим\n"
         "/settings — основные настройки\n"
         "/test_metrika — проверить подключение к Яндекс.Метрике\n"
         "/test_direct — проверить подключение к Яндекс.Директу\n"
-        "/deep_direct — глубокая диагностика Директа (группы, запросы) независимо от текущего alert\n"
-        "/check_onboarding — диагностика онбординга (путь после регистрации) независимо от текущего alert\n"
-        "/check_landing — диагностика воронки лендинга (Direct → лендинг → CTA → бот → регистрация → активация)"
+        "/deep_direct — глубокая диагностика Директа (группы, поисковые запросы)\n"
+        "/check_landing — диагностика воронки лендинга (Яндекс.Директ → лендинг → кнопка → бот → регистрация → активация)"
     )
 
 
@@ -1200,7 +1292,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             select(Integration).where(Integration.project_id == project.id)
         ).all()
 
-        status_lines = [f"Проект: {project.name}", f"Режим: {project.settings_json.get('mode', 'watch_only')}", ""]
+        mode_ru = {
+            "watch_only": "наблюдение",
+            "recommend_only": "рекомендации",
+            "approval_required": "действия только с подтверждением",
+            "autopilot_limited": "ограниченный автопилот",
+        }
+        integration_ru = {
+            "project_metrics_api": "метрики продукта",
+            "metrika": "Яндекс.Метрика",
+            "direct": "Яндекс.Директ",
+            "yookassa": "ЮKassa",
+            "telegram": "Telegram",
+            "llm": "языковая модель",
+        }
+        status_ru = {
+            "ok": "работает",
+            "not_configured": "не настроено",
+            "error": "ошибка",
+            "stale": "данные устарели",
+        }
+        current_mode = project.settings_json.get("mode", "watch_only")
+        status_lines = [f"Проект: {project.name}", f"Режим: {mode_ru.get(current_mode, current_mode)}", ""]
         status_lines.append("Интеграции:")
         status_emoji = {
             IntegrationStatus.ok: "🟢",
@@ -1210,7 +1323,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         }
         for integ in integrations:
             emoji = status_emoji.get(integ.status, "⚪️")
-            status_lines.append(f"{emoji} {integ.type.value}: {integ.status.value}")
+            name = integration_ru.get(integ.type.value, integ.type.value)
+            state = status_ru.get(integ.status.value, integ.status.value)
+            status_lines.append(f"{emoji} {name}: {state}")
 
         open_alerts_count = session.exec(
             select(Alert).where(
@@ -1219,7 +1334,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
         ).all()
         status_lines.append("")
-        status_lines.append(f"Открытых алертов: {len(open_alerts_count)}")
+        status_lines.append(f"Открытых сигналов: {len(open_alerts_count)}")
 
         await update.message.reply_text("\n".join(status_lines))
 
@@ -1294,7 +1409,7 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ).all()
 
         if not alerts:
-            await update.message.reply_text("Алертов пока нет.")
+            await update.message.reply_text("Сигналов пока нет.")
             return
 
         active_statuses = {AlertStatus.open, AlertStatus.sent, AlertStatus.escalated}
@@ -1365,7 +1480,7 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(format_metric_line("payment_started", metrics_7d.payment_started))
     lines.append(format_metric_line("payment_success", metrics_7d.payment_success))
 
-    # Поясняющая сноска про activation_2 -- именно та метрика, которая
+    # Поясняющая сноска про генерации постов -- именно та метрика, которая
     # визуально может "не сходиться" с остальными (события, не пользователи).
     explain = get_metric_explain("activation_2")
     if explain and metrics_7d.activation_2 is not None:
@@ -1449,15 +1564,15 @@ async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Принудительный запуск Direct deep diagnostics НЕЗАВИСИМО от primary
-    alert. Нужна, потому что обычная кнопка "Проверить глубже" привязана
+    Принудительный запуск Директ deep diagnostics НЕЗАВИСИМО от главного
+    сигнала. Нужна, потому что обычная кнопка "Проверить глубже" привязана
     к конкретному alert_id и появляется только если этот alert относится к
     триггерящей категории (DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES) -- если
     сейчас главный сигнал продуктовый (например, "Регистрации без
-    активации"), кнопки не будет вообще, хотя Direct может быть подключён
+    активации"), кнопки не будет вообще, хотя Директ может быть подключён
     и его стоит проверить отдельно для теста/диагностики.
 
-    Read-only, как и весь Direct-анализ: только granular-отчёты (ad group,
+    Read-only, как и весь Директ-анализ: только granular-отчёты (ad group,
     search query) и поиск находок, никаких изменений в кампаниях.
     """
     settings = get_settings()
@@ -1507,57 +1622,28 @@ async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_check_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Принудительный запуск Product Onboarding Diagnostics НЕЗАВИСИМО от
-    primary alert -- симметрично cmd_deep_direct. Полезна, когда нужно
-    проверить путь после регистрации, даже если текущий главный сигнал
-    сейчас не product/onboarding категории.
-
-    Read-only: только чтение через onboarding-endpoint TruePost, никаких
-    изменений в продукте. Честно сообщает "недоступно", если endpoint
-    ещё не реализован в TruePost -- не падает и не молчит об этом.
-    """
-    settings = get_settings()
-
-    if not (settings.project_internal_api_token):
-        await update.message.reply_text(
-            "TruePost не настроен (нет PROJECT_INTERNAL_API_TOKEN) -- диагностика онбординга недоступна."
-        )
-        return
-
-    await update.message.reply_text("Проверяю путь после регистрации...")
-
-    from app.scheduler import force_refresh_onboarding_diagnostics
-    outcome = await force_refresh_onboarding_diagnostics()
-
-    with get_session() as session:
-        project = _get_active_project(session)
-        project_name = project.name if project else "Проект"
-
-    if outcome["status"] == "ok":
-        details_text = format_onboarding_diagnostics_details(outcome["result"], project_name)
-    else:
-        payload_for_details = {"status": outcome["status"], "error_detail": outcome.get("error")}
-        details_text = format_onboarding_diagnostics_details(payload_for_details, project_name)
-
-    await update.message.reply_text(details_text)
+    """Команда временно отключена: диагностический интерфейс онбординга в продукте ещё не реализован."""
+    await update.message.reply_text(
+        "Диагностика онбординга пока скрыта: в продукте ещё нет диагностического интерфейса для этого отчёта. "
+        "Кнопка не показывается, чтобы не выглядеть рабочей. Когда интерфейс появится, команду можно включить обратно."
+    )
 
 
 async def cmd_check_landing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Принудительный запуск Landing Funnel Diagnostics НЕЗАВИСИМО от primary
-    alert -- симметрично cmd_deep_direct/cmd_check_onboarding. Проверяет
-    всю цепочку Direct clicks -> landing -> CTA -> bot -> register ->
+    Принудительный запуск диагностики лендинга НЕЗАВИСИМО от главного
+    сигнала -- симметрично cmd_deep_direct/cmd_check_onboarding. Проверяет
+    всю цепочку клики из Директа -> landing -> CTA -> bot -> register ->
     activation за один проход.
 
-    Read-only: только чтение через TruePost internal API, никаких
+    Только чтение через внутренний API продукта, никаких
     изменений в лендинге, рекламе или продукте.
     """
     settings = get_settings()
 
     if not settings.project_internal_api_token:
         await update.message.reply_text(
-            "TruePost не настроен (нет PROJECT_INTERNAL_API_TOKEN) -- диагностика лендинга недоступна."
+            "Продуктовый источник данных не настроен — диагностика лендинга недоступна."
         )
         return
 
@@ -1629,20 +1715,20 @@ async def cmd_debug_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     with get_session() as session:
         alert = session.get(Alert, alert_id)
         if alert is None:
-            await update.message.reply_text(f"Алерт {alert_id} не найден.")
+            await update.message.reply_text(f"Сигнал {alert_id} не найден.")
             return
 
         lines = [
-            f"Alert #{alert.id}",
-            f"fingerprint: {alert.fingerprint}",
-            f"category: {alert.category.value}",
-            f"severity: {alert.severity.value}",
-            f"confidence: {alert.confidence.value}",
-            f"status: {alert.status.value}",
-            f"occurrence_count: {alert.occurrence_count}",
-            f"escalation_level: {alert.escalation_level}",
+            f"Сигнал #{alert.id}",
+            f"Идентификатор: {alert.fingerprint}",
+            f"Категория: {alert.category.value}",
+            f"Важность: {alert.severity.value}",
+            f"Уверенность: {alert.confidence.value}",
+            f"Статус: {alert.status.value}",
+            f"Число повторов: {alert.occurrence_count}",
+            f"Уровень эскалации: {alert.escalation_level}",
             "",
-            "payload_json:",
+            "Данные:",
         ]
         lines.extend(f"  {k}: {v}" for k, v in alert.payload_json.items())
         await update.message.reply_text("\n".join(lines))
@@ -1655,13 +1741,19 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Активный проект не найден.")
             return
         mode = project.settings_json.get("mode", "watch_only")
+        mode_ru = {
+            "watch_only": "наблюдение",
+            "recommend_only": "рекомендации",
+            "approval_required": "действия только с подтверждением",
+            "autopilot_limited": "ограниченный автопилот",
+        }
         await update.message.reply_text(
-            f"Текущий режим: {mode}\n\n"
-            "Доступные режимы (в v1 активен только watch_only):\n"
-            "• watch_only — только смотреть (активен)\n"
-            "• recommend_only — предлагать (скоро)\n"
-            "• approval_required — делать с подтверждением (скоро)\n"
-            "• autopilot_limited — автопилот в лимитах (скоро)"
+            f"Текущий режим: {mode_ru.get(mode, mode)}\n\n"
+            "Доступные режимы:\n"
+            "• Наблюдение — только смотрит и сообщает выводы (активен).\n"
+            "• Рекомендации — будет предлагать изменения, но не применять их.\n"
+            "• Действия с подтверждением — будет готовить изменения после вашего одобрения.\n"
+            "• Ограниченный автопилот — будущий режим, сейчас выключен."
         )
 
 
@@ -1676,8 +1768,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines = [
             f"Проект: {project.name}",
             f"Тип: {project.type}",
-            f"Connector: {project.connector_name}",
-            f"Base URL: {project.base_url or '—'}",
+            f"Коннектор: {project.connector_name}",
+            f"Адрес продукта: {project.base_url or '—'}",
             f"Интервал проверки: {settings.watch_interval_seconds // 3600} ч",
         ]
         await update.message.reply_text("\n".join(lines))
