@@ -32,7 +32,7 @@ from app.db import get_session
 from app.models import Alert, AlertStatus, Integration, IntegrationStatus, MetricSnapshot, Project
 from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
 from app.scheduler import run_cycle_once_sync_with_timeout
-from app.service import AlertChange, AlertChangeType, CycleResult
+from app.service import AlertChange, AlertChangeType, CycleResult, extract_normalized_metrics_from_snapshot
 
 logger = logging.getLogger("growth_agent.telegram")
 
@@ -1339,7 +1339,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "metrika": "Яндекс.Метрика",
             "direct": "Яндекс.Директ",
             "yookassa": "ЮKassa",
-            "telegram": "Telegram",
+            # Telegram bot runtime is not read from Integration rows: if this
+            # command replies, the bot itself is alive. Old DB rows with
+            # type=telegram used to show "Telegram: не настроено", which was
+            # misleading for the user.
             "llm": "языковая модель",
         }
         status_ru = {
@@ -1351,6 +1354,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         current_mode = project.settings_json.get("mode", "watch_only")
         status_lines = [f"Проект: {project.name}", f"Версия: {BUILD_MARKER}", f"Режим: {mode_ru.get(current_mode, current_mode)}", ""]
         status_lines.append("Интеграции:")
+        status_lines.append("🟢 Telegram-бот: работает (этот ответ получен)")
         status_emoji = {
             IntegrationStatus.ok: "🟢",
             IntegrationStatus.not_configured: "⚪️",
@@ -1358,6 +1362,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             IntegrationStatus.stale: "🟡",
         }
         for integ in integrations:
+            if integ.type == IntegrationType.telegram:
+                # Do not show stale/legacy DB status for the bot runtime.
+                # The live bot status is the explicit line above.
+                continue
             emoji = status_emoji.get(integ.status, "⚪️")
             name = integration_ru.get(integ.type.value, integ.type.value)
             state = status_ru.get(integ.status.value, integ.status.value)
@@ -1391,12 +1399,165 @@ def _format_duration(seconds: float) -> str:
     return f"{sec} сек"
 
 
-def _build_cycle_response(result: CycleResult) -> tuple[str, InlineKeyboardMarkup | None]:
+def _as_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _format_dt(dt: datetime | str | None) -> str:
+    if dt is None:
+        return "неизвестное время"
+    if isinstance(dt, str):
+        return dt
+    return _as_aware(dt).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _get_latest_combined_snapshot(session, project_id: int, period_key: str = "7d") -> MetricSnapshot | None:
+    return session.exec(
+        select(MetricSnapshot)
+        .where(
+            MetricSnapshot.project_id == project_id,
+            MetricSnapshot.period_key == period_key,
+            MetricSnapshot.source == "combined",
+        )
+        .order_by(MetricSnapshot.created_at.desc())
+        .limit(1)
+    ).first()
+
+
+def _snapshot_has_product_metrics(snapshot: MetricSnapshot) -> bool:
+    product = (snapshot.metrics_json or {}).get("product") or {}
+    return any(product.get(k) is not None for k in ["signup", "activation_1", "activation_2", "payment_started", "payment_success"])
+
+
+def _normalized_metrics_from_snapshot(snapshot: MetricSnapshot) -> NormalizedMetrics:
+    data = extract_normalized_metrics_from_snapshot(snapshot)
+    raw = snapshot.metrics_json or {}
+    sources_ok = {name for name in ["product", "metrika", "direct", "yookassa"] if raw.get(name) is not None}
+    metrics = NormalizedMetrics(period_key=snapshot.period_key, sources_ok=sources_ok)
+    metrics.signup = data.get("signup")
+    metrics.activation_1 = data.get("activation_1")
+    metrics.activation_2 = data.get("activation_2")
+    metrics.payment_started = data.get("payment_started")
+    metrics.payment_success = data.get("payment_success")
+    metrics.spend = data.get("spend")
+    metrics.clicks = data.get("clicks")
+    return metrics
+
+
+def _format_source_freshness(snapshot: MetricSnapshot, *, fallback_mode: bool) -> str:
+    raw = snapshot.metrics_json or {}
+    statuses = raw.get("source_statuses") or {}
+    source_labels = {
+        "product": "Метрики продукта",
+        "metrika": "Яндекс.Метрика",
+        "direct": "Яндекс.Директ",
+        "yookassa": "ЮKassa / оплаты",
+    }
+    lines = ["Свежесть данных:"]
+    for source, label in source_labels.items():
+        source_payload = raw.get(source)
+        status_info = statuses.get(source) or {}
+        status = status_info.get("status")
+        cached_at = status_info.get("snapshot_created_at") or snapshot.created_at
+        if source_payload is None:
+            reason = status_info.get("error")
+            suffix = f" ({reason})" if reason else ""
+            lines.append(f"— {label}: недоступно или не настроено{suffix}.")
+        elif fallback_mode:
+            lines.append(f"— {label}: кэш от {_format_dt(cached_at)}.")
+        elif status == "fresh":
+            lines.append(f"— {label}: свежие данные текущего запуска.")
+        elif status == "stale":
+            lines.append(f"— {label}: кэш от {_format_dt(cached_at)}.")
+        else:
+            lines.append(f"— {label}: последний сохранённый замер от {_format_dt(snapshot.created_at)}.")
+    return "\n".join(lines)
+
+
+def _format_cached_business_report(project_name: str, snapshot: MetricSnapshot, *, reason: str) -> str:
+    metrics = _normalized_metrics_from_snapshot(snapshot)
+    signups = int(metrics.signup or 0)
+    activation_1 = int(metrics.activation_1 or 0)
+    activation_2 = int(metrics.activation_2 or 0)
+    payment_started = int(metrics.payment_started or 0)
+    payment_success = int(metrics.payment_success or 0)
+
+    if reason == "timeout":
+        preface = (
+            "Один из внешних источников отвечает медленно, поэтому использую "
+            f"последний сохранённый замер от {_format_dt(snapshot.created_at)}."
+        )
+    else:
+        preface = (
+            "Живой сбор данных завершился с ошибкой, поэтому показываю лучший доступный "
+            f"отчёт по последнему сохранённому замеру от {_format_dt(snapshot.created_at)}."
+        )
+
+    if payment_success == 0 and signups > 0 and (activation_1 > 0 or activation_2 > 0):
+        main = (
+            f"Регистрации и активации идут: {signups} регистраций, "
+            f"{activation_1} созданных каналов, {activation_2} генераций постов. "
+            "Успешных оплат пока нет. Рекламу, лендинг, ставки, бюджет, цены и тарифы резко не трогать. "
+            "Следующий фокус — качество регистраций, активация и путь до оплаты."
+        )
+        check = (
+            "Почему после регистрации пользователи не доходят до оплаты; отдельно проверить платёжный путь. "
+            f"{payment_started} начатая оплата пока не является достаточным сигналом проблемы."
+            if payment_started == 1
+            else "Почему после регистрации пользователи не доходят до оплаты; отдельно проверить платёжный путь, тарифный экран и момент перехода к покупке."
+        )
+        dont = "Не чистить рекламу по единичным запросам, не менять цены, не делать редизайн лендинга."
+    else:
+        main = (
+            f"Последний замер: {signups} регистраций, {activation_1} созданных каналов, "
+            f"{activation_2} генераций постов, {payment_started} начатых оплат, "
+            f"{payment_success} успешных оплат."
+        )
+        check = "Проверить следующий самый узкий шаг по данным воронки, не делая резких изменений без свежего замера."
+        dont = "Не менять одновременно рекламу, лендинг, цены и продуктовую воронку."
+
+    return "\n\n".join([
+        preface,
+        "Аналитик Воронки — проверка бизнеса",
+        f"Проект: {project_name}",
+        "Главный вывод:\n" + main,
+        "Что проверить:\n" + check,
+        "Что не делать:\n" + dont,
+        _format_source_freshness(snapshot, fallback_mode=True),
+        f"Метрики (7д):\n{_format_metrics_line(metrics)}",
+    ])
+
+
+def _build_cached_cycle_response(reason: str) -> str | None:
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            return None
+        snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
+        if snapshot is None or not _snapshot_has_product_metrics(snapshot):
+            return None
+        return _format_cached_business_report(project.name, snapshot, reason=reason)
+
+
+def _build_cycle_response(result: CycleResult, started_at: datetime | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
+    project_id = None
     with get_session() as session:
         project = _get_active_project(session)
         project_name = project.name if project else "Проект"
+        project_id = project.id if project else None
 
     text = format_cycle_message(result, project_name)
+
+    if project_id is not None:
+        with get_session() as session:
+            snapshot = _get_latest_combined_snapshot(session, project_id, "7d")
+            if snapshot is not None:
+                started = _as_aware(started_at)
+                snap_created = _as_aware(snapshot.created_at)
+                fallback_mode = bool(started and snap_created and snap_created < started - timedelta(seconds=5))
+                text += "\n\n" + _format_source_freshness(snapshot, fallback_mode=fallback_mode)
 
     keyboard = None
     if result.primary_candidate is not None:
@@ -1436,8 +1597,10 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
             ),
             timeout=MANUAL_RUN_TIMEOUT_SECONDS + 5.0,
         )
-        text, keyboard = _build_cycle_response(result)
+        text, keyboard = _build_cycle_response(result, started_at=started_at)
         await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        logger.info("report generated from fresh/cached/mixed data (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        logger.info("final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         logger.info(
             "Manual /run finished (build=%s, chat_id=%s, elapsed=%.1f sec, primary=%s, milestones=%s)",
             BUILD_MARKER,
@@ -1453,28 +1616,42 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
             BUILD_MARKER,
             chat_id,
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "Проверка заняла слишком много времени и была остановлена. "
-                "Вероятно, один из внешних источников данных отвечает медленно. "
-                "Бот остаётся живым: /ping, /status, /funnel и /start должны отвечать. "
-                "Повторите /run позже или проверьте логи Railway."
-            ),
-        )
+        fallback_text = _build_cached_cycle_response(reason="timeout")
+        if fallback_text:
+            logger.info("cached fallback used after manual /run timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            logger.info("report generated from cached data (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+            await bot.send_message(chat_id=chat_id, text=fallback_text)
+            logger.info("final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Проверка заняла слишком много времени и была остановлена. "
+                    "Последнего сохранённого замера с продуктовыми метриками пока нет, поэтому я не могу собрать полезный отчёт из кэша. "
+                    "Бот остаётся живым: /ping, /status, /funnel и /start должны отвечать."
+                ),
+            )
+            logger.info("final timeout-only message sent because no usable cached snapshot exists (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
     except asyncio.CancelledError:
         logger.warning("Manual /run task cancelled (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         raise
     except Exception:
         logger.exception("Manual /run failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Не удалось выполнить проверку из-за внутренней ошибки. "
-                    "Traceback записан в Railway logs. Бот не заблокирован; можно проверить /ping или /status."
-                ),
-            )
+            fallback_text = _build_cached_cycle_response(reason="error")
+            if fallback_text:
+                logger.info("cached fallback used after manual /run exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+                logger.info("report generated from cached data (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+                await bot.send_message(chat_id=chat_id, text=fallback_text)
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Не удалось выполнить проверку из-за внутренней ошибки. "
+                        "Traceback записан в Railway logs. Бот не заблокирован; можно проверить /ping или /status."
+                    ),
+                )
+            logger.info("final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         except Exception:
             logger.exception("Manual /run failed and final Telegram error message could not be sent")
     finally:

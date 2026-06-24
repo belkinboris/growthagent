@@ -248,4 +248,4 @@ DIRECT_REPORT_RETRY_SLEEP_CAP_SECONDS = 3.0
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-emergencyfix-2026-06-24"
+BUILD_MARKER = "growth-agent-cachefallback-2026-06-24"

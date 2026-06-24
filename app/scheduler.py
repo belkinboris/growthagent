@@ -38,7 +38,7 @@ from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
 from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding, analyze_landing_funnel, finding_fingerprint
-from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, Project
+from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, MetricSnapshot, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
 from app.service import (
@@ -81,6 +81,47 @@ def _log_manual_source_failure(source_name: str, error: object) -> None:
         logger.warning("Manual /run source timeout: %s: %s", source_name, message)
     else:
         logger.warning("Manual /run source failed: %s: %s", source_name, message)
+
+
+def _get_cached_source_from_latest_snapshot(
+    project_id: int,
+    period_key: str,
+    source_name: str,
+) -> tuple[dict | None, datetime | None]:
+    """
+    Returns the latest cached sub-payload for one source from combined snapshots.
+
+    This is used only as a fallback when a live source fails or times out. It
+    lets /run produce a business report from the best available data instead
+    of returning only a timeout message.
+    """
+    with get_session() as session:
+        snapshots = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project_id,
+                MetricSnapshot.period_key == period_key,
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(20)
+        ).all()
+
+        for snapshot in snapshots:
+            data = (snapshot.metrics_json or {}).get(source_name)
+            if data is not None:
+                return data, snapshot.created_at
+
+    return None, None
+
+
+def _source_status(status: str, snapshot_created_at: datetime | None = None, error: str | None = None) -> dict:
+    payload = {"status": status}
+    if snapshot_created_at is not None:
+        payload["snapshot_created_at"] = snapshot_created_at.isoformat()
+    if error:
+        payload["error"] = error
+    return payload
 
 
 async def _run_with_timeout(awaitable, timeout_seconds: float, source_name: str):
@@ -251,29 +292,95 @@ async def _collect_window(project: Project, period_key: str, period_hours: int) 
         _fetch_yookassa_metrics(period_hours),
     )
 
+    source_statuses: dict[str, dict] = {}
+
     product_data, product_error, product_as_of = product_result
     if product_error:
         errors["product"] = product_error
+        cached, cached_at = _get_cached_source_from_latest_snapshot(project.id, period_key, "product")
+        if cached is not None:
+            product_data = cached
+            sources_ok.add("product")
+            source_statuses["product"] = _source_status("stale", cached_at, product_error)
+            logger.info(
+                "cached fallback used: product metrics from %s after live error: %s",
+                cached_at.isoformat() if cached_at else "unknown time",
+                product_error,
+            )
+        else:
+            source_statuses["product"] = _source_status("unavailable", error=product_error)
     elif product_data is not None:
         sources_ok.add("product")
+        source_statuses["product"] = _source_status("fresh", error=None)
+        logger.info("source fresh: product metrics (%s)", period_key)
+    else:
+        source_statuses["product"] = _source_status("unavailable")
 
     metrika_data, metrika_error = metrika_result
     if metrika_error:
         errors["metrika"] = metrika_error
+        cached, cached_at = _get_cached_source_from_latest_snapshot(project.id, period_key, "metrika")
+        if cached is not None:
+            metrika_data = cached
+            sources_ok.add("metrika")
+            source_statuses["metrika"] = _source_status("stale", cached_at, metrika_error)
+            logger.info(
+                "cached fallback used: Metrika metrics from %s after live error: %s",
+                cached_at.isoformat() if cached_at else "unknown time",
+                metrika_error,
+            )
+        else:
+            source_statuses["metrika"] = _source_status("unavailable", error=metrika_error)
     elif metrika_data is not None:
         sources_ok.add("metrika")
+        source_statuses["metrika"] = _source_status("fresh")
+        logger.info("source fresh: Metrika metrics (%s)", period_key)
+    else:
+        source_statuses["metrika"] = _source_status("unavailable")
 
     direct_data, direct_error = direct_result
     if direct_error:
         errors["direct"] = direct_error
+        cached, cached_at = _get_cached_source_from_latest_snapshot(project.id, period_key, "direct")
+        if cached is not None:
+            direct_data = cached
+            sources_ok.add("direct")
+            source_statuses["direct"] = _source_status("stale", cached_at, direct_error)
+            logger.info(
+                "cached fallback used: Direct summary from %s after live error: %s",
+                cached_at.isoformat() if cached_at else "unknown time",
+                direct_error,
+            )
+        else:
+            source_statuses["direct"] = _source_status("unavailable", error=direct_error)
     elif direct_data is not None:
         sources_ok.add("direct")
+        source_statuses["direct"] = _source_status("fresh")
+        logger.info("source fresh: Direct summary (%s)", period_key)
+    else:
+        source_statuses["direct"] = _source_status("unavailable")
 
     yookassa_data, yookassa_error = yookassa_result
     if yookassa_error:
         errors["yookassa"] = yookassa_error
+        cached, cached_at = _get_cached_source_from_latest_snapshot(project.id, period_key, "yookassa")
+        if cached is not None:
+            yookassa_data = cached
+            sources_ok.add("yookassa")
+            source_statuses["yookassa"] = _source_status("stale", cached_at, yookassa_error)
+            logger.info(
+                "cached fallback used: YooKassa metrics from %s after live error: %s",
+                cached_at.isoformat() if cached_at else "unknown time",
+                yookassa_error,
+            )
+        else:
+            source_statuses["yookassa"] = _source_status("unavailable", error=yookassa_error)
     elif yookassa_data is not None:
         sources_ok.add("yookassa")
+        source_statuses["yookassa"] = _source_status("fresh")
+        logger.info("source fresh: YooKassa metrics (%s)", period_key)
+    else:
+        source_statuses["yookassa"] = _source_status("unavailable")
 
     metrics = NormalizedMetrics(
         period_key=period_key,
@@ -307,6 +414,7 @@ async def _collect_window(project: Project, period_key: str, period_hours: int) 
         "yookassa": _jsonify(yookassa_data),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
+        "source_statuses": source_statuses,
     }
 
     return metrics, {"raw": raw_for_snapshot, "errors": errors, "product_as_of": product_as_of}
@@ -353,6 +461,10 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
 
         if project is None:
             raise ValueError("No active project found")
+
+        manual_context = _RUN_CONTEXT.get() == "manual_telegram_run"
+        if manual_context:
+            logger.info("/run live refresh started (project_id=%s, build context=manual_telegram_run)", project.id)
 
         metrics_by_window: dict[str, NormalizedMetrics] = {}
         all_sources_ok: set[str] = set()
@@ -457,7 +569,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if cached is not None:
                 result.deep_diagnostics = cached.result_json
                 result.deep_diagnostics["_from_cache"] = True
-            else:
+            elif not manual_context:
                 diag_result, diag_error = await run_deep_diagnostics_for_project(
                     project, settings, period_hours=ANALYSIS_WINDOWS_HOURS["7d"],
                 )
@@ -474,6 +586,8 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                         session, project.id, "7d", "alert_triggered", {}, ok=False, error=diag_error,
                     )
                     logger.warning("Deep diagnostics failed: %s", diag_error)
+            else:
+                logger.info("Manual /run skipped live deep Direct diagnostics; cached result not available")
 
         # Onboarding diagnostics: симметрично Direct, но триггер -- продуктовые
         # категории (signups_no_activation), не рекламные.
@@ -482,6 +596,8 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if cached_onboarding is not None:
                 result.onboarding_diagnostics = cached_onboarding.result_json
                 result.onboarding_diagnostics["_from_cache"] = True
+            elif manual_context:
+                logger.info("Manual /run skipped live onboarding diagnostics; cached result not available")
             else:
                 onboarding_outcome = await run_onboarding_diagnostics_for_project(project, settings)
                 if onboarding_outcome["status"] == "ok":
@@ -520,6 +636,8 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if cached_landing is not None:
                 result.landing_funnel_diagnostics = cached_landing.result_json
                 result.landing_funnel_diagnostics["_from_cache"] = True
+            elif manual_context:
+                logger.info("Manual /run skipped live landing diagnostics; cached result not available")
             else:
                 landing_period_hours = ANALYSIS_WINDOWS_HOURS["7d"]
                 landing_outcome = await run_landing_funnel_diagnostics_for_project(
