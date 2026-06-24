@@ -99,6 +99,7 @@ class DiagnosticFinding:
     detail: str
     recommended_action: Optional[str] = None
     payload: dict = field(default_factory=dict)
+    clean_period_note: Optional[str] = None  # см. run_diagnostics: предупреждение про смешение до/после cutoff
 
 
 @dataclass
@@ -118,6 +119,15 @@ class DiagnosticsResult:
     findings: list = field(default_factory=list)
     main_finding: Optional[DiagnosticFinding] = None
     good_findings: list = field(default_factory=list)  # отдельно good_query_cluster -- не проблемы, а возможности
+    # known_risks -- находки, подавленные anti-repetition logic (window-based,
+    # см. service.should_suppress_as_primary) -- НЕ показываются как главный
+    # вывод, но и не исчезают: архитектор явно требует отображать их в
+    # отдельном разделе "известные риски". Заполняется НЕ здесь -- эта
+    # функция (run_diagnostics) не читает БД и не знает про anti-repetition
+    # вообще (тот же принцип "diagnostics.py не пишет/не читает БД", что и
+    # для clean_period_cutoffs) -- поле заполняется снаружи, в scheduler.py,
+    # после того как run_diagnostics уже вернул результат.
+    known_risks: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Для сериализации в DeepDiagnosticsCache.result_json."""
@@ -130,6 +140,7 @@ class DiagnosticsResult:
             "findings": [vars(f) for f in self.findings],
             "main_finding": vars(self.main_finding) if self.main_finding else None,
             "good_findings": [vars(f) for f in self.good_findings],
+            "known_risks": [vars(f) for f in self.known_risks],
         }
 
 
@@ -302,7 +313,7 @@ def _rule_query_clusters(query_rows: list, query_clusters: dict) -> tuple[list, 
                 ),
                 recommended_action="Рассмотреть минус-фразы для этих запросов.",
                 payload={"cluster_key": cluster_key, "clicks": agg["clicks"], "cost": round(agg["cost"], 2),
-                         "top_queries": top_queries},
+                         "top_queries": top_queries, "ad_group_ids": sorted(agg["ad_group_ids"])},
             ))
         elif group == "good":
             good_findings.append(DiagnosticFinding(
@@ -316,10 +327,50 @@ def _rule_query_clusters(query_rows: list, query_clusters: dict) -> tuple[list, 
                 ),
                 recommended_action=None,
                 payload={"cluster_key": cluster_key, "clicks": agg["clicks"], "cost": round(agg["cost"], 2),
-                         "top_queries": top_queries},
+                         "top_queries": top_queries, "ad_group_ids": sorted(agg["ad_group_ids"])},
             ))
 
     return irrelevant_findings, good_findings, irrelevant_ad_group_ids
+
+
+def finding_fingerprint(finding: DiagnosticFinding) -> str:
+    """
+    Стабильный идентификатор СУТИ находки -- finding_type + ключевое
+    измерение (cluster_key для query cluster находок, ad_group_id для
+    остальных), БЕЗ конкретных цифр (clicks/cost). Используется
+    service.should_suppress_as_primary -- если этот fingerprint совпадает
+    с предыдущим прогоном, это "та же находка снова", не новая, даже если
+    числа немного изменились (5 кликов сегодня, 7 завтра -- суть та же).
+
+    Не включает payload целиком (там есть top_queries, которые могут
+    немного меняться от запроса к запросу даже для того же кластера) --
+    только стабильный ключ измерения.
+    """
+    dimension_key = (
+        finding.payload.get("cluster_key")
+        or finding.payload.get("ad_group_id")
+        or "unknown"
+    )
+    return f"{finding.finding_type}:{dimension_key}"
+
+
+def finding_key_metric_value(finding: DiagnosticFinding) -> Optional[float]:
+    """
+    Извлекает "главное число" находки для записи в AlertRepeatTracker.key_metric_value
+    -- используется service.should_suppress_as_primary для resurface-сравнения
+    ("метрика изменилась на 30%+ -- находка может вернуться"). Делегирует в
+    service._extract_key_metric с тем же payload, не дублирует логику выбора
+    поля -- единственное отличие: эта функция работает с DiagnosticFinding
+    напрямую (объект), там -- с уже сериализованным payload (dict), но поля
+    одинаковые (clicks/clicks_share/cost), поэтому просто передаём payload дальше.
+    """
+    for key in ("clicks", "clicks_share", "cost"):
+        if key in finding.payload and finding.payload[key] is not None:
+            try:
+                return float(finding.payload[key])
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _pick_main_finding(findings: list) -> Optional[DiagnosticFinding]:
@@ -351,6 +402,7 @@ def run_diagnostics(
     query_rows: list,
     attribution_status: AttributionStatus,
     query_clusters: Optional[dict] = None,
+    clean_period_cutoffs: Optional[dict] = None,
 ) -> DiagnosticsResult:
     """
     Главная точка входа. ad_group_rows и query_rows -- результат
@@ -360,8 +412,26 @@ def run_diagnostics(
     Если суммарных кликов меньше MIN_CLICKS_FOR_DEEP_DIAGNOSTICS --
     insufficient_data=True, findings будет пустым (агент честно говорит
     "данных мало", не выдумывает находки на шуме).
+
+    clean_period_cutoffs -- {ad_group_id: cutoff_at_iso_string}, опционально.
+    Этот модуль НЕ читает ProjectChangeEvent из БД сам (принцип "diagnostics.py
+    не пишет/не читает БД" -- см. docstring модуля) -- cutoff'ы для
+    релевантных ad_group_id передаются готовыми извне (scheduler.py читает
+    service.get_latest_cutoff() и собирает этот словарь перед вызовом).
+
+    Важное техническое ограничение: ad_group_rows здесь -- это сводные
+    данные ЗА ВЕСЬ ЗАПРОШЕННЫЙ ПЕРИОД (Director Reports API не отдаёт
+    per-row timestamp клика). Если у группы есть активный cutoff внутри
+    периода, эта функция НЕ может сама отрезать "грязную" часть -- это
+    должно быть сделано ДО вызова, через отдельный запрос к Director с
+    date_from_override=cutoff_at (см. scheduler.py). Если такой отдельный
+    запрос не был сделан и в clean_period_cutoffs всё равно передан cutoff
+    для этой группы, функция добавляет находке явное предупреждение
+    "не могу отделить статистику до/после" -- то есть честно говорит о
+    неопределённости, а не делает вид, что данные чистые.
     """
     query_clusters = query_clusters or DEFAULT_QUERY_CLUSTERS
+    clean_period_cutoffs = clean_period_cutoffs or {}
 
     total_clicks = sum(row["clicks"] for row in ad_group_rows)
     total_cost = sum(row["cost"] for row in ad_group_rows)
@@ -392,6 +462,27 @@ def run_diagnostics(
     findings.extend(budget_drain_findings)
     findings.extend(low_ctr_findings)
     findings.extend(irrelevant_findings)
+
+    # Помечаем находки, чьи ad_group_id (один или несколько -- query
+    # cluster находки могут затрагивать несколько групп) пересекаются с
+    # активным clean-period cutoff -- честное предупреждение про
+    # невозможность отделить статистику до/после, а не молчаливая выдача
+    # смешанных данных как окончательного вывода.
+    if clean_period_cutoffs:
+        for f in findings:
+            affected_ids = set()
+            single_id = f.payload.get("ad_group_id")
+            if single_id:
+                affected_ids.add(single_id)
+            affected_ids |= set(f.payload.get("ad_group_ids", []))
+
+            matching_cutoffs = {gid: clean_period_cutoffs[gid] for gid in affected_ids if gid in clean_period_cutoffs}
+            if matching_cutoffs:
+                cutoff_text = "; ".join(f"{v}" for v in matching_cutoffs.values())
+                f.clean_period_note = (
+                    f"Не могу отделить статистику до и после {cutoff_text}, "
+                    f"поэтому вывод по этой находке предварительный."
+                )
 
     main_finding = _pick_main_finding(findings)
 

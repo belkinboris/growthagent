@@ -343,6 +343,13 @@ def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None
     if main_finding:
         return f"Проверил группы объявлений и поисковые запросы: {main_finding['title'].lower()}. Детали — по кнопке ниже."
 
+    known_risks = deep_diagnostics.get("known_risks", [])
+    if known_risks:
+        return (
+            "Проверил группы объявлений и поисковые запросы: новых выводов нет, "
+            "известные риски недавно уже озвучены. Детали — по кнопке ниже."
+        )
+
     return "Проверил группы объявлений и поисковые запросы: явных проблем не нашёл."
 
 
@@ -427,16 +434,25 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
     Формат по задаче: главная находка, основные запросы, вероятная
     причина, что сделать, уровень уверенности.
 
-    attribution_status формулируется явно текстом, не цифрой -- агент
-    никогда не должен писать "клики дали регистрации" как причинно-
-    следственную связь, если атрибуция не подтверждена (almost всегда
-    not_available в v1, см. scheduler.run_deep_diagnostics_for_project).
+    confidence (main_finding["confidence"]) -- это уверенность в САМОМ
+    ФАКТЕ находки (например, "120 кликов дали 5 регистраций" -- это
+    наблюдение, посчитанное напрямую, high confidence не противоречит
+    тому, что атрибуция отдельно может быть not_available).
+    attribution_status -- это ДРУГОЕ измерение: уверенность в том, что
+    КОНКРЕТНО ЭТИ регистрации пришли именно ИЗ ЭТОГО рекламного трафика
+    (causal link), не из органики/тестов владельца/другого канала.
+
+    Раньше эти два понятия выводились рядом без разделения ("Атрибуция не
+    подтверждена. Уровень уверенности: high.") и читались как
+    противоречие. Теперь подписаны раздельно: что мы знаем точно (факт) и
+    что не можем утверждать (причинно-следственная связь с рекламой).
     """
     attribution_ru = {
-        "confirmed": "подтверждена",
-        "partial": "частичная",
-        "not_available": "не подтверждена",
+        "confirmed": "подтверждена — можно связывать регистрации с конкретным рекламным трафиком",
+        "partial": "частичная — есть косвенная связь, но не полная",
+        "not_available": "не подтверждена — нет сквозного трекинга, нельзя утверждать, что именно эти регистрации пришли из рекламы",
     }
+    confidence_ru = {"low": "низкая", "medium": "средняя", "high": "высокая"}
 
     lines = [
         "Growth Agent — рекламная диагностика",
@@ -454,12 +470,28 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
 
     main_finding = deep_diagnostics.get("main_finding")
     if main_finding is None:
-        lines.append("Проверил группы объявлений и поисковые запросы — явных проблем не нашёл.")
+        known_risks = deep_diagnostics.get("known_risks", [])
+        if known_risks:
+            # Не "явных проблем не нашёл" -- это другая ситуация: находки
+            # есть, но они уже были главным выводом достаточно раз за
+            # последнюю неделю без новых данных, поэтому не повторяются.
+            lines.append(
+                "Новых выводов по рекламе нет — известные риски недавно уже были "
+                "озвучены, ситуация не изменилась."
+            )
+            lines.append("\nИзвестные риски (повторялись недавно, не главный вывод сейчас):")
+            for risk in known_risks[:3]:
+                lines.append(f"— {risk['detail']}")
+        else:
+            lines.append("Проверил группы объявлений и поисковые запросы — явных проблем не нашёл.")
         attribution_status = deep_diagnostics.get("attribution_status", "not_available")
         lines.append(f"\nАтрибуция регистраций к Директу: {attribution_ru.get(attribution_status, attribution_status)}.")
         return "\n".join(lines)
 
     lines.append(f"Главная находка:\n{main_finding['detail']}")
+
+    if main_finding.get("clean_period_note"):
+        lines.append(f"\n{main_finding['clean_period_note']}")
 
     top_queries = main_finding.get("payload", {}).get("top_queries")
     if top_queries:
@@ -471,9 +503,19 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
 
     lines.append("\nЛендинг и рекламу одновременно менять не стоит — сначала найти проблемный сегмент.")
 
+    # Confidence факта (находки) и confidence атрибуции -- РАЗНЫЕ строки,
+    # явно подписанные, чтобы не читались как противоречие друг другу.
+    finding_confidence = confidence_ru.get(main_finding.get("confidence", "medium"), "средняя")
+    lines.append(f"\nУверенность в самой находке (фактах и цифрах): {finding_confidence}.")
+
     attribution_status = deep_diagnostics.get("attribution_status", "not_available")
-    lines.append(f"\nАтрибуция регистраций к Директу: {attribution_ru.get(attribution_status, attribution_status)}.")
-    lines.append(f"Уровень уверенности: {main_finding.get('confidence', 'medium')}.")
+    lines.append(f"Атрибуция к рекламе: {attribution_ru.get(attribution_status, attribution_status)}.")
+
+    known_risks = deep_diagnostics.get("known_risks", [])
+    if known_risks:
+        lines.append("\nИзвестные риски (повторялись недавно, не главный вывод сейчас):")
+        for risk in known_risks[:3]:
+            lines.append(f"— {risk['detail']}")
 
     good_findings = deep_diagnostics.get("good_findings", [])
     if good_findings:

@@ -320,3 +320,73 @@ class DeepDiagnosticsCache(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Аналитик Воронки 2.0: clean-period tracking, anti-repetition
+# ---------------------------------------------------------------------------
+
+
+class ProjectChangeEvent(SQLModel, table=True):
+    """
+    Точка изменения проекта (cutoff для clean-period анализа). Лёгкая
+    таблица, не файл PROJECT_STATE.md -- решение принято осознанно: чтение
+    большого markdown-файла на каждый /analyze дорого по токенам и не даёт
+    структурированной даты для фильтрации статистики "до/после". Таблица
+    с датой + описанием решает ровно ту задачу, которая нужна агенту
+    (отрезать данные по cutoff), без необходимости парсить произвольный
+    текст.
+
+    dimension_type/dimension_id -- опциональная привязка к конкретному
+    объекту (например, dimension_type="ad_group", dimension_id="12345" для
+    "Группа Генератор постов очищена 23.06.2026"). Если изменение глобальное
+    (например, "поменяли CTA на лендинге"), оба поля остаются None -- тогда
+    cutoff применяется ко всему проекту, не к конкретному сегменту.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+
+    title: str  # "Группа Генератор постов очищена под Telegram-семантику"
+    description: Optional[str] = None
+    cutoff_at: datetime  # момент, после которого считается "новый" период
+
+    dimension_type: Optional[str] = None  # "ad_group" | "campaign" | "landing" | "product" | None (глобально)
+    dimension_id: Optional[str] = None  # конкретный ad_group_id и т.п., если применимо
+
+    created_by: str = "manual"  # "manual" | "agent" -- кто добавил запись
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class AlertRepeatTracker(SQLModel, table=True):
+    """
+    Отдельная от Alert таблица для anti-repetition logic в /analyze и
+    /deep_direct.
+
+    Архитектурное решение (по запросу архитектора): НЕ простой счётчик
+    "сколько раз подряд", а ЖУРНАЛ отдельных показов -- одна строка на
+    каждый случай, когда находка была главным выводом. Это нужно, чтобы
+    честно считать "N раз ЗА ПОСЛЕДНИЕ 7 ДНЕЙ" (скользящее окно), а не
+    только "подряд без перерыва" -- предыдущая версия (один счётчик на
+    fingerprint) физически не могла отличить "была главной 2 раза за
+    последнюю неделю" от "была главной 2 раза год назад, потом давно не
+    появлялась". Журнал решает это: считаем COUNT(*) WHERE shown_at >=
+    now() - repeat_window_days.
+
+    key_metric_value -- значение ключевой метрики находки на момент
+    показа (например, clicks или register_success), сохраняется, чтобы
+    реализовать "resurface_if_metric_changed_by 30%" -- если метрика
+    существенно изменилась с последнего показа, находка имеет право
+    вернуться как главная, даже если лимит показов в окне исчерпан --
+    это не "тот же" вывод по сути, ситуация изменилась.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+
+    finding_fingerprint: str  # стабильный хэш сути находки (rule_id + dimension_id), не цифр
+    surface: str  # "deep_direct" | "landing_funnel" | "analyze" -- где показывался
+
+    shown_at: datetime = Field(default_factory=utcnow)
+    key_metric_value: Optional[float] = None  # значение ключевой метрики находки на момент показа
+    payload_json: dict = Field(default_factory=dict, sa_column=Column(JSON))

@@ -28,7 +28,7 @@ from app.connectors import onboarding as onboarding_connector
 from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
-from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding, analyze_landing_funnel
+from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding, analyze_landing_funnel, finding_fingerprint
 from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
@@ -38,7 +38,9 @@ from app.service import (
     ONBOARDING_CACHE_PERIOD_KEY,
     check_integration_freshness,
     get_cached_diagnostics,
+    get_latest_cutoff,
     process_cycle,
+    record_finding_shown,
     save_diagnostics_cache,
     save_snapshot,
     should_run_deep_diagnostics,
@@ -46,6 +48,7 @@ from app.service import (
     should_run_onboarding_diagnostics,
     should_show_deep_direct_button,
     should_show_landing_funnel_button,
+    should_suppress_as_primary,
     should_show_onboarding_button,
 )
 
@@ -490,6 +493,19 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
 
     query_clusters = get_query_clusters(project.settings_json)
 
+    # Clean-period: собираем активные cutoff'ы ТОЛЬКО для ad_group_id,
+    # реально присутствующих в этом отчёте -- не для всех событий проекта
+    # сразу, иначе пришлось бы делать отдельный Director-запрос на каждую
+    # зарегистрированную точку изменения, даже нерелевантную текущим данным.
+    clean_period_cutoffs: dict[str, str] = {}
+    present_ad_group_ids = {row.get("ad_group_id") for row in ad_group_report["rows"] if row.get("ad_group_id")}
+    if present_ad_group_ids:
+        with get_session() as cp_session:
+            for ad_group_id in present_ad_group_ids:
+                cutoff = get_latest_cutoff(cp_session, project.id, dimension_type="ad_group", dimension_id=ad_group_id)
+                if cutoff is not None:
+                    clean_period_cutoffs[ad_group_id] = cutoff.strftime("%d.%m.%Y %H:%M")
+
     # attribution_status: в v1 у нас нет сквозной UTM-атрибуции между
     # Direct и TruePost (TruePost отдаёт просто число регистраций за
     # период, не привязанное к источнику трафика) -- поэтому всегда
@@ -503,7 +519,64 @@ async def run_deep_diagnostics_for_project(project: Project, settings, period_ho
         query_rows=query_report["rows"],
         attribution_status=attribution_status,
         query_clusters=query_clusters,
+        clean_period_cutoffs=clean_period_cutoffs,
     )
+
+    # Anti-repetition (window-based, по решению архитектора): находка не
+    # должна быть главным выводом больше MAX_MAIN_REPEATS_IN_WINDOW раз за
+    # последние REPEAT_WINDOW_DAYS дней -- НЕ "подряд без перерыва" (старая
+    # версия логики), а именно по календарному окну, чтобы находка не
+    # могла "отдохнуть один день и вернуться" и тем самым обойти лимит.
+    # Снимается подавление, если её ключевая метрика изменилась существенно
+    # (RESURFACE_IF_METRIC_CHANGED_BY) -- это и есть "появились новые данные"
+    # из требования архитектора.
+    #
+    # Находки НЕ удаляются из findings -- они остаются доступны через
+    # known_risks (см. ниже) для отображения как "известные риски", не
+    # пропадают совсем, просто не становятся главным выводом повторно.
+    #
+    # Итеративный обход по приоритету сохранён из предыдущей версии (баг,
+    # уже найденный тестированием: один-единственный переключение на
+    # "вторую по приоритету" находку при подавлении первой -- недостаточно,
+    # если эта вторая тоже была главной слишком много раз).
+    known_risks: list = []
+
+    if diag_result.findings:
+        from app.diagnostics import _pick_main_finding, finding_key_metric_value
+
+        candidates_in_order = []
+        remaining_pool = list(diag_result.findings)
+        while remaining_pool:
+            top = _pick_main_finding(remaining_pool)
+            candidates_in_order.append(top)
+            remaining_pool = [f for f in remaining_pool if f is not top]
+
+        with get_session() as ar_session:
+            chosen = None
+            for candidate in candidates_in_order:
+                fp = finding_fingerprint(candidate)
+                suppressed = should_suppress_as_primary(
+                    ar_session, project.id, fp, "deep_direct", current_payload=candidate.payload,
+                )
+                if suppressed:
+                    known_risks.append(candidate)
+                    continue
+                chosen = candidate
+                record_finding_shown(
+                    ar_session, project.id, fp, "deep_direct", candidate.payload,
+                    key_metric_value=finding_key_metric_value(candidate),
+                )
+                break
+
+            # Если ВСЕ находки подавлены (редкий случай -- все варианты уже
+            # были главными максимальное число раз за окно без изменений),
+            # main_finding становится None. Это лучше, чем насильно
+            # показывать заведомо повторяющийся вывод -- агент в этом
+            # случае должен честно сказать "новых выводов нет", не
+            # выдумывать причину продолжать ту же рекомендацию.
+            diag_result.main_finding = chosen
+
+    diag_result.known_risks = known_risks
     return diag_result, None
 
 

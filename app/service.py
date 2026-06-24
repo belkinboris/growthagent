@@ -16,6 +16,7 @@ MetricSnapshot, Alert как универсальными моделями.
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Optional
 
 from sqlmodel import Session, select
 
@@ -24,6 +25,7 @@ from app.config import get_settings, DEEP_DIAGNOSTICS_CACHE_TTL_HOURS
 from app.models import (
     Alert,
     AlertCategory,
+    AlertRepeatTracker,
     AlertSeverity,
     AlertStatus,
     ConfidenceLevel,
@@ -33,6 +35,7 @@ from app.models import (
     IntegrationType,
     MetricSnapshot,
     Project,
+    ProjectChangeEvent,
 )
 
 
@@ -621,3 +624,265 @@ def save_diagnostics_cache(
     session.commit()
     session.refresh(cache_entry)
     return cache_entry
+
+
+# ---------------------------------------------------------------------------
+# Clean-period tracking (Аналитик Воронки 2.0)
+# ---------------------------------------------------------------------------
+
+
+def add_change_event(
+    session: Session,
+    project_id: int,
+    title: str,
+    cutoff_at: datetime,
+    description: str | None = None,
+    dimension_type: str | None = None,
+    dimension_id: str | None = None,
+    created_by: str = "manual",
+) -> ProjectChangeEvent:
+    """
+    Регистрирует точку изменения проекта для clean-period анализа. Вызывается
+    либо вручную (через будущую команду/скрипт), либо агентом, когда он сам
+    обнаруживает значимое изменение (например, видит, что у ad_group
+    качественно изменился набор запросов после определённой даты -- такое
+    можно детектировать, но это эвристика, не точный сигнал, поэтому
+    created_by="agent" в этом случае).
+    """
+    event = ProjectChangeEvent(
+        project_id=project_id,
+        title=title,
+        description=description,
+        cutoff_at=cutoff_at,
+        dimension_type=dimension_type,
+        dimension_id=dimension_id,
+        created_by=created_by,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    return event
+
+
+def get_active_change_events(
+    session: Session,
+    project_id: int,
+    dimension_type: str | None = None,
+    dimension_id: str | None = None,
+) -> list[ProjectChangeEvent]:
+    """
+    Возвращает события изменений, релевантные для данного измерения (или
+    все глобальные события, если dimension_type/dimension_id не переданы).
+    Используется diagnostics.py, чтобы решить, нужно ли отрезать "грязный"
+    период перед анализом конкретной группы/кампании/проекта целиком.
+    """
+    query = select(ProjectChangeEvent).where(ProjectChangeEvent.project_id == project_id)
+
+    if dimension_type is not None and dimension_id is not None:
+        # Релевантны события именно для этого измерения ИЛИ глобальные
+        # (dimension_type IS NULL) -- глобальное изменение (например, смена
+        # CTA на лендинге) влияет на все срезы, не только на один.
+        query = query.where(
+            (
+                (ProjectChangeEvent.dimension_type == dimension_type)
+                & (ProjectChangeEvent.dimension_id == dimension_id)
+            )
+            | (ProjectChangeEvent.dimension_type.is_(None))
+        )
+
+    return list(session.exec(query.order_by(ProjectChangeEvent.cutoff_at.desc())).all())
+
+
+def get_latest_cutoff(
+    session: Session,
+    project_id: int,
+    dimension_type: str | None = None,
+    dimension_id: str | None = None,
+) -> Optional[datetime]:
+    """
+    Возвращает самый свежий cutoff_at, релевантный для измерения, или None,
+    если изменений не зарегистрировано. Это и есть "где начинается
+    clean-period" -- всё, что раньше этой даты, должно анализироваться
+    отдельно или не смешиваться с данными после.
+    """
+    events = get_active_change_events(session, project_id, dimension_type, dimension_id)
+    if not events:
+        return None
+
+    # SQLite не хранит timezone -- при чтении обратно datetime приходит
+    # naive, даже если при записи был aware (см. ту же проблему в
+    # service.get_cached_diagnostics). Приводим к aware UTC перед max(),
+    # иначе сравнение нескольких cutoff_at между собой может упасть с
+    # TypeError, если хотя бы один из них naive.
+    def _as_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    return max(_as_aware(e.cutoff_at) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Anti-repetition logic (Аналитик Воронки 2.0)
+# ---------------------------------------------------------------------------
+#
+# Архитектурное решение: НЕ "подряд без перерыва", а скользящее окно по
+# календарным дням. Находка не должна быть главным выводом более
+# max_main_repeats_in_window раз за последние repeat_window_days дней --
+# даже если между показами был перерыв (находка "отдохнула" один день и
+# вернулась). Старая версия логики ("подряд") давала мерцание -- находка
+# гасла на один день и тут же возвращалась, что не решало исходную
+# проблему ("одна и та же находка третий день подряд"). Window-based
+# версия решает её строже: учитывает все показы за последнюю неделю,
+# не только непосредственно предыдущий запуск.
+
+REPEAT_WINDOW_DAYS = 7
+MAX_MAIN_REPEATS_IN_WINDOW = 2
+RESURFACE_IF_METRIC_CHANGED_BY = 0.30  # 30% -- доля изменения ключевой метрики
+
+
+def record_finding_shown(
+    session: Session,
+    project_id: int,
+    finding_fingerprint: str,
+    surface: str,
+    payload: dict,
+    key_metric_value: float | None = None,
+) -> AlertRepeatTracker:
+    """
+    Добавляет ОТДЕЛЬНУЮ запись о показе находки как главного вывода --
+    не обновляет существующую строку, не инкрементирует счётчик. Каждый
+    вызов = новая строка в журнале с собственным shown_at. Это и даёт
+    возможность считать "сколько раз ЗА ОКНО", а не только "общее число
+    раз когда-либо" -- старые показы естественным образом перестают
+    учитываться, когда выходят за repeat_window_days, без отдельной
+    операции "сброса".
+
+    key_metric_value -- значение ключевой метрики этой находки на момент
+    показа (например clicks для irrelevant_query_cluster, или
+    clicks_share для ad_group_budget_drain) -- используется
+    should_suppress_as_primary для resurface-логики.
+    """
+    tracker = AlertRepeatTracker(
+        project_id=project_id,
+        finding_fingerprint=finding_fingerprint,
+        surface=surface,
+        key_metric_value=key_metric_value,
+        payload_json=payload,
+    )
+    session.add(tracker)
+    session.commit()
+    session.refresh(tracker)
+    return tracker
+
+
+def _extract_key_metric(payload: dict) -> Optional[float]:
+    """
+    Извлекает "главное число" находки из payload для resurface-сравнения.
+    Порядок полей отражает то, что обычно является самой значимой цифрой
+    для каждого типа находки (clicks -- для query cluster и budget drain,
+    clicks_share -- запасной вариант). Если ни одного поля нет -- None,
+    тогда resurface по изменению метрики просто не сработает (откатится
+    на обычную window-логику), не будет ошибки сравнения с None.
+    """
+    for key in ("clicks", "clicks_share", "cost"):
+        if key in payload and payload[key] is not None:
+            try:
+                return float(payload[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def should_suppress_as_primary(
+    session: Session,
+    project_id: int,
+    finding_fingerprint: str,
+    surface: str,
+    current_payload: dict | None = None,
+    repeat_window_days: int = REPEAT_WINDOW_DAYS,
+    max_main_repeats_in_window: int = MAX_MAIN_REPEATS_IN_WINDOW,
+    resurface_if_metric_changed_by: float = RESURFACE_IF_METRIC_CHANGED_BY,
+) -> bool:
+    """
+    True, если находка уже была главным выводом max_main_repeats_in_window
+    раз за последние repeat_window_days дней -- и при этом её ключевая
+    метрика НЕ изменилась существенно с последнего показа.
+
+    Три условия снятия подавления (любое освобождает находку, по
+    решению архитектора):
+    1. Появились новые данные -- здесь это означает: метрика изменилась
+       на resurface_if_metric_changed_by и более относительно последнего
+       показа (current_payload передаёт актуальные цифры).
+    2. Метрика не изменилась существенно -- НЕ освобождает (это и есть
+       основной случай подавления, "ничего не поменялось").
+    3. Пользователь явно запросил эту тему -- это НЕ обрабатывается
+       здесь: явный запрос (например /deep_direct с force=true от кнопки)
+       должен идти через ПОЛНОСТЬЮ отдельный путь, не вызывающий
+       should_suppress_as_primary вообще -- подавление применимо только
+       к автоматическому выбору главного вывода, не к прямому запросу
+       пользователя посмотреть конкретную находку.
+
+    Не вызывает record_finding_shown сама -- разделение ответственности:
+    эта функция только читает и решает, вызывающий код сам пишет историю.
+    """
+    cutoff = utcnow() - timedelta(days=repeat_window_days)
+
+    recent_shows = session.exec(
+        select(AlertRepeatTracker).where(
+            AlertRepeatTracker.project_id == project_id,
+            AlertRepeatTracker.finding_fingerprint == finding_fingerprint,
+            AlertRepeatTracker.surface == surface,
+        ).order_by(AlertRepeatTracker.shown_at.desc())
+    ).all()
+
+    # SQLite naive/aware datetime -- та же защита, что в get_cached_diagnostics
+    # и get_latest_cutoff выше. shown_at может прийти naive при чтении из
+    # SQLite, даже если был записан как aware -- приводим перед сравнением.
+    def _as_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    recent_shows_in_window = [s for s in recent_shows if _as_aware(s.shown_at) >= cutoff]
+
+    if len(recent_shows_in_window) < max_main_repeats_in_window:
+        return False  # лимит окна не достигнут -- показывать можно
+
+    # Лимит достигнут -- проверяем, не изменилась ли метрика существенно
+    # с последнего показа. Если current_payload не передан, resurface не
+    # проверяется -- подавление действует безусловно (это нормально для
+    # вызовов, где метрика не релевантна, например onboarding-находки).
+    if current_payload is not None and recent_shows_in_window:
+        last_show = recent_shows_in_window[0]  # самый свежий, т.к. order_by desc
+        last_value = last_show.key_metric_value
+        current_value = _extract_key_metric(current_payload)
+
+        if last_value is not None and current_value is not None and last_value != 0:
+            relative_change = abs(current_value - last_value) / abs(last_value)
+            if relative_change >= resurface_if_metric_changed_by:
+                return False  # метрика существенно изменилась -- находка может вернуться
+
+    return True
+
+
+def get_recent_finding_history(
+    session: Session,
+    project_id: int,
+    surface: str,
+    repeat_window_days: int = REPEAT_WINDOW_DAYS,
+) -> list[AlertRepeatTracker]:
+    """
+    Возвращает все показы за окно для surface -- используется, чтобы
+    собрать раздел "известные риски" (находки, подавленные как main, но
+    не пропавшие совсем -- архитектор явно требует не скрывать их
+    полностью, только убрать из главного вывода).
+    """
+    cutoff = utcnow() - timedelta(days=repeat_window_days)
+
+    def _as_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    all_shows = session.exec(
+        select(AlertRepeatTracker).where(
+            AlertRepeatTracker.project_id == project_id,
+            AlertRepeatTracker.surface == surface,
+        )
+    ).all()
+    return [s for s in all_shows if _as_aware(s.shown_at) >= cutoff]
