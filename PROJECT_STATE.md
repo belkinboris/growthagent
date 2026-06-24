@@ -21,6 +21,20 @@
 
 ### Сделано
 
+- **Status command fix 2026-06-25 (`growth-agent-statusfix-2026-06-25`)** —
+  исправлена production-проблема, при которой `/status` не отвечал после
+  cached-fallback фикса. Root cause: handler `/status` ссылался на
+  `IntegrationType.telegram`, но `IntegrationType` не был импортирован в
+  `telegram_bot.py`, поэтому команда падала с `NameError` до отправки
+  сообщения. Дополнительно `/status` упрощён до дешёвой runtime-команды:
+  не вызывает Direct, Метрику, YooKassa, TruePost, deep diagnostics или
+  `run_cycle_once`; показывает только project/build/mode, состояние
+  manual `/run`, последний сохранённый snapshot и число открытых сигналов.
+  DB-чтение обёрнуто в короткий timeout с fallback-ответом, чтобы команда
+  оставалась живой даже при медленной локальной БД. Добавлены логи:
+  `Status command received`, `Status response prepared`,
+  `Status response sent`, `Status failed with traceback`.
+
 - **Cached fallback fix 2026-06-24 (`growth-agent-cachefallback-2026-06-24`)** —
   `/run` изменён с модели «live refresh или timeout» на модель «лучший
   доступный бизнес-отчёт сейчас». Если живой сбор данных или отдельный
