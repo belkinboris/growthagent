@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Аналитик Воронки — режим наблюдения</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+    h1 { font-size: 20px; }
+    .muted { color: #888; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Аналитик Воронки — режим наблюдения</h1>
+  <p class="muted">Веб-интерфейс в разработке. Пока доступны API-эндпоинты:</p>
+  <ul>
+    <li><code>GET /health</code></li>
+    <li><code>GET /status</code></li>
+    <li><code>POST /api/run</code></li>
+    <li><code>GET /api/alerts</code></li>
+    <li><code>GET /api/snapshots</code></li>
+  </ul>
+  <p class="muted">Основной интерфейс взаимодействия — Telegram-бот.</p>
+</body>
+</html>
