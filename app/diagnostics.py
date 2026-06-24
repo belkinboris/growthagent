@@ -131,6 +131,15 @@ class DiagnosticsResult:
 
     def to_dict(self) -> dict:
         """Для сериализации в DeepDiagnosticsCache.result_json."""
+        selection_explanation = None
+        if self.main_finding is not None:
+            # Вычисляется здесь, не в run_diagnostics() -- main_finding может
+            # быть изменён ПОСЛЕ run_diagnostics() (см. scheduler.py:
+            # anti-repetition logic может заменить исходный выбор на
+            # следующего по приоритету кандидата). Объяснение должно
+            # соответствовать ФИНАЛЬНОМУ выбору, не первоначальному.
+            selection_explanation = explain_selection(self.main_finding, self.findings)
+
         return {
             "period_key": self.period_key,
             "attribution_status": self.attribution_status.value,
@@ -141,6 +150,7 @@ class DiagnosticsResult:
             "main_finding": vars(self.main_finding) if self.main_finding else None,
             "good_findings": [vars(f) for f in self.good_findings],
             "known_risks": [vars(f) for f in self.known_risks],
+            "selection_explanation": selection_explanation,
         }
 
 
@@ -389,6 +399,46 @@ def _pick_main_finding(findings: list) -> Optional[DiagnosticFinding]:
     confidence_rank = {"high": 0, "medium": 1, "low": 2}
 
     return sorted(findings, key=lambda f: (severity_rank.get(f.severity, 99), confidence_rank.get(f.confidence, 99)))[0]
+
+
+def explain_selection(chosen: DiagnosticFinding, all_findings: list) -> str:
+    """
+    Формулирует, почему именно эта находка стала главным выводом среди
+    остальных (доводка по фидбэку архитектора: "не хватает прозрачности
+    выбора"). Не дублирует _pick_main_finding -- читает уже принятое
+    решение и описывает его постфактум человеческим текстом, основываясь
+    на том, чем chosen отличается от остальных findings.
+
+    Если all_findings содержит только chosen (единственная находка) --
+    говорит об этом явно, не придумывает сравнение с пустым множеством.
+    """
+    others = [f for f in all_findings if f is not chosen]
+
+    if not others:
+        return "Это единственный сигнал, который удалось найти за период."
+
+    same_severity_others = [f for f in others if f.severity == chosen.severity]
+
+    if chosen.severity == "P1" and not any(f.severity == "P1" for f in others):
+        return f"Выбрано как главный сигнал: это единственная находка уровня P1 среди {len(all_findings)}."
+
+    if not same_severity_others:
+        return (
+            f"Выбрано как главный сигнал: самый высокий уровень важности (P1) "
+            f"среди {len(all_findings)} найденных сигналов."
+        )
+
+    if chosen.confidence == "high" and not any(f.confidence == "high" for f in same_severity_others):
+        others_word = "другой находки" if len(same_severity_others) == 1 else f"{len(same_severity_others)} других находок"
+        return (
+            f"Выбрано как главный сигнал: тот же уровень важности ({chosen.severity}), что и "
+            f"у {others_word}, но с наибольшей уверенностью в данных."
+        )
+
+    return (
+        f"Выбрано как главный сигнал среди {len(all_findings)} найденных -- "
+        f"наивысший уровень важности ({chosen.severity}) с уверенностью {chosen.confidence}."
+    )
 
 
 # ---------------------------------------------------------------------------

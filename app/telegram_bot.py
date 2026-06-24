@@ -341,7 +341,15 @@ def _format_deep_diagnostics_teaser(deep_diagnostics: dict | None) -> str | None
 
     main_finding = deep_diagnostics.get("main_finding")
     if main_finding:
-        return f"Проверил группы объявлений и поисковые запросы: {main_finding['title'].lower()}. Детали — по кнопке ниже."
+        text = f"Проверил группы объявлений и поисковые запросы: {main_finding['title'].lower()}."
+        # Видимость clean-period в КОРОТКОМ сообщении, не только в деталях
+        # (доводка по фидбэку архитектора, проблема 4: "пользователь не
+        # чувствует, что агент учитывает этот факт"). Не дублируем полный
+        # текст clean_period_note здесь -- короткая пометка, полный текст
+        # всё равно идёт в деталях по кнопке.
+        if main_finding.get("clean_period_note"):
+            text += " Учтён период очистки группы — вывод предварительный."
+        return text + " Детали — по кнопке ниже."
 
     known_risks = deep_diagnostics.get("known_risks", [])
     if known_risks:
@@ -489,6 +497,10 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
         return "\n".join(lines)
 
     lines.append(f"Главная находка:\n{main_finding['detail']}")
+
+    selection_explanation = deep_diagnostics.get("selection_explanation")
+    if selection_explanation:
+        lines.append(f"\n{selection_explanation}")
 
     if main_finding.get("clean_period_note"):
         lines.append(f"\n{main_finding['clean_period_note']}")
@@ -1259,36 +1271,78 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Доводка по фидбэку архитектора (проблема "/alerts слишком шумный"):
+    открытые/эскалированные алерты показываются первыми и полностью,
+    resolved сворачиваются в одну итоговую строку с числом, не разворачиваются
+    построчно -- они уже не требуют внимания, занимать ими экран не нужно.
+    """
     with get_session() as session:
         project = _get_active_project(session)
         if project is None:
             await update.message.reply_text("Активный проект не найден.")
             return
 
+        # Берём чуть больше 10, чтобы после разделения на активные/resolved
+        # активных точно не оказалось меньше, чем стоило бы показать --
+        # запас на случай, если среди последних 10 окажется много resolved.
         alerts = session.exec(
             select(Alert)
             .where(Alert.project_id == project.id)
             .order_by(Alert.last_seen_at.desc())
-            .limit(10)
+            .limit(30)
         ).all()
 
         if not alerts:
             await update.message.reply_text("Алертов пока нет.")
             return
 
+        active_statuses = {AlertStatus.open, AlertStatus.sent, AlertStatus.escalated}
+        waiting_statuses = {AlertStatus.acknowledged, AlertStatus.snoozed}
+
+        active = [a for a in alerts if a.status in active_statuses]
+        waiting = [a for a in alerts if a.status in waiting_statuses]
+        resolved = [a for a in alerts if a.status == AlertStatus.resolved]
+
         status_emoji = {
             AlertStatus.open: "🔵", AlertStatus.sent: "🔵", AlertStatus.acknowledged: "✅",
-            AlertStatus.resolved: "⚪️", AlertStatus.escalated: "🔴", AlertStatus.snoozed: "⏸",
+            AlertStatus.escalated: "🔴", AlertStatus.snoozed: "⏸",
         }
+
         lines = []
-        for a in alerts:
-            emoji = status_emoji.get(a.status, "⚪️")
-            lines.append(f"{emoji} [{a.severity.value}] {a.title} ({a.status.value}, x{a.occurrence_count})")
+
+        if active:
+            lines.append("Требуют внимания:")
+            for a in active[:10]:
+                emoji = status_emoji.get(a.status, "🔵")
+                lines.append(f"{emoji} [{a.severity.value}] {a.title} (x{a.occurrence_count})")
+        else:
+            lines.append("Открытых сигналов сейчас нет.")
+
+        if waiting:
+            lines.append("")
+            lines.append("В работе:")
+            for a in waiting[:5]:
+                emoji = status_emoji.get(a.status, "✅")
+                lines.append(f"{emoji} {a.title}")
+
+        if resolved:
+            lines.append("")
+            lines.append(f"Решено за последнее время: {len(resolved)}.")
 
         await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Доводка по фидбэку архитектора (Аналитик Воронки 2.0, дешёвые видимые
+    улучшения): убраны технические названия ("Активация 1/2"), вместо
+    них -- vocabulary.py с явной пометкой пользователи/события. Добавлена
+    динамика день-к-дню относительно предыдущего сохранённого снэпшота.
+    """
+    from app.vocabulary import format_metric_line, get_metric_explain
+    from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
+
     try:
         result = await run_cycle_once()
     except Exception as exc:
@@ -1300,14 +1354,55 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Данных по воронке нет.")
         return
 
-    lines = ["Воронка (7 дней):"]
+    lines = ["Воронка за 7 дней:", ""]
+
     if metrics_7d.clicks is not None:
-        lines.append(f"Клики: {metrics_7d.clicks}")
-    lines.append(f"Регистрации: {metrics_7d.signup if metrics_7d.signup is not None else '—'}")
-    lines.append(f"Активация 1: {metrics_7d.activation_1 if metrics_7d.activation_1 is not None else '—'}")
-    lines.append(f"Активация 2: {metrics_7d.activation_2 if metrics_7d.activation_2 is not None else '—'}")
-    lines.append(f"Оплаты начаты: {metrics_7d.payment_started if metrics_7d.payment_started is not None else '—'}")
-    lines.append(f"Оплаты успешны: {metrics_7d.payment_success if metrics_7d.payment_success is not None else '—'}")
+        lines.append(f"{metrics_7d.clicks} событий — клики из рекламы (по данным Яндекс.Директа)")
+
+    lines.append(format_metric_line("signup", metrics_7d.signup))
+    lines.append(format_metric_line("activation_1", metrics_7d.activation_1))
+    lines.append(format_metric_line("activation_2", metrics_7d.activation_2))
+    lines.append(format_metric_line("payment_started", metrics_7d.payment_started))
+    lines.append(format_metric_line("payment_success", metrics_7d.payment_success))
+
+    # Поясняющая сноска про activation_2 -- именно та метрика, которая
+    # визуально может "не сходиться" с остальными (события, не пользователи).
+    explain = get_metric_explain("activation_2")
+    if explain and metrics_7d.activation_2 is not None:
+        lines.append("")
+        lines.append(f"Примечание: {explain}")
+
+    # Динамика день-к-дню -- сравнение с предыдущим сохранённым снэпшотом
+    # того же окна. Если истории нет -- честно говорим об этом, не
+    # подставляем нули как "изменений нет" (это разные по смыслу вещи).
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project:
+            prev_snapshot = get_previous_snapshot(session, project.id, "7d")
+            lines.append("")
+            if prev_snapshot is None:
+                lines.append("Динамика: нет данных для сравнения с предыдущим замером.")
+            else:
+                prev = extract_normalized_metrics_from_snapshot(prev_snapshot)
+                deltas = []
+                pairs = [
+                    ("signup", "регистрации", metrics_7d.signup),
+                    ("activation_1", "создали канал", metrics_7d.activation_1),
+                    ("activation_2", "генерации постов", metrics_7d.activation_2),
+                    ("payment_success", "оплатили", metrics_7d.payment_success),
+                ]
+                for key, label, current_value in pairs:
+                    prev_value = prev.get(key)
+                    if current_value is None or prev_value is None:
+                        continue
+                    diff = current_value - prev_value
+                    if diff != 0:
+                        sign = "+" if diff > 0 else ""
+                        deltas.append(f"{label} {sign}{diff}")
+                if deltas:
+                    lines.append(f"С прошлого замера: {', '.join(deltas)}.")
+                else:
+                    lines.append("С прошлого замера: без изменений по основным метрикам.")
 
     await update.message.reply_text("\n".join(lines))
 

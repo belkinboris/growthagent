@@ -886,3 +886,71 @@ def get_recent_finding_history(
         )
     ).all()
     return [s for s in all_shows if _as_aware(s.shown_at) >= cutoff]
+
+
+# ---------------------------------------------------------------------------
+# Динамика день-к-дню (Аналитик Воронки 2.0 — доводка по фидбэку архитектора)
+# ---------------------------------------------------------------------------
+
+
+def get_previous_snapshot(
+    session: Session,
+    project_id: int,
+    period_key: str,
+    min_age_hours: float = 1.0,
+) -> Optional[MetricSnapshot]:
+    """
+    Возвращает предыдущий снэпшот того же period_key, СТАРШЕ min_age_hours
+    от текущего момента -- нужно, чтобы при ручном повторном /run в течение
+    одного часа агент не сравнивал текущие данные с собственным снэпшотом
+    "только что", выдавая "+0 ко всему" как мнимую динамику. min_age_hours=1
+    по умолчанию -- разумный компромисс: даже при ручном тестировании раз в
+    несколько минут не считается "новым днём", но и не требует ждать сутки.
+
+    Возвращает None, если истории нет -- вызывающий код должен честно
+    написать "нет данных для сравнения", не подставлять 0 как "изменений нет"
+    (это разные по смыслу вещи: "не выросло" vs "не с чем сравнить").
+    """
+    cutoff = utcnow() - timedelta(hours=min_age_hours)
+
+    def _as_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    candidates = session.exec(
+        select(MetricSnapshot)
+        .where(
+            MetricSnapshot.project_id == project_id,
+            MetricSnapshot.period_key == period_key,
+        )
+        .order_by(MetricSnapshot.created_at.desc())
+        .limit(20)  # запас, чтобы найти достаточно старую запись без полного скана таблицы
+    ).all()
+
+    for snap in candidates:
+        if _as_aware(snap.created_at) <= cutoff:
+            return snap
+
+    return None
+
+
+def extract_normalized_metrics_from_snapshot(snapshot: MetricSnapshot) -> dict:
+    """
+    Достаёт нормализованные ключи воронки (signup/activation_1/...) из
+    metrics_json снэпшота. Снэпшот хранит "raw" структуру вида
+    {"product": {...}, "direct": {...}, ...} (см. scheduler._collect_window:
+    raw_for_snapshot) -- но "product" уже нормализован коннектором
+    TruePost ДО сохранения, поэтому здесь просто извлекаем нужный под-словарь,
+    не делаем повторную нормализацию.
+
+    Возвращает {} если ключа "product" нет вовсе (например, снэпшот только
+    с данными Director без продуктовых метрик) -- не бросает исключение,
+    вызывающий код получит пустой dict и честно скажет "нет данных".
+    """
+    product = snapshot.metrics_json.get("product") or {}
+    return {
+        "signup": product.get("signup"),
+        "activation_1": product.get("activation_1"),
+        "activation_2": product.get("activation_2"),
+        "payment_started": product.get("payment_started"),
+        "payment_success": product.get("payment_success"),
+    }
