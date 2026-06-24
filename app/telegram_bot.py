@@ -33,7 +33,14 @@ from app.db import get_session
 from app.models import Alert, AlertStatus, MetricSnapshot, Project
 from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
 from app.scheduler import run_cycle_once_sync_with_timeout
-from app.service import AlertChange, AlertChangeType, CycleResult, extract_normalized_metrics_from_snapshot
+from app.service import (
+    AlertChange,
+    AlertChangeType,
+    CycleResult,
+    extract_normalized_metrics_from_snapshot,
+    get_cached_diagnostics,
+)
+from app.owner_report import build_owner_report, format_snapshot_age
 
 logger = logging.getLogger("growth_agent.telegram")
 
@@ -380,9 +387,16 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     if milestone_block:
         blocks.append(milestone_block)
 
-    business_stage = _current_business_stage(metrics_7d)
-    if business_stage is not None:
-        blocks.append(_format_business_stage_block(business_stage, project_name))
+    owner_report = build_owner_report(
+        project_name,
+        metrics_7d,
+        source_statuses=(result.source_statuses_by_window or {}).get("7d", {}),
+        previous_metrics=(result.previous_metrics_by_window or {}).get("7d"),
+        deep_diagnostics=result.deep_diagnostics,
+        period_label="7д",
+    )
+    if owner_report is not None:
+        blocks.append(owner_report)
 
         landing_summary = _format_landing_funnel_teaser(result.landing_funnel_diagnostics)
         if landing_summary:
@@ -1372,7 +1386,10 @@ def _build_status_text_sync() -> str:
         ).all()
 
         if snapshot is not None:
-            snapshot_line = f"Последний сохранённый замер: {_format_dt(snapshot.created_at)} ({snapshot.period_key})."
+            snapshot_line = (
+                f"Последний сохранённый замер: {_format_dt(snapshot.created_at)}, "
+                f"{format_snapshot_age(snapshot.created_at, now)}. Период отчёта: {snapshot.period_key}."
+            )
         else:
             snapshot_line = "Последний сохранённый замер: пока не найден."
 
@@ -1523,13 +1540,16 @@ def _format_source_freshness(snapshot: MetricSnapshot, *, fallback_mode: bool) -
     return "\n".join(lines)
 
 
-def _format_cached_business_report(project_name: str, snapshot: MetricSnapshot, *, reason: str) -> str:
+def _format_cached_business_report(
+    project_name: str,
+    snapshot: MetricSnapshot,
+    *,
+    reason: str,
+    deep_diagnostics: dict | None = None,
+) -> str:
     metrics = _normalized_metrics_from_snapshot(snapshot)
-    signups = int(metrics.signup or 0)
-    activation_1 = int(metrics.activation_1 or 0)
-    activation_2 = int(metrics.activation_2 or 0)
-    payment_started = int(metrics.payment_started or 0)
-    payment_success = int(metrics.payment_success or 0)
+    raw = snapshot.metrics_json or {}
+    source_statuses = raw.get("source_statuses") or {}
 
     if reason == "timeout":
         preface = (
@@ -1542,38 +1562,25 @@ def _format_cached_business_report(project_name: str, snapshot: MetricSnapshot, 
             f"отчёт по последнему сохранённому замеру от {_format_dt(snapshot.created_at)}."
         )
 
-    if payment_success == 0 and signups > 0 and (activation_1 > 0 or activation_2 > 0):
-        main = (
-            f"Регистрации и активации идут: {signups} регистраций, "
-            f"{activation_1} созданных каналов, {activation_2} генераций постов. "
-            "Успешных оплат пока нет. Рекламу, лендинг, ставки, бюджет, цены и тарифы резко не трогать. "
-            "Следующий фокус — качество регистраций, активация и путь до оплаты."
-        )
-        check = (
-            "Почему после регистрации пользователи не доходят до оплаты; отдельно проверить платёжный путь. "
-            f"{payment_started} начатая оплата пока не является достаточным сигналом проблемы."
-            if payment_started == 1
-            else "Почему после регистрации пользователи не доходят до оплаты; отдельно проверить платёжный путь, тарифный экран и момент перехода к покупке."
-        )
-        dont = "Не чистить рекламу по единичным запросам, не менять цены, не делать редизайн лендинга."
-    else:
-        main = (
-            f"Последний замер: {signups} регистраций, {activation_1} созданных каналов, "
-            f"{activation_2} генераций постов, {payment_started} начатых оплат, "
-            f"{payment_success} успешных оплат."
-        )
-        check = "Проверить следующий самый узкий шаг по данным воронки, не делая резких изменений без свежего замера."
-        dont = "Не менять одновременно рекламу, лендинг, цены и продуктовую воронку."
+    report = build_owner_report(
+        project_name,
+        metrics,
+        source_statuses=source_statuses,
+        previous_metrics=None,
+        deep_diagnostics=deep_diagnostics,
+        period_label="7д",
+        preface=preface,
+    )
+    if report is not None:
+        return report
 
     return "\n\n".join([
         preface,
         "Аналитик Воронки — проверка бизнеса",
         f"Проект: {project_name}",
-        "Главный вывод:\n" + main,
-        "Что проверить:\n" + check,
-        "Что не делать:\n" + dont,
-        _format_source_freshness(snapshot, fallback_mode=True),
+        "Последний сохранённый замер есть, но в нём недостаточно продуктовых метрик для предпринимательского вывода.",
         f"Метрики (7д):\n{_format_metrics_line(metrics)}",
+        _format_source_freshness(snapshot, fallback_mode=True),
     ])
 
 
@@ -1585,7 +1592,11 @@ def _build_cached_cycle_response(reason: str) -> str | None:
         snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
         if snapshot is None or not _snapshot_has_product_metrics(snapshot):
             return None
-        return _format_cached_business_report(project.name, snapshot, reason=reason)
+        cached_direct = get_cached_diagnostics(session, project.id, "7d")
+        deep_diagnostics = dict(cached_direct.result_json or {}) if cached_direct is not None else None
+        if deep_diagnostics is not None:
+            deep_diagnostics["_from_cache"] = True
+        return _format_cached_business_report(project.name, snapshot, reason=reason, deep_diagnostics=deep_diagnostics)
 
 
 def _build_cycle_response(result: CycleResult, started_at: datetime | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -1597,14 +1608,9 @@ def _build_cycle_response(result: CycleResult, started_at: datetime | None = Non
 
     text = format_cycle_message(result, project_name)
 
-    if project_id is not None:
-        with get_session() as session:
-            snapshot = _get_latest_combined_snapshot(session, project_id, "7d")
-            if snapshot is not None:
-                started = _as_aware(started_at)
-                snap_created = _as_aware(snapshot.created_at)
-                fallback_mode = bool(started and snap_created and snap_created < started - timedelta(seconds=5))
-                text += "\n\n" + _format_source_freshness(snapshot, fallback_mode=fallback_mode)
+    # Source freshness is now part of the Owner Decision Layer report. Do not
+    # append a second legacy freshness block here, otherwise /run becomes noisy
+    # and can show conflicting wording.
 
     keyboard = None
     if result.primary_candidate is not None:

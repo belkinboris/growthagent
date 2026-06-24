@@ -121,6 +121,11 @@ class CycleResult:
     show_onboarding_button: bool = False
     show_landing_funnel_button: bool = False
     milestone_notifications: list[str] = field(default_factory=list)
+    # Owner Decision Layer inputs. Populated by scheduler.py; read by Telegram
+    # formatting only. They are intentionally optional so older cached objects
+    # and tests keep working.
+    source_statuses_by_window: dict = field(default_factory=dict)
+    previous_metrics_by_window: dict = field(default_factory=dict)
 
     @property
     def has_notifiable_changes(self) -> bool:

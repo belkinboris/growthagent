@@ -467,6 +467,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             logger.info("/run live refresh started (project_id=%s, build context=manual_telegram_run)", project.id)
 
         metrics_by_window: dict[str, NormalizedMetrics] = {}
+        source_statuses_by_window: dict[str, dict] = {}
         all_sources_ok: set[str] = set()
         all_errors: dict[str, str] = {}
         product_as_of: datetime | None = None
@@ -474,6 +475,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         for period_key, period_hours in ANALYSIS_WINDOWS_HOURS.items():
             metrics, extra = await _collect_window(project, period_key, period_hours)
             metrics_by_window[period_key] = metrics
+            source_statuses_by_window[period_key] = (extra.get("raw") or {}).get("source_statuses") or {}
             all_sources_ok |= metrics.sources_ok
             all_errors.update(extra["errors"])
             if extra.get("product_as_of"):
@@ -533,6 +535,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             metrics_by_window=metrics_by_window,
         )
         result.integration_down_changes = integration_changes
+        result.source_statuses_by_window = source_statuses_by_window
 
         # Deep diagnostics: гибридный режим. Автоматически запускается
         # только если (а) есть триггерящий алерт, (б) Direct настроен,
@@ -556,6 +559,16 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         previous_snapshot_7d = get_previous_snapshot(session, project.id, "7d")
         if previous_snapshot_7d is not None:
             previous_metrics_7d = extract_normalized_metrics_from_snapshot(previous_snapshot_7d)
+        result.previous_metrics_by_window["7d"] = previous_metrics_7d
+
+        # Regular manual /run should not run heavy deep Direct live, but it may
+        # attach an already cached diagnostics result so the owner can still see
+        # what to scale, observe or clean in search queries.
+        if manual_context and direct_configured:
+            cached_direct = get_cached_diagnostics(session, project.id, "7d")
+            if cached_direct is not None:
+                result.deep_diagnostics = dict(cached_direct.result_json or {})
+                result.deep_diagnostics["_from_cache"] = True
 
         result.milestone_notifications = collect_milestone_notifications(
             session=session,
