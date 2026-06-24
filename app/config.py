@@ -243,9 +243,10 @@ RUN_CYCLE_TIMEOUT_SECONDS = 75.0
 MANUAL_RUN_TIMEOUT_SECONDS = 75.0
 MANUAL_RUN_STALE_AFTER_SECONDS = 120.0
 DIRECT_REPORT_RETRY_SLEEP_CAP_SECONDS = 3.0
+STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 
 # Метка версии для диагностики деплоя -- не семантический номер версии,
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-cachefallback-2026-06-24"
+BUILD_MARKER = "growth-agent-statusfix-2026-06-25"

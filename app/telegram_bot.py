@@ -24,12 +24,13 @@ from app.config import (
     BUILD_MARKER,
     MANUAL_RUN_STALE_AFTER_SECONDS,
     MANUAL_RUN_TIMEOUT_SECONDS,
+    STATUS_COMMAND_DB_TIMEOUT_SECONDS,
     get_settings,
     MIN_SIGNUP_CONVERSION_WARN_PERCENT,
     DEFAULT_QUERY_CLUSTERS,
 )
 from app.db import get_session
-from app.models import Alert, AlertStatus, Integration, IntegrationStatus, MetricSnapshot, Project
+from app.models import Alert, AlertStatus, MetricSnapshot, Project
 from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
 from app.scheduler import run_cycle_once_sync_with_timeout
 from app.service import AlertChange, AlertChangeType, CycleResult, extract_normalized_metrics_from_snapshot
@@ -1317,76 +1318,122 @@ async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _manual_run_state_text(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    if _manual_run_task is not None and not _manual_run_task.done() and _manual_run_started_at is not None:
+        elapsed = (now - _manual_run_started_at).total_seconds()
+        return f"идёт {_format_duration(elapsed)}"
+    return "не запущена"
+
+
+def _build_status_text_sync() -> str:
+    """
+    Cheap /status payload builder. It reads only local DB state and never calls
+    Direct, Metrika, YooKassa, TruePost, deep diagnostics or run_cycle_once.
+    The async handler wraps this in a short timeout and falls back to an even
+    cheaper response if the DB is temporarily slow.
+    """
+    now = datetime.now(timezone.utc)
+    mode_ru = {
+        "watch_only": "наблюдение",
+        "recommend_only": "рекомендации",
+        "approval_required": "действия только с подтверждением",
+        "autopilot_limited": "ограниченный автопилот",
+    }
+
     with get_session() as session:
         project = _get_active_project(session)
         if project is None:
-            await update.message.reply_text("Активный проект не найден.")
-            return
+            return "\n".join([
+                "Аналитик Воронки — статус",
+                "Проект: активный проект не найден",
+                f"Версия: {BUILD_MARKER}",
+                "Telegram-бот: работает (этот ответ получен)",
+                f"Ручная проверка /run: {_manual_run_state_text(now)}",
+                "Внешние источники: не проверяются внутри /status, чтобы команда отвечала быстро.",
+            ])
 
-        integrations = session.exec(
-            select(Integration).where(Integration.project_id == project.id)
-        ).all()
+        current_mode = (project.settings_json or {}).get("mode", "watch_only")
+        snapshot = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
 
-        mode_ru = {
-            "watch_only": "наблюдение",
-            "recommend_only": "рекомендации",
-            "approval_required": "действия только с подтверждением",
-            "autopilot_limited": "ограниченный автопилот",
-        }
-        integration_ru = {
-            "project_metrics_api": "метрики продукта",
-            "metrika": "Яндекс.Метрика",
-            "direct": "Яндекс.Директ",
-            "yookassa": "ЮKassa",
-            # Telegram bot runtime is not read from Integration rows: if this
-            # command replies, the bot itself is alive. Old DB rows with
-            # type=telegram used to show "Telegram: не настроено", which was
-            # misleading for the user.
-            "llm": "языковая модель",
-        }
-        status_ru = {
-            "ok": "работает",
-            "not_configured": "не настроено",
-            "error": "ошибка",
-            "stale": "данные устарели",
-        }
-        current_mode = project.settings_json.get("mode", "watch_only")
-        status_lines = [f"Проект: {project.name}", f"Версия: {BUILD_MARKER}", f"Режим: {mode_ru.get(current_mode, current_mode)}", ""]
-        status_lines.append("Интеграции:")
-        status_lines.append("🟢 Telegram-бот: работает (этот ответ получен)")
-        status_emoji = {
-            IntegrationStatus.ok: "🟢",
-            IntegrationStatus.not_configured: "⚪️",
-            IntegrationStatus.error: "🔴",
-            IntegrationStatus.stale: "🟡",
-        }
-        for integ in integrations:
-            if integ.type == IntegrationType.telegram:
-                # Do not show stale/legacy DB status for the bot runtime.
-                # The live bot status is the explicit line above.
-                continue
-            emoji = status_emoji.get(integ.status, "⚪️")
-            name = integration_ru.get(integ.type.value, integ.type.value)
-            state = status_ru.get(integ.status.value, integ.status.value)
-            status_lines.append(f"{emoji} {name}: {state}")
-
-        open_alerts_count = session.exec(
-            select(Alert).where(
+        open_signal_ids = session.exec(
+            select(Alert.id).where(
                 Alert.project_id == project.id,
                 Alert.status.in_([AlertStatus.open, AlertStatus.sent, AlertStatus.escalated]),
             )
         ).all()
-        status_lines.append("")
-        status_lines.append(f"Открытых сигналов: {len(open_alerts_count)}")
-        if _manual_run_task is not None and not _manual_run_task.done() and _manual_run_started_at is not None:
-            elapsed = (datetime.now(timezone.utc) - _manual_run_started_at).total_seconds()
-            status_lines.append(f"Ручная проверка /run: идёт {_format_duration(elapsed)}")
+
+        if snapshot is not None:
+            snapshot_line = f"Последний сохранённый замер: {_format_dt(snapshot.created_at)} ({snapshot.period_key})."
         else:
-            status_lines.append("Ручная проверка /run: не запущена")
+            snapshot_line = "Последний сохранённый замер: пока не найден."
 
-        await update.message.reply_text("\n".join(status_lines))
+        return "\n".join([
+            "Аналитик Воронки — статус",
+            f"Проект: {project.name}",
+            f"Версия: {BUILD_MARKER}",
+            f"Режим бота: {mode_ru.get(current_mode, current_mode)}",
+            "Telegram-бот: работает (этот ответ получен)",
+            f"Ручная проверка /run: {_manual_run_state_text(now)}",
+            snapshot_line,
+            f"Открытых сигналов: {len(open_signal_ids)}",
+            "Внешние источники: не проверяются внутри /status, чтобы команда отвечала быстро. Для отдельных проверок используйте /test_metrika, /test_direct или /run.",
+        ])
 
+
+def _build_status_fallback_text(reason: str) -> str:
+    return "\n".join([
+        "Аналитик Воронки — статус",
+        f"Версия: {BUILD_MARKER}",
+        "Telegram-бот: работает (этот ответ получен)",
+        f"Ручная проверка /run: {_manual_run_state_text()}",
+        f"Локальная БД статуса временно недоступна или отвечает медленно: {reason}.",
+        "Внешние источники не проверялись. /status остаётся быстрой командой и не вызывает Директ, Метрику, YooKassa или продуктовый API.",
+    ])
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cheap status command: must stay responsive during /run and slow APIs."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    logger.info("Status command received (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+
+    if update.message is None:
+        logger.warning("Status command received without message object (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        return
+
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(_build_status_text_sync),
+            timeout=STATUS_COMMAND_DB_TIMEOUT_SECONDS,
+        )
+        logger.info("Status response prepared (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Status command DB read timed out after %.1f sec (build=%s, chat_id=%s)",
+            STATUS_COMMAND_DB_TIMEOUT_SECONDS,
+            BUILD_MARKER,
+            chat_id,
+        )
+        text = _build_status_fallback_text("timeout")
+        logger.info("Status fallback response prepared (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+    except Exception as exc:
+        logger.exception("Status failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        text = _build_status_fallback_text(exc.__class__.__name__)
+        logger.info("Status fallback response prepared after exception (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+
+    try:
+        await update.message.reply_text(text)
+        logger.info("Status response sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+    except Exception:
+        logger.exception("Status response send failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
 
 def _format_duration(seconds: float) -> str:
     seconds_int = max(0, int(seconds))
