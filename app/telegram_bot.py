@@ -399,6 +399,7 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         source_statuses=(result.source_statuses_by_window or {}).get("7d", {}),
         previous_metrics=(result.previous_metrics_by_window or {}).get("7d"),
         deep_diagnostics=result.deep_diagnostics,
+        payment_path_diagnostics=result.payment_path_diagnostics,
         period_label="7д",
     )
     if owner_report is not None:

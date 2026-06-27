@@ -37,6 +37,7 @@ from app.connectors import direct as direct_connector
 from app.connectors import landing as landing_connector
 from app.connectors import metrika as metrika_connector
 from app.connectors import onboarding as onboarding_connector
+from app.connectors import payment_path as payment_path_connector
 from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
@@ -676,6 +677,41 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                     )
                     logger.warning("Landing funnel diagnostics failed: %s", landing_outcome["error"])
 
+        # Payment-path diagnostics: запускается всегда при manual /run и при
+        # плановом цикле если product configured. Использует 7d-окно (168ч) --
+        # наилучший охват для анализа попыток оплаты. Не кэшируется, так как
+        # не является тяжёлым запросом (internal endpoint TruePost). Не
+        # блокирует /run: ошибка endpoint'а переходит в статус, не в падение.
+        #
+        # В отличие от onboarding/landing -- не требует триггерного алерта:
+        # путь до оплаты всегда полезен для понимания воронки, вне зависимости
+        # от того, что сейчас primary_candidate.
+        if product_configured:
+            payment_path_period_hours = ANALYSIS_WINDOWS_HOURS["7d"]
+            try:
+                payment_path_outcome = await run_payment_path_diagnostics_for_project(
+                    project, settings, period_hours=payment_path_period_hours,
+                )
+            except Exception as exc:
+                # Последний рубеж: run_payment_path_diagnostics_for_project не должна
+                # кидать исключения, но если что-то неожиданное (баг в коде, OOM и т.п.)
+                # -- /run продолжает работу, блок просто не появится в отчёте.
+                logger.exception("Unexpected error in payment_path diagnostics: %s", exc)
+                payment_path_outcome = {"status": "error", "result": None, "error": str(exc)}
+
+            if payment_path_outcome["status"] == "ok":
+                result.payment_path_diagnostics = payment_path_outcome["result"]
+                result.payment_path_diagnostics["_from_cache"] = False
+            elif payment_path_outcome["status"] == "not_configured":
+                result.payment_path_diagnostics = {"status": "not_configured"}
+            else:
+                # Ошибка endpoint'а -- не падаем, передаём статус в отчёт
+                result.payment_path_diagnostics = {
+                    "status": "error",
+                    "error": payment_path_outcome.get("error"),
+                }
+                logger.warning("Payment-path diagnostics failed: %s", payment_path_outcome.get("error"))
+
         return result
 
 
@@ -1079,6 +1115,51 @@ async def run_landing_funnel_diagnostics_for_project(
 
     diag_result = analyze_landing_funnel(connector_result, direct_clicks=direct_clicks, period_hours=period_hours)
     return {"status": "ok", "result": diag_result.to_dict(), "error": None}
+
+
+async def run_payment_path_diagnostics_for_project(
+    project: Project, settings, period_hours: int = 168,
+) -> dict:
+    """
+    Запускает payment-path diagnostics для проекта.
+
+    Возвращает {"status": "ok"|"not_configured"|"error",
+                "result": {...}|None,
+                "error": "..."|None}.
+
+    Не кидает исключений наружу -- все ошибки переходят в status="error".
+    Не блокирует /run: вызывается с тем же _run_with_timeout, что и другие
+    internal-источники.
+
+    period_hours: используем 7d (168ч) -- максимальное окно, которое
+    даёт достаточно данных о попытках оплаты для вывода. Не 24h, потому что
+    у малого проекта в сутки может быть 0 событий оплаты -- это не сигнал.
+    """
+    if not project.base_url or not settings.project_internal_api_token:
+        return {"status": "not_configured", "result": None, "error": None}
+
+    try:
+        connector_result = await _run_with_timeout(
+            payment_path_connector.fetch_payment_path_diagnostics(
+                base_url=project.base_url,
+                api_token=settings.project_internal_api_token,
+                period_hours=period_hours,
+            ),
+            CONNECTOR_CALL_TIMEOUT_SECONDS,
+            "Payment-path diagnostics",
+        )
+    except payment_path_connector.NotConfiguredError:
+        return {"status": "not_configured", "result": None, "error": None}
+    except asyncio.TimeoutError:
+        return {
+            "status": "error",
+            "result": None,
+            "error": f"Payment-path diagnostics не ответил за {CONNECTOR_CALL_TIMEOUT_SECONDS:.0f} секунд",
+        }
+    except payment_path_connector.PaymentPathConnectorError as exc:
+        return {"status": "error", "result": None, "error": str(exc)}
+
+    return {"status": "ok", "result": connector_result, "error": None}
 
 
 async def force_refresh_landing_funnel_diagnostics(project_id: int | None = None) -> dict:

@@ -112,6 +112,11 @@ class CycleResult:
     onboarding_diagnostics: dict | None = None
     # Симметрично onboarding_diagnostics, для landing funnel diagnostics.
     landing_funnel_diagnostics: dict | None = None
+    # Payment-path diagnostics: данные по воронке до оплаты из
+    # /api/internal/payment-path-diagnostics. None -- "не запускался в этом
+    # цикле". Запускается всегда при manual /run и при плановом цикле, если
+    # product connector настроен. Не блокирует /run при недоступности.
+    payment_path_diagnostics: dict | None = None
     # Независимо от того, запускалась ли диагностика автоматически в этом
     # цикле -- показывать ли кнопки ручного запуска. См. service.
     # should_show_deep_direct_button/should_show_onboarding_button: кнопки

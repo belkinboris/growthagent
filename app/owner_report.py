@@ -445,6 +445,164 @@ def _format_metrics_line(metrics: NormalizedMetrics) -> str:
     ])
 
 
+def _format_payment_path_block(payment_path: dict | None) -> str | None:
+    """
+    Форматирует блок "Путь до оплаты" из данных payment-path diagnostics endpoint.
+
+    Возвращает None, если данные недоступны (не показываем пустой блок).
+
+    Логика stage-aware: не пишем выводы о стадиях, до которых данных нет.
+    Особый случай:
+      - 1 payment_started без success -- ранний сигнал, не P1.
+      - payment_returned != payment_success -- возврат не равен успеху.
+      - pricing_viewed = None (не 0) -- значит событие не трекируется совсем.
+    """
+    if payment_path is None:
+        return None
+
+    # Endpoint недоступен или не настроен -- честно пишем об этом
+    status = payment_path.get("status")
+    if status == "not_configured":
+        return None
+    if status == "error":
+        err = payment_path.get("error") or "неизвестная ошибка"
+        return f"Путь до оплаты:\n— диагностика временно недоступна ({err}); данные будут при следующем /run."
+    if status == "not_available":
+        return "Путь до оплаты:\n— endpoint диагностики ещё не подключён в продукте; данные появятся после деплоя."
+
+    def _iv(v) -> int:
+        """int value, None -> 0"""
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # Основные шаги воронки
+    registrations = _iv(payment_path.get("registrations"))
+    channels_created = _iv(payment_path.get("channels_created"))
+    post_generations = _iv(payment_path.get("post_generations"))
+    # pricing_viewed может быть None (не трекируется) или int
+    pricing_viewed_raw = payment_path.get("pricing_viewed")
+    pricing_viewed = _iv(pricing_viewed_raw) if pricing_viewed_raw is not None else None
+    payment_cta_clicked = _iv(payment_path.get("payment_cta_clicked"))
+    payment_started = _iv(payment_path.get("payment_started"))
+    payment_success = _iv(payment_path.get("payment_success"))
+    payment_failed = _iv(payment_path.get("payment_failed"))
+    payment_returned = _iv(payment_path.get("payment_returned"))
+    missing_data: list = payment_path.get("missing_data") or []
+
+    lines = ["Путь до оплаты:"]
+
+    # --- Воронка числами ---
+    if registrations > 0:
+        lines.append(f"— зарегистрировались: {registrations}")
+        lines.append(f"— создали канал: {channels_created} ({_pct(channels_created, registrations)})")
+        lines.append(f"— сгенерировали пост: {post_generations} событий")
+    else:
+        lines.append("— регистраций за период: нет данных или 0")
+
+    # Тарифы: отдельно обрабатываем None vs 0
+    if pricing_viewed is None:
+        lines.append("— открыли тарифы: событие не трекируется (данных нет)")
+    else:
+        lines.append(f"— открыли тарифы: {pricing_viewed}")
+
+    lines.append(f"— нажали кнопку оплаты: {payment_cta_clicked}")
+    lines.append(f"— backend Payment создан: {payment_started}")
+
+    if payment_failed > 0:
+        lines.append(f"— оплат с ошибкой: {payment_failed}")
+    if payment_returned > 0:
+        lines.append(f"— вернулись со страницы оплаты (не успех): {payment_returned}")
+
+    lines.append(f"— успешно оплатили: {payment_success}")
+
+    # --- Разрыв и интерпретация ---
+    lines.append("")  # пустая строка перед выводом
+
+    if registrations == 0:
+        lines.append("Вывод: нет регистраций за период -- путь до оплаты начинается с привлечения.")
+
+    elif channels_created == 0 and post_generations == 0:
+        lines.append(
+            "Вывод: пользователи регистрируются, но не создают канал и не генерируют посты. "
+            "Главная зона -- онбординг и первое действие после регистрации."
+        )
+
+    elif pricing_viewed is None:
+        # Событие вообще не трекируется -- не знаем, видят ли тарифы
+        lines.append(
+            "Вывод: активация живая. Данных по просмотру тарифов нет -- "
+            "неизвестно, доходят ли пользователи до тарифного экрана. "
+            "Рекомендуется добавить трекинг события pricing_viewed."
+        )
+
+    elif pricing_viewed == 0:
+        lines.append(
+            "Вывод: активация живая, но пользователи пока не доходят до тарифного экрана. "
+            "Проверить: когда и как тарифы предлагаются (после первого поста? по кнопке?), "
+            "видит ли пользователь paywall без дополнительных действий."
+        )
+
+    elif pricing_viewed > 0 and payment_cta_clicked == 0:
+        lines.append(
+            "Вывод: пользователи видят тарифы, но не нажимают оплату. "
+            "Вероятная зона проверки -- ценность, цена, текст тарифов, доверие, "
+            "момент предложения оплаты."
+        )
+
+    elif payment_cta_clicked > 0 and payment_started == 0:
+        lines.append(
+            "Вывод: люди нажимают кнопку оплаты, но backend Payment не создаётся. "
+            "Вероятная техническая проблема payment flow -- проверить логи создания Payment."
+        )
+
+    elif payment_started > 0 and payment_success == 0:
+        if 0 < payment_started < MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT:
+            lines.append(
+                f"Вывод: есть {payment_started} начатая оплата без успеха -- "
+                f"ранний сигнал, не P1. При {MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT}+ "
+                "неуспешных попытках можно поднимать как проблему оплаты/YooKassa/доверия/цены."
+            )
+        else:
+            lines.append(
+                f"Вывод: {payment_started} попыток оплаты без успеха -- "
+                "достаточно для сигнала. Проверить YooKassa логи, шлюз, "
+                "доверие пользователей к платёжной форме, сумму платежа."
+            )
+
+    elif payment_success > 0:
+        lines.append(
+            f"Вывод: есть {payment_success} успешных оплат. "
+            "Путь до оплаты работает."
+        )
+
+    else:
+        # Регистрации и активации есть, до тарифов данных нет или всё 0 выше
+        lines.append(
+            "Вывод: активация живая. Данных по тарифному и платёжному шагу пока недостаточно для вывода."
+        )
+
+    # --- Дополнительные сигналы ---
+    if payment_failed > 0:
+        lines.append(
+            f"Сигнал: {payment_failed} оплат завершились ошибкой -- "
+            "стоит проверить в YooKassa конкретные причины отказов."
+        )
+
+    if payment_returned > 0 and payment_success == 0:
+        lines.append(
+            f"Сигнал: {payment_returned} возвратов со страницы оплаты без успешной оплаты -- "
+            "пользователи начинают платёж, но уходят. Возврат ≠ успешная оплата."
+        )
+
+    # --- Чего не хватает ---
+    if missing_data:
+        lines.append(f"Не хватает данных: {', '.join(missing_data)}.")
+
+    return "\n".join(lines)
+
+
 def build_owner_report(
     project_name: str,
     metrics: NormalizedMetrics | None,
@@ -452,6 +610,7 @@ def build_owner_report(
     source_statuses: dict | None = None,
     previous_metrics: dict | None = None,
     deep_diagnostics: dict | None = None,
+    payment_path_diagnostics: dict | None = None,
     period_label: str = "7д",
     preface: str | None = None,
 ) -> str | None:
@@ -483,6 +642,12 @@ def build_owner_report(
 
     blocks.append("Что не трогать:\n" + "\n".join(f"— {item}." for item in decision.do_not_touch))
     blocks.append(_format_direct_decision_layer(deep_diagnostics))
+
+    # Блок "Путь до оплаты" -- только если данные доступны
+    payment_path_block = _format_payment_path_block(payment_path_diagnostics)
+    if payment_path_block:
+        blocks.append(payment_path_block)
+
     blocks.append(_format_deltas(previous_metrics, metrics))
     blocks.append(_format_confidence(decision.confidence))
     blocks.append(f"Метрики ({period_label}):\n{_format_metrics_line(metrics)}")
