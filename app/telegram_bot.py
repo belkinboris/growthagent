@@ -426,14 +426,16 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         landing_summary = _format_landing_funnel_teaser(result.landing_funnel_diagnostics)
         if landing_summary:
             blocks.append(landing_summary)
+
+        # Метрики выводим только в fallback-ветке (owner_report их не включает).
+        if metrics_7d:
+            blocks.append(f"Метрики (7д):\n{_format_metrics_line(metrics_7d)}")
+
     elif not blocks:
         blocks.append(
             f"Аналитик Воронки — режим наблюдения\nПроект: {project_name}\n\n"
             "Главный сигнал: пока всё спокойно, явных проблем не найдено."
         )
-
-    if metrics_7d:
-        blocks.append(f"Метрики (7д):\n{_format_metrics_line(metrics_7d)}")
 
     return "\n\n".join(blocks)
 

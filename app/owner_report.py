@@ -451,11 +451,14 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
 
     Возвращает None, если данные недоступны (не показываем пустой блок).
 
-    Логика stage-aware: не пишем выводы о стадиях, до которых данных нет.
-    Особый случай:
+    Ключевые правила интерпретации:
+      - pricing_viewed = None -- событие не трекируется совсем (не 0).
+      - pricing_viewed < MIN_PRICING_VIEWED_FOR_CONCLUSION -- данных мало,
+        нельзя делать вывод "видят тарифы, но не платят".
       - 1 payment_started без success -- ранний сигнал, не P1.
       - payment_returned != payment_success -- возврат не равен успеху.
-      - pricing_viewed = None (не 0) -- значит событие не трекируется совсем.
+      - Данные payment-path начали собираться после деплоя endpoint'а,
+        поэтому 7d-регистрации могут включать пользователей до старта трекинга.
     """
     if payment_path is None:
         return None
@@ -476,6 +479,11 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
             return int(v or 0)
         except (TypeError, ValueError):
             return 0
+
+    # Минимальный порог просмотров тарифного экрана для вывода "видят, но не платят".
+    # При значении ниже порога -- нельзя судить о поведении на тарифном экране,
+    # только констатировать что до него почти не доходят.
+    MIN_PRICING_VIEWED_FOR_CONCLUSION = 5
 
     # Основные шаги воронки
     registrations = _iv(payment_path.get("registrations"))
@@ -501,7 +509,7 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
     else:
         lines.append("— регистраций за период: нет данных или 0")
 
-    # Тарифы: отдельно обрабатываем None vs 0
+    # Тарифы: отдельно обрабатываем None vs 0 vs мало
     if pricing_viewed is None:
         lines.append("— открыли тарифы: событие не трекируется (данных нет)")
     else:
@@ -517,56 +525,76 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
 
     lines.append(f"— успешно оплатили: {payment_success}")
 
+    # --- Предупреждение о раннем трекинге ---
+    # Payment-path события начали собираться только после деплоя нового endpoint'а.
+    # 7d-окно может включать пользователей, зарегистрированных до старта трекинга,
+    # у которых pricing/payment события не попали в счётчик.
+    # Предупреждение показываем когда видим расхождение: много регистраций/активаций,
+    # но мало или 0 событий pricing/payment.
+    activated = channels_created > 0 or post_generations > 0
+    payment_events_low = (pricing_viewed is not None and pricing_viewed < MIN_PRICING_VIEWED_FOR_CONCLUSION
+                         and payment_cta_clicked == 0 and payment_started == 0)
+    if registrations > 5 and activated and payment_events_low:
+        lines.append(
+            "⚠ Данные payment-path собираются с момента деплоя нового endpoint'а. "
+            "7-дневные регистрации могут включать пользователей, зарегистрированных "
+            "до старта трекинга. Вывод предварительный."
+        )
+
     # --- Разрыв и интерпретация ---
     lines.append("")  # пустая строка перед выводом
 
     if registrations == 0:
-        lines.append("Вывод: нет регистраций за период -- путь до оплаты начинается с привлечения.")
+        lines.append("Вывод: нет регистраций за период — путь до оплаты начинается с привлечения.")
 
     elif channels_created == 0 and post_generations == 0:
         lines.append(
             "Вывод: пользователи регистрируются, но не создают канал и не генерируют посты. "
-            "Главная зона -- онбординг и первое действие после регистрации."
+            "Главная зона — онбординг и первое действие после регистрации."
         )
 
     elif pricing_viewed is None:
-        # Событие вообще не трекируется -- не знаем, видят ли тарифы
+        # Событие не трекируется совсем
         lines.append(
-            "Вывод: активация живая. Данных по просмотру тарифов нет -- "
+            "Вывод: активация живая. Данных по просмотру тарифов нет — "
             "неизвестно, доходят ли пользователи до тарифного экрана. "
             "Рекомендуется добавить трекинг события pricing_viewed."
         )
 
-    elif pricing_viewed == 0:
+    elif pricing_viewed < MIN_PRICING_VIEWED_FOR_CONCLUSION and payment_cta_clicked == 0:
+        # pricing_viewed есть, но мало — нельзя делать вывод "видят тарифы, но не кликают"
         lines.append(
-            "Вывод: активация живая, но пользователи пока не доходят до тарифного экрана. "
-            "Проверить: когда и как тарифы предлагаются (после первого поста? по кнопке?), "
-            "видит ли пользователь paywall без дополнительных действий."
+            f"Вывод: пользователи проходят раннюю активацию, но почти не доходят "
+            f"до тарифного экрана (pricing_viewed={pricing_viewed}). "
+            "Вероятная зона проверки — видимость paywall/тарифов, "
+            "момент предложения оплаты, путь от генерации к оплате. "
+            "Данных по тарифному экрану пока мало для детальных выводов."
         )
 
-    elif pricing_viewed > 0 and payment_cta_clicked == 0:
+    elif pricing_viewed >= MIN_PRICING_VIEWED_FOR_CONCLUSION and payment_cta_clicked == 0:
+        # Достаточно просмотров тарифов, но никто не нажал оплату
         lines.append(
-            "Вывод: пользователи видят тарифы, но не нажимают оплату. "
-            "Вероятная зона проверки -- ценность, цена, текст тарифов, доверие, "
-            "момент предложения оплаты."
+            f"Вывод: {pricing_viewed} пользователей видели тарифы, но никто не нажал оплату. "
+            "Вероятная зона проверки — ценность предложения, цена, текст тарифов, "
+            "доверие, момент предложения оплаты."
         )
 
     elif payment_cta_clicked > 0 and payment_started == 0:
         lines.append(
             "Вывод: люди нажимают кнопку оплаты, но backend Payment не создаётся. "
-            "Вероятная техническая проблема payment flow -- проверить логи создания Payment."
+            "Вероятная техническая проблема payment flow — проверить логи создания Payment."
         )
 
     elif payment_started > 0 and payment_success == 0:
         if 0 < payment_started < MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT:
             lines.append(
-                f"Вывод: есть {payment_started} начатая оплата без успеха -- "
+                f"Вывод: есть {payment_started} начатая оплата без успеха — "
                 f"ранний сигнал, не P1. При {MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT}+ "
                 "неуспешных попытках можно поднимать как проблему оплаты/YooKassa/доверия/цены."
             )
         else:
             lines.append(
-                f"Вывод: {payment_started} попыток оплаты без успеха -- "
+                f"Вывод: {payment_started} попыток оплаты без успеха — "
                 "достаточно для сигнала. Проверить YooKassa логи, шлюз, "
                 "доверие пользователей к платёжной форме, сумму платежа."
             )
@@ -578,7 +606,6 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
         )
 
     else:
-        # Регистрации и активации есть, до тарифов данных нет или всё 0 выше
         lines.append(
             "Вывод: активация живая. Данных по тарифному и платёжному шагу пока недостаточно для вывода."
         )
@@ -586,13 +613,13 @@ def _format_payment_path_block(payment_path: dict | None) -> str | None:
     # --- Дополнительные сигналы ---
     if payment_failed > 0:
         lines.append(
-            f"Сигнал: {payment_failed} оплат завершились ошибкой -- "
+            f"Сигнал: {payment_failed} оплат завершились ошибкой — "
             "стоит проверить в YooKassa конкретные причины отказов."
         )
 
     if payment_returned > 0 and payment_success == 0:
         lines.append(
-            f"Сигнал: {payment_returned} возвратов со страницы оплаты без успешной оплаты -- "
+            f"Сигнал: {payment_returned} возвратов со страницы оплаты без успешной оплаты — "
             "пользователи начинают платёж, но уходят. Возврат ≠ успешная оплата."
         )
 
