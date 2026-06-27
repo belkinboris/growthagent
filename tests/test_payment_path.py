@@ -99,14 +99,68 @@ class TestFormatPaymentPathBlock:
         assert "не трекируется" in block or "трекинг события" in block
 
     def test_pricing_viewed_but_no_cta(self):
-        """Люди видят тарифы, но не нажимают оплату -- вероятная зона: ценность/цена/доверие."""
+        """Достаточно просмотров тарифов (>= порога), но никто не нажал — зона: ценность/цена."""
         block = _format_payment_path_block(_payment_path(
             pricing_viewed=10,
             payment_cta_clicked=0,
         ))
         assert block is not None
-        assert "видят тарифы" in block or "видят" in block
-        assert "не нажимают" in block or "не нажимают оплату" in block
+        assert "видели тарифы" in block
+        assert "не нажимают" in block or "не нажал оплату" in block
+        assert "ценность" in block or "цена" in block
+
+    def test_pricing_viewed_low_not_enough_for_conclusion(self):
+        """pricing_viewed=1 (< порога 5) с активацией — нельзя говорить 'видят, но не платят'."""
+        block = _format_payment_path_block(_payment_path(
+            registrations=32,
+            channels_created=27,
+            post_generations=80,
+            pricing_viewed=1,
+            payment_cta_clicked=0,
+            payment_started=0,
+        ))
+        assert block is not None
+        # Должно говорить "данных мало", а не "видят тарифы, но не кликают"
+        assert "пока мало" in block or ("данных" in block and "мало" in block.lower())
+        assert "видели тарифы" not in block
+        assert "видят тарифы" not in block
+        assert "почти не доходят" in block or "мало" in block
+
+    def test_pricing_viewed_zero_correct_message(self):
+        """pricing_viewed=0 (трекируется, но никто не смотрел) — тоже ниже порога, данных мало."""
+        block = _format_payment_path_block(_payment_path(pricing_viewed=0))
+        assert block is not None
+        assert "данных" in block or "не доходят" in block
+        # Не должно быть вывода про "тарифы плохие"
+        assert "текст тарифов" not in block
+        assert "видели тарифы" not in block
+
+    def test_early_tracking_warning_shown_when_few_pricing_events(self):
+        """При много регистраций/активаций и мало pricing_viewed — предупреждение о раннем трекинге."""
+        block = _format_payment_path_block(_payment_path(
+            registrations=32,
+            channels_created=27,
+            post_generations=80,
+            pricing_viewed=1,
+            payment_cta_clicked=0,
+            payment_started=0,
+        ))
+        assert block is not None
+        assert "деплоя" in block or "endpoint" in block or "трекинг" in block.lower()
+
+    def test_early_tracking_warning_not_shown_when_data_sufficient(self):
+        """При достаточно pricing_viewed — предупреждение о раннем трекинге не нужно."""
+        block = _format_payment_path_block(_payment_path(
+            registrations=32,
+            channels_created=27,
+            post_generations=80,
+            pricing_viewed=20,
+            payment_cta_clicked=0,
+        ))
+        assert block is not None
+        # Вывод о тарифах есть, предупреждение о трекинге — нет
+        assert "видели тарифы" in block
+        assert "деплоя нового endpoint" not in block or "не нажимают оплату" in block
 
     def test_cta_clicked_but_no_payment_started(self):
         """CTA нажат, но Payment не создан -- техническая проблема backend."""
