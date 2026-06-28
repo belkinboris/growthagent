@@ -675,3 +675,137 @@ class TestDeepDirectFallbackPath:
         intel_msg = sent_messages[0]
         assert "Direct Intelligence" in intel_msg
         assert "не настроен" in intel_msg or "DIRECT_" in intel_msg
+
+
+# ---------------------------------------------------------------------------
+# Тест: cache key — save == read
+# ---------------------------------------------------------------------------
+
+class TestCacheKeyConsistency:
+    def test_save_key_equals_read_key(self):
+        """Ключ сохранения и чтения Direct Intelligence кэша должен быть одинаковым."""
+        from app.service import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        from app.telegram_bot import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY as tb_key
+
+        assert DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY == tb_key, (
+            f"Ключ сохранения ({DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY!r}) "
+            f"не совпадает с ключом чтения в telegram_bot ({tb_key!r})"
+        )
+
+    def test_cache_key_value(self):
+        """Значение ключа зафиксировано — защита от случайного переименования."""
+        from app.service import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        assert DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY == "direct_intelligence_24h"
+
+
+# ---------------------------------------------------------------------------
+# Тест: fallback /run читает DI кэш
+# ---------------------------------------------------------------------------
+
+class TestFallbackRunReadsDICache:
+    def test_build_cached_cycle_response_reads_di(self):
+        """
+        _build_cached_cycle_response должен читать DI кэш и передавать
+        его в _format_cached_business_report.
+        Даже если live /run упал — рекламный блок должен присутствовать.
+        """
+        from unittest.mock import MagicMock, patch
+        from app.telegram_bot import _build_cached_cycle_response
+        from app.query_classifier import DirectIntelligenceResult, QueryClassification, QueryLabel
+
+        # Мок DI cache объекта (ORM DeepDiagnosticsCache)
+        di_result = DirectIntelligenceResult(
+            period_label="7д",
+            safe_negatives=[QueryClassification(
+                query="шапка ютуб",
+                label=QueryLabel.SAFE_NEGATIVE,
+                reason="youtube_decoration",
+                clicks=15, cost=200.0,
+            )],
+            total_queries_analyzed=5,
+            total_spend=500.0,
+            total_clicks=80,
+        )
+        mock_di_cache = MagicMock()
+        mock_di_cache.ok = True
+        mock_di_cache.result_json = di_result.to_dict()
+
+        # Мок snapshot с нужными метриками
+        from app.rules import NormalizedMetrics
+        from unittest.mock import MagicMock
+        mock_snapshot = MagicMock()
+        mock_snapshot.created_at = None
+        mock_snapshot.metrics_json = {
+            "product": {
+                "registrations": 32, "channels_created": 27,
+                "post_generations": 80, "payments_success": 0,
+            },
+            "source_statuses": {},
+        }
+
+        mock_project = MagicMock()
+        mock_project.id = 1
+        mock_project.name = "АвтоПост"
+
+        def mock_get_cached(session, project_id, period_key):
+            if period_key == "direct_intelligence_24h":
+                return mock_di_cache
+            return None
+
+        with patch("app.telegram_bot.get_session") as mock_gs, \
+             patch("app.telegram_bot._get_active_project", return_value=mock_project), \
+             patch("app.telegram_bot._get_latest_combined_snapshot", return_value=mock_snapshot), \
+             patch("app.telegram_bot._snapshot_has_product_metrics", return_value=True), \
+             patch("app.telegram_bot.get_cached_diagnostics", side_effect=mock_get_cached):
+
+            mock_session = MagicMock()
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_gs.return_value = mock_session
+
+            result = _build_cached_cycle_response(reason="error")
+
+        assert result is not None, "Fallback report не должен быть None при наличии snapshot"
+        # Рекламный блок должен присутствовать
+        assert "шапка ютуб" in result or "safe_negative" in result.lower() or "Реклама" in result, (
+            f"Рекламный блок из DI cache не найден в fallback отчёте. "
+            f"Начало: {result[:200]!r}"
+        )
+
+    def test_format_cached_business_report_with_di(self):
+        """_format_cached_business_report с direct_intelligence показывает рекламный блок."""
+        from unittest.mock import MagicMock
+        from app.telegram_bot import _format_cached_business_report
+        from app.query_classifier import DirectIntelligenceResult, QueryClassification, QueryLabel
+
+        di = DirectIntelligenceResult(
+            period_label="7д",
+            safe_negatives=[QueryClassification(
+                query="шапка ютуб",
+                label=QueryLabel.SAFE_NEGATIVE,
+                reason="youtube_decoration",
+                clicks=15, cost=200.0,
+            )],
+            total_queries_analyzed=3,
+        )
+
+        mock_snapshot = MagicMock()
+        mock_snapshot.created_at = None
+        mock_snapshot.metrics_json = {
+            "product": {
+                "registrations": 32, "channels_created": 27,
+                "post_generations": 80, "payments_success": 0,
+            },
+            "source_statuses": {},
+        }
+
+        result = _format_cached_business_report(
+            "АвтоПост",
+            mock_snapshot,
+            reason="error",
+            direct_intelligence_dict=di.to_dict(),
+        )
+        assert result is not None
+        assert "Реклама" in result or "шапка ютуб" in result, (
+            f"Рекламный блок не найден. Начало: {result[:300]!r}"
+        )
