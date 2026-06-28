@@ -258,4 +258,4 @@ STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-deepdirect-fallback-2026-06-25"
+BUILD_MARKER = "growth-agent-di-hotfix2-2026-06-28"
