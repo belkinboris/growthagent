@@ -47,6 +47,7 @@ class NotConfiguredError(Exception):
 # Канонические имена полей, которые ожидаем в ответе.
 # Каждое поле опциональное (None если не заполнено endpoint'ом).
 _EXPECTED_FIELDS = [
+    # Основная воронка (существующие)
     "registrations",
     "channels_created",
     "post_generations",
@@ -58,12 +59,17 @@ _EXPECTED_FIELDS = [
     "payment_returned",
     "quota_warning_seen",
     "limit_reached",
+    # Onboarding choice (новые, 2026-06-28)
+    "onboarding_choice_counts",   # dict: {"generate_post": N, "analyze_channel": N, "skip": N}
+    # First post feedback (новые, 2026-06-28)
+    "first_post_feedback_good",   # int
+    "first_post_feedback_bad",    # int
+    "first_post_feedback_reasons", # dict: {"too_generic": N, "wrong_style": N, ...}
+    # Breakdown по верификации канала (новые, 2026-06-28)
+    "post_generations_verified",    # int — генерации у подключённых каналов
+    "post_generations_unverified",  # int — генерации у неподключённых каналов
 ]
 
-# Алиасы: canonical_name -> [возможные альтернативные имена в ответе].
-# Если canonical_name отсутствует в raw, пробуем алиасы по порядку.
-# Это защищает от незначительных расхождений имён между контрактом задачи
-# и фактической реализацией AutoPost endpoint.
 _FIELD_ALIASES: dict[str, list[str]] = {
     "post_generations":    ["posts_generated", "post_generated", "generations"],
     "pricing_viewed":      ["pricing_views", "tariff_views", "tariff_viewed"],
@@ -72,6 +78,13 @@ _FIELD_ALIASES: dict[str, list[str]] = {
     "payment_success":     ["payments_success", "payments_succeeded", "successful_payments"],
     "payment_failed":      ["payments_failed", "payment_failures"],
     "payment_returned":    ["payments_returned"],
+    # Новые поля — возможные альтернативные имена
+    "onboarding_choice_counts":     ["onboarding_choices", "choice_counts"],
+    "first_post_feedback_good":     ["feedback_good", "feedback_positive"],
+    "first_post_feedback_bad":      ["feedback_bad", "feedback_negative"],
+    "first_post_feedback_reasons":  ["feedback_reasons", "bad_feedback_reasons"],
+    "post_generations_verified":    ["generations_verified", "verified_channel_generations"],
+    "post_generations_unverified":  ["generations_unverified", "unverified_channel_generations"],
 }
 
 
