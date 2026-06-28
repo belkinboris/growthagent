@@ -476,15 +476,15 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
     if milestone_block:
         blocks.append(milestone_block)
 
-    owner_report = build_owner_report(
+    from app.commercial_report import build_run_report
+    di = _deserialize_direct_intelligence(result.direct_intelligence)
+    owner_report = build_run_report(
         project_name,
         metrics_7d,
-        source_statuses=(result.source_statuses_by_window or {}).get("7d", {}),
-        previous_metrics=(result.previous_metrics_by_window or {}).get("7d"),
-        deep_diagnostics=result.deep_diagnostics,
-        payment_path_diagnostics=result.payment_path_diagnostics,
-        direct_intelligence=_deserialize_direct_intelligence(result.direct_intelligence),
-        period_label="7д",
+        payment_path=result.payment_path_diagnostics,
+        direct_intelligence=di,
+        snapshot_dt=None,
+        is_fallback=False,
     )
     if owner_report is not None:
         blocks.append(owner_report)
@@ -1809,45 +1809,17 @@ def _format_cached_business_report(
     direct_intelligence_dict: dict | None = None,
     payment_path_dict: dict | None = None,
 ) -> str:
+    from app.commercial_report import build_run_report
     metrics = _normalized_metrics_from_snapshot(snapshot)
-    raw = snapshot.metrics_json or {}
-    source_statuses = raw.get("source_statuses") or {}
-
-    if reason == "timeout":
-        preface = (
-            "Один из внешних источников отвечает медленно, поэтому использую "
-            f"последний сохранённый замер от {_format_dt(snapshot.created_at)}."
-        )
-    else:
-        preface = (
-            "Живой сбор данных завершился с ошибкой, поэтому показываю лучший доступный "
-            f"отчёт по последнему сохранённому замеру от {_format_dt(snapshot.created_at)}."
-        )
-
     di = _deserialize_direct_intelligence(direct_intelligence_dict)
-
-    report = build_owner_report(
+    return build_run_report(
         project_name,
         metrics,
-        source_statuses=source_statuses,
-        previous_metrics=None,
-        deep_diagnostics=deep_diagnostics,
+        payment_path=payment_path_dict,
         direct_intelligence=di,
-        payment_path_diagnostics=payment_path_dict,
-        period_label="7д",
-        preface=preface,
+        snapshot_dt=snapshot.created_at,
+        is_fallback=True,
     )
-    if report is not None:
-        return report
-
-    return "\n\n".join([
-        preface,
-        "Аналитик Воронки — проверка бизнеса",
-        f"Проект: {project_name}",
-        "Последний сохранённый замер есть, но в нём недостаточно продуктовых метрик для предпринимательского вывода.",
-        f"Метрики (7д):\n{_format_metrics_line(metrics)}",
-        _format_source_freshness(snapshot, fallback_mode=True),
-    ])
 
 
 def _build_cached_cycle_response(reason: str) -> str | None:
@@ -2143,12 +2115,8 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Cheap funnel view from the latest saved snapshot. It deliberately does not
-    call run_cycle_once() or any external API, so /funnel remains responsive
-    while manual /run is slow, timed out, or waiting on Direct/Metrika/product.
-    """
-    from app.vocabulary import format_metric_line, get_metric_explain
+    """Продуктовая воронка — быстро из кэша, без внешних API."""
+    from app.commercial_report import build_funnel_report
     from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
 
     with get_session() as session:
@@ -2157,7 +2125,7 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("Активный проект не найден.")
             return
 
-        latest_snapshot = session.exec(
+        snapshot = session.exec(
             select(MetricSnapshot)
             .where(
                 MetricSnapshot.project_id == project.id,
@@ -2168,64 +2136,55 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             .limit(1)
         ).first()
 
-        if latest_snapshot is None:
+        if snapshot is None:
             await update.message.reply_text(
-                "Данных по воронке пока нет: ещё нет сохранённого снэпшота за 7 дней. "
-                "Запустите /run один раз; после этого /funnel будет отвечать быстро без внешних API."
+                "Данных по воронке пока нет. Запустите /run один раз — "
+                "после этого /funnel будет отвечать быстро."
             )
             return
 
-        current = extract_normalized_metrics_from_snapshot(latest_snapshot)
+        current = extract_normalized_metrics_from_snapshot(snapshot)
+        from app.rules import NormalizedMetrics
+        metrics_obj = NormalizedMetrics(
+            period_key="7d",
+            signup=current.get("signup"),
+            activation_1=current.get("activation_1"),
+            activation_2=current.get("activation_2"),
+            payment_started=current.get("payment_started"),
+            payment_success=current.get("payment_success"),
+            spend=current.get("spend"),
+            clicks=current.get("clicks"),
+            sources_ok=set(),
+        )
+
+        # Читаем payment_path кэш
+        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
         prev_snapshot = get_previous_snapshot(session, project.id, "7d")
-        prev = None
-        if prev_snapshot is not None and prev_snapshot.id != latest_snapshot.id:
-            prev = extract_normalized_metrics_from_snapshot(prev_snapshot)
+        prev_metrics = None
+        if prev_snapshot and prev_snapshot.id != snapshot.id:
+            prev_raw = extract_normalized_metrics_from_snapshot(prev_snapshot)
+            prev_metrics = NormalizedMetrics(
+                period_key="7d",
+                signup=prev_raw.get("signup"),
+                activation_1=prev_raw.get("activation_1"),
+                activation_2=prev_raw.get("activation_2"),
+                payment_started=prev_raw.get("payment_started"),
+                payment_success=prev_raw.get("payment_success"),
+                sources_ok=set(),
+            )
 
-    lines = ["Воронка за 7 дней:", ""]
-    lines.append(f"Источник: последний сохранённый замер от {latest_snapshot.created_at.isoformat()}.")
-    if _manual_run_task is not None and not _manual_run_task.done():
-        lines.append("Примечание: сейчас идёт /run; этот отчёт не ждёт внешние API и показывает последний сохранённый замер.")
-    lines.append("")
+        project_name = project.name
 
-    if current.get("clicks") is not None:
-        lines.append(f"{current.get('clicks')} событий — клики из рекламы (по данным Яндекс.Директа)")
-
-    lines.append(format_metric_line("signup", current.get("signup")))
-    lines.append(format_metric_line("activation_1", current.get("activation_1")))
-    lines.append(format_metric_line("activation_2", current.get("activation_2")))
-    lines.append(format_metric_line("payment_started", current.get("payment_started")))
-    lines.append(format_metric_line("payment_success", current.get("payment_success")))
-
-    explain = get_metric_explain("activation_2")
-    if explain and current.get("activation_2") is not None:
-        lines.append("")
-        lines.append(f"Примечание: {explain}")
-
-    lines.append("")
-    if prev is None:
-        lines.append("Динамика: нет данных для сравнения с предыдущим замером.")
-    else:
-        deltas = []
-        pairs = [
-            ("signup", "регистрации", current.get("signup")),
-            ("activation_1", "создали канал", current.get("activation_1")),
-            ("activation_2", "генерации постов", current.get("activation_2")),
-            ("payment_success", "оплатили", current.get("payment_success")),
-        ]
-        for key, label, current_value in pairs:
-            prev_value = prev.get(key)
-            if current_value is None or prev_value is None:
-                continue
-            diff = current_value - prev_value
-            if diff != 0:
-                sign = "+" if diff > 0 else ""
-                deltas.append(f"{label} {sign}{diff}")
-        if deltas:
-            lines.append(f"С прошлого замера: {', '.join(deltas)}.")
-        else:
-            lines.append("С прошлого замера: без изменений по основным метрикам.")
-
-    await update.message.reply_text("\n".join(lines))
+    text = build_funnel_report(
+        project_name,
+        metrics_obj,
+        payment_path=pp_dict,
+        snapshot_dt=snapshot.created_at,
+        prev_metrics=prev_metrics,
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2292,34 +2251,22 @@ async def _send_deep_direct_result(chat_id: int, bot, deep_result: dict, project
 
 
 def _format_intel_status_note(status: str, error: str | None, rows: int) -> str:
-    """
-    Статус Direct Intelligence — всегда возвращает непустую строку.
-    Отправляется пользователю после /deep_direct независимо от исхода.
-    """
-    if status == "ok":
-        if rows == 0:
-            return (
-                "Direct Intelligence: строк не получено (0 запросов в отчёте). "
-                "Кэш сохранён пустым. Проверьте даты кампаний в Яндекс.Директе."
-            )
-        return f"Direct Intelligence: обновлён ✓ ({rows} запросов). Следующий /run покажет блок рекламы."
-    if status == "not_configured":
-        return (
-            "Direct Intelligence: не настроен — нет DIRECT_OAUTH_TOKEN или DIRECT_CLIENT_LOGIN. "
-            "Добавьте переменные в Railway для активации рекламного анализа."
-        )
-    if status == "no_project":
-        return "Direct Intelligence: проект не найден в БД — кэш не обновлён."
-    if status == "timeout":
-        return (
-            f"Direct Intelligence: таймаут ({error or 'превышен лимит времени'}). "
-            "Кэш не обновлён. Попробуйте /deep_direct позже."
-        )
-    if status == "error":
-        return f"Direct Intelligence: ошибка API — {error or 'неизвестно'}. Кэш не обновлён."
-    if status == "exception":
-        return f"Direct Intelligence: внутренняя ошибка — {error or 'см. Railway logs'}. Кэш не обновлён."
-    return f"Direct Intelligence: статус={status}. {error or ''}"
+    """Статус Direct Intelligence — всегда возвращает непустую строку."""
+    from app.commercial_report import build_deep_direct_status
+    # Определяем project_name быстро
+    try:
+        with get_session() as session:
+            project = _get_active_project(session)
+            project_name = project.name if project else "Проект"
+    except Exception:
+        project_name = "Проект"
+    return build_deep_direct_status(
+        intel_status=status,
+        intel_rows=rows,
+        intel_error=error,
+        legacy_ok=False,
+        project_name=project_name,
+    )
 
 
 async def _send_intel_status(chat_id: int, bot, status: str, error: str | None, rows: int) -> None:
@@ -2515,6 +2462,109 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             if _deep_direct_task is current_task:
                 _deep_direct_task = None
                 _deep_direct_started_at = None
+
+
+async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Рекламный вывод из кэша — без внешних API."""
+    from app.commercial_report import build_ads_report
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            await update.message.reply_text("Активный проект не найден.")
+            return
+
+        snapshot = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.period_key == "7d",
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
+
+        metrics_obj = None
+        if snapshot:
+            from app.rules import NormalizedMetrics
+            raw = extract_normalized_metrics_from_snapshot(snapshot)
+            metrics_obj = NormalizedMetrics(
+                period_key="7d",
+                signup=raw.get("signup"),
+                activation_1=raw.get("activation_1"),
+                activation_2=raw.get("activation_2"),
+                payment_started=raw.get("payment_started"),
+                payment_success=raw.get("payment_success"),
+                spend=raw.get("spend"),
+                clicks=raw.get("clicks"),
+                sources_ok=set(),
+            )
+
+        di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
+        di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
+        di = _deserialize_direct_intelligence(di_dict)
+        project_name = project.name
+
+    text = build_ads_report(
+        project_name,
+        direct_intelligence=di,
+        metrics=metrics_obj,
+        snapshot_dt=snapshot.created_at if snapshot else None,
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Путь к оплате из кэша — без внешних API."""
+    from app.commercial_report import build_pay_report
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            await update.message.reply_text("Активный проект не найден.")
+            return
+
+        snapshot = session.exec(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.period_key == "7d",
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
+
+        metrics_obj = None
+        if snapshot:
+            from app.rules import NormalizedMetrics
+            raw = extract_normalized_metrics_from_snapshot(snapshot)
+            metrics_obj = NormalizedMetrics(
+                period_key="7d",
+                signup=raw.get("signup"),
+                activation_1=raw.get("activation_1"),
+                activation_2=raw.get("activation_2"),
+                payment_started=raw.get("payment_started"),
+                payment_success=raw.get("payment_success"),
+                spend=raw.get("spend"),
+                clicks=raw.get("clicks"),
+                sources_ok=set(),
+            )
+
+        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+        project_name = project.name
+
+    text = build_pay_report(
+        project_name,
+        payment_path=pp_dict,
+        metrics=metrics_obj,
+        snapshot_dt=snapshot.created_at if snapshot else None,
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2812,6 +2862,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("ads", cmd_ads))
+    app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("funnel", cmd_funnel))
     app.add_handler(CommandHandler("mode", cmd_mode))
