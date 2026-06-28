@@ -41,6 +41,7 @@ from app.service import (
     AlertChangeType,
     CycleResult,
     DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
+    PAYMENT_PATH_CACHE_PERIOD_KEY,
     extract_normalized_metrics_from_snapshot,
     get_cached_diagnostics,
 )
@@ -1806,6 +1807,7 @@ def _format_cached_business_report(
     reason: str,
     deep_diagnostics: dict | None = None,
     direct_intelligence_dict: dict | None = None,
+    payment_path_dict: dict | None = None,
 ) -> str:
     metrics = _normalized_metrics_from_snapshot(snapshot)
     raw = snapshot.metrics_json or {}
@@ -1831,6 +1833,7 @@ def _format_cached_business_report(
         previous_metrics=None,
         deep_diagnostics=deep_diagnostics,
         direct_intelligence=di,
+        payment_path_diagnostics=payment_path_dict,
         period_label="7д",
         preface=preface,
     )
@@ -1860,28 +1863,40 @@ def _build_cached_cycle_response(reason: str) -> str | None:
         deep_diagnostics = dict(cached_direct.result_json or {}) if cached_direct is not None else None
         if deep_diagnostics is not None:
             deep_diagnostics["_from_cache"] = True
-        # Direct Intelligence кэш -- читаем отдельно, с правильным ключом
-        # и правильным доступом к ORM-полям (.ok, .result_json)
+        # Direct Intelligence кэш
         di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
         di_dict: dict | None = None
         if di_cached is not None and di_cached.ok:
             di_dict = dict(di_cached.result_json or {})
             logger.info(
                 "Fallback /run: Direct Intelligence cache read ok (project_id=%s, rows=%s)",
-                project.id,
-                di_dict.get("total_queries_analyzed", "?"),
+                project.id, di_dict.get("total_queries_analyzed", "?"),
             )
         else:
             logger.info(
                 "Fallback /run: Direct Intelligence cache miss (project_id=%s, found=%s)",
-                project.id,
-                di_cached is not None,
+                project.id, di_cached is not None,
+            )
+        # Payment-path кэш — читаем если есть, иначе None (блок скрыт)
+        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        pp_dict: dict | None = None
+        if pp_cached is not None and pp_cached.ok:
+            pp_dict = dict(pp_cached.result_json or {})
+            logger.info(
+                "Fallback /run: Payment-path cache read ok (project_id=%s, registrations=%s)",
+                project.id, pp_dict.get("registrations", "?"),
+            )
+        else:
+            logger.info(
+                "Fallback /run: Payment-path cache miss (project_id=%s, found=%s)",
+                project.id, pp_cached is not None,
             )
         return _format_cached_business_report(
             project.name, snapshot,
             reason=reason,
             deep_diagnostics=deep_diagnostics,
             direct_intelligence_dict=di_dict,
+            payment_path_dict=pp_dict,
         )
 
 
@@ -1974,7 +1989,13 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
     except asyncio.CancelledError:
         logger.warning("Manual /run task cancelled (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         raise
-    except Exception:
+    except Exception as exc:
+        # Логируем тип и краткое сообщение дополнительно к полному traceback,
+        # чтобы причину было видно без разворачивания стектрейса в Railway.
+        logger.error(
+            "Manual /run live collection failed: %s: %s (build=%s, chat_id=%s) — fallback будет использован",
+            type(exc).__name__, str(exc)[:300], BUILD_MARKER, chat_id,
+        )
         logger.exception("Manual /run failed with traceback (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         try:
             fallback_text = _build_cached_cycle_response(reason="error")

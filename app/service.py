@@ -683,6 +683,7 @@ LANDING_FUNNEL_TRIGGER_CATEGORIES = DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES | ONBOAR
 
 LANDING_FUNNEL_CACHE_PERIOD_KEY = "landing_funnel_24h"
 DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY = "direct_intelligence_24h"
+PAYMENT_PATH_CACHE_PERIOD_KEY = "payment_path_7d"
 
 
 def should_run_landing_funnel_diagnostics(primary_candidate: AlertCandidate | None) -> bool:

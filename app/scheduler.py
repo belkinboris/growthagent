@@ -51,6 +51,7 @@ from app.service import (
     DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
     LANDING_FUNNEL_CACHE_PERIOD_KEY,
     ONBOARDING_CACHE_PERIOD_KEY,
+    PAYMENT_PATH_CACHE_PERIOD_KEY,
     check_integration_freshness,
     collect_milestone_notifications,
     extract_normalized_metrics_from_snapshot,
@@ -704,6 +705,18 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if payment_path_outcome["status"] == "ok":
                 result.payment_path_diagnostics = payment_path_outcome["result"]
                 result.payment_path_diagnostics["_from_cache"] = False
+                # Сохраняем в кэш — чтобы fallback /run тоже мог показать payment-path блок
+                try:
+                    save_diagnostics_cache(
+                        session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY,
+                        "live_run", result.payment_path_diagnostics, ok=True,
+                    )
+                    logger.info(
+                        "Payment-path diagnostics cached (project_id=%s, key=%s)",
+                        project.id, PAYMENT_PATH_CACHE_PERIOD_KEY,
+                    )
+                except Exception as cache_exc:
+                    logger.warning("Failed to cache payment-path diagnostics: %s", cache_exc)
             elif payment_path_outcome["status"] == "not_configured":
                 result.payment_path_diagnostics = {"status": "not_configured"}
             else:
