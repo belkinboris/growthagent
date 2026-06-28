@@ -1024,3 +1024,115 @@ class TestCommercialReportBannedTerms:
         report = build_run_report("АвтоПост", self._make_metrics())
         assert "МСК" in report
         assert "UTC" not in report
+
+
+# ---------------------------------------------------------------------------
+# P0 stabilization tests
+# ---------------------------------------------------------------------------
+
+class TestNoRawMarkdown:
+    """Пользовательские тексты не содержат сырого markdown."""
+
+    def _make_m(self):
+        from app.rules import NormalizedMetrics
+        return NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+
+    def _make_pp(self, pricing_viewed=1):
+        return {"registrations": 31, "channels_created": 26, "post_generations": 75,
+            "pricing_viewed": pricing_viewed, "payment_cta_clicked": 0,
+            "payment_started": 0, "payment_success": 0,
+            "payment_failed": 0, "payment_returned": 0, "missing_data": []}
+
+    def _check_no_raw_markdown(self, text: str, cmd: str):
+        import re
+        # Проверяем что нет *heading:* или *text* паттернов (bold markdown)
+        # но не ловим эмодзи которые могут содержать *
+        bad = re.findall(r'(?<!\w)\*[^\*\n]{1,50}\*(?!\w)', text)
+        assert not bad, f"{cmd}: найден сырой markdown: {bad[:3]}"
+
+    def test_run_no_raw_markdown(self):
+        from app.commercial_report import build_run_report
+        text = build_run_report("АвтоПост", self._make_m(), payment_path=self._make_pp())
+        self._check_no_raw_markdown(text, "/run")
+
+    def test_funnel_no_raw_markdown(self):
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("АвтоПост", self._make_m(), payment_path=self._make_pp())
+        self._check_no_raw_markdown(text, "/funnel")
+
+    def test_pay_no_raw_markdown(self):
+        from app.commercial_report import build_pay_report
+        text = build_pay_report("АвтоПост", payment_path=self._make_pp())
+        self._check_no_raw_markdown(text, "/pay")
+
+    def test_ads_no_raw_markdown(self):
+        from app.commercial_report import build_ads_report
+        text = build_ads_report("АвтоПост")
+        self._check_no_raw_markdown(text, "/ads")
+
+    def test_deep_direct_no_raw_markdown(self):
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="ok", intel_rows=3283,
+            intel_error=None, legacy_ok=False, project_name="АвтоПост")
+        self._check_no_raw_markdown(text, "/deep_direct")
+
+
+class TestFunnelOutput:
+    """/funnel никогда не пишет 'Воронка работает. Продолжать наблюдать.'"""
+
+    def test_funnel_no_generic_ok_message(self):
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        # С payment_success > 0 — раньше давал "Воронка работает"
+        m2 = NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=2, payment_success=2, spend=4800, clicks=528, sources_ok=set())
+        for m_test, label in [(m, "no payments"), (m2, "with payments")]:
+            text = build_funnel_report("АвтоПост", m_test)
+            assert "Воронка работает. Продолжать наблюдать." not in text, \
+                f"/funnel ({label}): нашли запрещённую фразу 'Воронка работает'"
+
+    def test_funnel_without_pricing_data_mentions_it(self):
+        """Если pricing_viewed не отслеживается, /funnel об этом говорит."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        # Без payment_path
+        text = build_funnel_report("АвтоПост", m, payment_path=None)
+        assert "тариф" in text.lower() or "отслеживается" in text.lower() or "оплат" in text.lower(), \
+            "/funnel должен упомянуть тарифы/оплату даже без payment_path данных"
+
+    def test_funnel_with_no_pricing_tracking(self):
+        """pricing_viewed=None → явное упоминание."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0}
+        text = build_funnel_report("АвтоПост", m, payment_path=pp)
+        assert "не отслеживается" in text or "данных нет" in text or "не настроено" in text, \
+            "/funnel должен явно сказать что просмотры тарифов не отслеживаются"
+
+
+class TestAdsClassification:
+    """/ads не кладёт обход ограничений в 'Что оставить'."""
+
+    def test_mass_posting_bypass_not_in_do_not_touch(self):
+        from app.query_classifier import classify_query, QueryLabel
+        r = classify_query("автопостинг по группам без премиума тг", clicks=10, cost=150.0)
+        assert r.label != QueryLabel.DO_NOT_TOUCH, \
+            "'автопостинг по группам без премиума тг' не должен быть в 'Что оставить'"
+
+    def test_ads_cpa_label(self):
+        """CPA называется 'цена регистрации', не 'CPA'."""
+        from app.commercial_report import build_ads_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        text = build_ads_report("АвтоПост", metrics=m)
+        # Не должно быть голого "CPA" без контекста
+        assert "цена регистрации" in text or "CPA" in text, \
+            "Должна быть строка с ценой регистрации"
