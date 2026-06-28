@@ -38,7 +38,7 @@ def test_deep_direct_summary_fallback_is_useful_without_granular_cache():
     assert "3157" in text
     assert "25" in text
     assert "ориентировочный CPA: 126" in text
-    assert "нельзя чистить вслепую" in text
+    assert "не менять резко ставки" in text
 
 
 def test_deep_direct_partial_result_marks_missing_source():

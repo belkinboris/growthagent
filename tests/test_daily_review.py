@@ -809,3 +809,96 @@ class TestFallbackRunReadsDICache:
         assert "Реклама" in result or "шапка ютуб" in result, (
             f"Рекламный блок не найден. Начало: {result[:300]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Тесты: garbage overrides protected (П4)
+# ---------------------------------------------------------------------------
+
+class TestGarbageOverridesProtected:
+    """Garbage категории из UNCONDITIONAL_GARBAGE должны overriding protected terms."""
+
+    def test_profile_decoration_overrides_telegram(self):
+        """'шапка профиля в телеграм' — garbage despite 'телеграм'."""
+        r = classify_query("шапка профиля в телеграм", clicks=10, cost=150.0)
+        assert r.label == QueryLabel.SAFE_NEGATIVE, f"Expected safe_negative, got {r.label}: {r.reason}"
+
+    def test_profile_decoration_genitive_case(self):
+        """'шапку профиля в телеграмм через ии' — garbage despite 'ии'/'телеграм'."""
+        r = classify_query("сгенерировать шапку профиля в телеграмм через ии", clicks=10, cost=150.0)
+        assert r.label == QueryLabel.SAFE_NEGATIVE, f"Expected safe_negative, got {r.label}: {r.reason}"
+
+    def test_youtube_decoration_overrides_protected(self):
+        """'шапка канала ютуб' — garbage despite nothing."""
+        r = classify_query("шапка канала ютуб", clicks=10, cost=150.0)
+        assert r.label == QueryLabel.SAFE_NEGATIVE
+
+    def test_relevant_telegram_queries_not_negative(self):
+        """'нейросеть для telegram канала' — do_not_touch, не safe_negative."""
+        r = classify_query("нейросеть для telegram канала", clicks=10, cost=150.0)
+        assert r.label != QueryLabel.SAFE_NEGATIVE
+
+    def test_autoposting_with_context_not_negative(self):
+        """'автопостинг по группам без премиума тг' — неоднозначно, но не safe_negative."""
+        r = classify_query("автопостинг по группам без премиума тг", clicks=10, cost=150.0)
+        assert r.label != QueryLabel.SAFE_NEGATIVE
+
+    def test_bot_for_posts_not_negative(self):
+        """'бот для постов в телеграм' — do_not_touch."""
+        r = classify_query("бот для постов в телеграм", clicks=10, cost=150.0)
+        assert r.label == QueryLabel.DO_NOT_TOUCH
+
+    def test_action_summary_includes_product(self):
+        """Action summary содержит Product блок."""
+        from app.owner_report import _format_action_items_block
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(
+            period_key="7d", signup=32, activation_1=27, activation_2=80,
+            payment_started=0, payment_success=0, spend=4800, clicks=594,
+            sources_ok={"product"},
+        )
+        pp = {"pricing_viewed": 1, "payment_cta_clicked": 0,
+              "payment_started": 0, "payment_success": 0}
+        block = _format_action_items_block(None, metrics=m, payment_path=pp)
+        assert block is not None
+        assert "Продукт" in block or "🛠" in block, f"Product action не найден: {block}"
+
+    def test_no_contradicting_direct_block_when_di_present(self):
+        """Если DI есть — блок 'кэш не приложен' не должен быть в отчёте."""
+        from app.owner_report import _format_direct_decision_layer
+        # Без DI — старый текст
+        block_no_di = _format_direct_decision_layer(None, has_direct_intelligence=False)
+        assert "не приложен" in block_no_di
+        # С DI — другой текст
+        block_with_di = _format_direct_decision_layer(None, has_direct_intelligence=True)
+        assert "не приложен" not in block_with_di
+        assert "Direct Intelligence" in block_with_di
+
+    def test_payment_path_shown_in_full_report(self):
+        """build_owner_report показывает payment path блок если данные есть."""
+        from app.owner_report import build_owner_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(
+            period_key="7d", signup=32, activation_1=27, activation_2=80,
+            payment_started=1, payment_success=0, spend=4800, clicks=594,
+            sources_ok={"product"},
+        )
+        pp = {"registrations": 32, "channels_created": 27, "post_generations": 80,
+              "pricing_viewed": 1, "payment_cta_clicked": 0,
+              "payment_started": 1, "payment_success": 0,
+              "payment_failed": 0, "payment_returned": 0, "missing_data": []}
+        report = build_owner_report("АвтоПост", m, payment_path_diagnostics=pp)
+        assert report is not None
+        assert "Путь до оплаты" in report
+
+    def test_pricing_viewed_1_no_tariff_conclusion(self):
+        """pricing_viewed=1 не даёт вывод 'люди видят тарифы, но не кликают'."""
+        from app.owner_report import _format_payment_path_block
+        pp = {"registrations": 32, "channels_created": 27, "post_generations": 80,
+              "pricing_viewed": 1, "payment_cta_clicked": 0,
+              "payment_started": 0, "payment_success": 0,
+              "payment_failed": 0, "payment_returned": 0, "missing_data": []}
+        block = _format_payment_path_block(pp)
+        bad = ["видят тарифы, но не кликают", "видели тарифы, но никто", "Люди открывают тарифы"]
+        for phrase in bad:
+            assert phrase not in block, f"Найдена запрещённая фраза: {phrase!r}"
