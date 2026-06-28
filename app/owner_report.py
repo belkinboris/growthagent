@@ -13,6 +13,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.rules import MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT, NormalizedMetrics
+from app.query_classifier import (
+    ActionType,
+    DirectIntelligenceResult,
+    QueryLabel,
+    SpendGateVerdict,
+)
 
 
 SOURCE_LABELS = {
@@ -445,6 +451,120 @@ def _format_metrics_line(metrics: NormalizedMetrics) -> str:
     ])
 
 
+def _format_direct_intelligence_block(di: DirectIntelligenceResult | None) -> str | None:
+    """
+    Форматирует блок 'Реклама' из DirectIntelligenceResult.
+    Если данных нет — возвращает однострочную пометку, не None,
+    чтобы владелец видел что данные недоступны, а не просто пустоту.
+    """
+    if di is None:
+        return "Реклама (Deep Analysis):\n— данные ещё не собраны; запустите /deep_direct для обновления."
+
+    lines = [f"Реклама — запросы ({di.period_label}):"]
+
+    if not di.has_registration_attribution:
+        lines.append(f"⚠ {di.registration_attribution_note}")
+
+    # Winners
+    if di.winners:
+        lines.append(f"\nWinners ({len(di.winners)}):")
+        for q in di.winners[:5]:
+            reg_str = f", {q.registrations} рег." if q.registrations is not None else ""
+            lines.append(f"  ✓ «{q.query}» — {q.clicks} кл., {q.cost:.0f} ₽{reg_str}")
+    # Watch
+    if di.watch:
+        top_watch = [w for w in di.watch if w.cost > 0][:5]
+        if top_watch:
+            lines.append(f"\nWatch (наблюдать, {len(di.watch)} запросов, топ по расходу):")
+            for q in top_watch:
+                lines.append(f"  ~ «{q.query}» — {q.clicks} кл., {q.cost:.0f} ₽")
+
+    # Safe negatives
+    if di.safe_negatives:
+        lines.append(f"\nБезопасные минус-фразы ({len(di.safe_negatives)}):")
+        for q in di.safe_negatives[:5]:
+            lines.append(f"  ✗ «{q.query}» — {q.reason}")
+        if len(di.safe_negatives) > 5:
+            lines.append(f"  ... и ещё {len(di.safe_negatives) - 5}")
+
+    if di.total_queries_analyzed > 0:
+        lines.append(
+            f"\nВсего запросов проанализировано: {di.total_queries_analyzed} "
+            f"/ расход: {di.total_spend:.0f} ₽ / клики: {di.total_clicks}"
+        )
+
+    if di.missing_data:
+        lines.append(f"Не хватает для атрибуции: {', '.join(di.missing_data)}")
+
+    return "\n".join(lines)
+
+
+def _format_spend_gate_block(di: DirectIntelligenceResult | None) -> str | None:
+    """Форматирует блок 'Защита бюджета' из DirectIntelligenceResult."""
+    if di is None or di.spend_gate is None:
+        return None
+
+    sg = di.spend_gate
+    verdict_labels = {
+        SpendGateVerdict.CONTROLLED_SPEND_OK: "✓ Расход обоснован",
+        SpendGateVerdict.DO_NOT_SCALE: "⚠ Не масштабировать",
+        SpendGateVerdict.MONETIZATION_NOT_PROVEN: "⚠ Монетизация не доказана",
+        SpendGateVerdict.PAUSE_RECOMMENDED: "✗ Рекомендована пауза",
+    }
+    label = verdict_labels.get(sg.verdict, sg.verdict.value)
+
+    lines = [
+        f"Защита бюджета: {label}",
+        sg.explanation,
+    ]
+    return "\n".join(lines)
+
+
+def _format_action_items_block(di: DirectIntelligenceResult | None) -> str | None:
+    """Форматирует блок 'Что сделать / Кому задача' из action items."""
+    if di is None or not di.action_items:
+        return None
+
+    type_labels = {
+        ActionType.ADS_ACTION_SUGGESTED: "📢 Реклама",
+        ActionType.PRODUCT_ACTION_SUGGESTED: "🛠 Продукт",
+        ActionType.PAYMENT_ACTION_SUGGESTED: "💳 Оплата",
+        ActionType.DO_NOT_TOUCH: "🚫 Не трогать",
+        ActionType.WAIT_FOR_DATA: "⏳ Ждать данных",
+    }
+
+    # Группируем по типу, убираем дубли по description
+    seen: set[str] = set()
+    by_type: dict[ActionType, list] = {}
+    for ai in di.action_items:
+        if ai.description in seen:
+            continue
+        seen.add(ai.description)
+        by_type.setdefault(ai.action_type, []).append(ai)
+
+    lines = ["Что сделать / Кому задача:"]
+    for action_type in [
+        ActionType.ADS_ACTION_SUGGESTED,
+        ActionType.PRODUCT_ACTION_SUGGESTED,
+        ActionType.PAYMENT_ACTION_SUGGESTED,
+        ActionType.DO_NOT_TOUCH,
+        ActionType.WAIT_FOR_DATA,
+    ]:
+        items = by_type.get(action_type, [])
+        if not items:
+            continue
+        label = type_labels[action_type]
+        for ai in items:
+            lines.append(f"{label}: {ai.description}")
+
+    if len(lines) == 1:
+        return None
+    return "\n".join(lines)
+
+
+
+
+
 def _format_payment_path_block(payment_path: dict | None) -> str | None:
     """
     Форматирует блок "Путь до оплаты" из данных payment-path diagnostics endpoint.
@@ -638,6 +758,7 @@ def build_owner_report(
     previous_metrics: dict | None = None,
     deep_diagnostics: dict | None = None,
     payment_path_diagnostics: dict | None = None,
+    direct_intelligence: DirectIntelligenceResult | None = None,
     period_label: str = "7д",
     preface: str | None = None,
 ) -> str | None:
@@ -669,6 +790,21 @@ def build_owner_report(
 
     blocks.append("Что не трогать:\n" + "\n".join(f"— {item}." for item in decision.do_not_touch))
     blocks.append(_format_direct_decision_layer(deep_diagnostics))
+
+    # Блок рекламной аналитики из Direct Intelligence (cached snapshot)
+    di_block = _format_direct_intelligence_block(direct_intelligence)
+    if di_block:
+        blocks.append(di_block)
+
+    # Блок защиты бюджета
+    spend_gate_block = _format_spend_gate_block(direct_intelligence)
+    if spend_gate_block:
+        blocks.append(spend_gate_block)
+
+    # Action items: Ads / Product / Payment / Do Not Touch
+    action_items_block = _format_action_items_block(direct_intelligence)
+    if action_items_block:
+        blocks.append(action_items_block)
 
     # Блок "Путь до оплаты" -- только если данные доступны
     payment_path_block = _format_payment_path_block(payment_path_diagnostics)
