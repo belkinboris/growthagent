@@ -454,8 +454,8 @@ def _format_metrics_line(metrics: NormalizedMetrics) -> str:
 def _format_direct_intelligence_block(di: "DirectIntelligenceResult | None") -> str | None:
     """
     Форматирует блок 'Реклама' из DirectIntelligenceResult.
-    Если данных нет — возвращает однострочную пометку, не None,
-    чтобы владелец видел что данные недоступны, а не просто пустоту.
+    Владельческий формат: max 3–5 строк на категорию, короткий итог.
+    Если данных нет — однострочная пометка.
     """
     if di is None:
         return (
@@ -467,8 +467,14 @@ def _format_direct_intelligence_block(di: "DirectIntelligenceResult | None") -> 
 
     lines = [f"Реклама — запросы ({di.period_label}):"]
 
+    # Честная заметка об attribution — без обещания что GoalId это решит
     if not di.has_registration_attribution:
-        lines.append(f"⚠ {di.registration_attribution_note}")
+        lines.append(
+            "— атрибуция регистраций к поисковым запросам через Direct API недоступна "
+            "(SEARCH_QUERY_PERFORMANCE_REPORT не поддерживает per-query goal attribution). "
+            "Анализ основан на семантике, расходе и кликах; "
+            "общие регистрации берём из backend product metrics."
+        )
 
     # Winners
     if di.winners:
@@ -476,30 +482,45 @@ def _format_direct_intelligence_block(di: "DirectIntelligenceResult | None") -> 
         for q in di.winners[:5]:
             reg_str = f", {q.registrations} рег." if q.registrations is not None else ""
             lines.append(f"  ✓ «{q.query}» — {q.clicks} кл., {q.cost:.0f} ₽{reg_str}")
-    # Watch
-    if di.watch:
-        top_watch = [w for w in di.watch if w.cost > 0][:5]
-        if top_watch:
-            lines.append(f"\nWatch (наблюдать, {len(di.watch)} запросов, топ по расходу):")
-            for q in top_watch:
-                lines.append(f"  ~ «{q.query}» — {q.clicks} кл., {q.cost:.0f} ₽")
+    else:
+        lines.append(
+            "\nWinners: winner по регистрациям на query-уровне сейчас определить нельзя — "
+            "per-query attribution ограничена. Общий Direct-трафик даёт регистрации."
+        )
 
-    # Safe negatives
+    # Safe negatives — топ-5, остальное числом
     if di.safe_negatives:
         lines.append(f"\nБезопасные минус-фразы ({len(di.safe_negatives)}):")
         for q in di.safe_negatives[:5]:
-            lines.append(f"  ✗ «{q.query}» — {q.reason}")
+            lines.append(f"  ✗ «{q.query}» ({q.reason})")
         if len(di.safe_negatives) > 5:
-            lines.append(f"  ... и ещё {len(di.safe_negatives) - 5}")
+            lines.append(f"  ... ещё {len(di.safe_negatives) - 5}. Полный список через /deep_direct.")
+    else:
+        lines.append("\nМусорных запросов с достаточным сигналом не найдено.")
 
+    # Watch — только топ-5 по расходу
+    top_watch = [w for w in di.watch if w.cost > 0][:5]
+    if top_watch:
+        watch_total = len(di.watch)
+        lines.append(f"\nWatch (топ-5 из {watch_total} по расходу):")
+        for q in top_watch:
+            lines.append(f"  ~ «{q.query}» — {q.clicks} кл., {q.cost:.0f} ₽")
+
+    # Do not touch — топ-3
+    if di.do_not_touch:
+        top_dnt = di.do_not_touch[:3]
+        lines.append(f"\nЗащищённые (не минусовать, {len(di.do_not_touch)} запросов):")
+        for q in top_dnt:
+            lines.append(f"  🛡 «{q.query}»")
+        if len(di.do_not_touch) > 3:
+            lines.append(f"  ... ещё {len(di.do_not_touch) - 3}")
+
+    # Итог
     if di.total_queries_analyzed > 0:
         lines.append(
-            f"\nВсего запросов проанализировано: {di.total_queries_analyzed} "
-            f"/ расход: {di.total_spend:.0f} ₽ / клики: {di.total_clicks}"
+            f"\nИтого: {di.total_queries_analyzed} запросов / "
+            f"{di.total_spend:.0f} ₽ / {di.total_clicks} кликов."
         )
-
-    if di.missing_data:
-        lines.append(f"Не хватает для атрибуции: {', '.join(di.missing_data)}")
 
     return "\n".join(lines)
 
@@ -525,48 +546,92 @@ def _format_spend_gate_block(di: DirectIntelligenceResult | None) -> str | None:
     return "\n".join(lines)
 
 
-def _format_action_items_block(di: DirectIntelligenceResult | None) -> str | None:
-    """Форматирует блок 'Что сделать / Кому задача' из action items."""
-    if di is None or not di.action_items:
-        return None
-
+def _format_action_items_block(
+    di: "DirectIntelligenceResult | None",
+    metrics: "NormalizedMetrics | None" = None,
+    payment_path: dict | None = None,
+) -> str | None:
+    """
+    Форматирует блок 'Что сделать сегодня'.
+    Если DI есть — берём action items из него.
+    Если DI нет — формируем дефолтные из метрик и payment_path.
+    Всегда включает блок 'Что не трогать'.
+    """
     type_labels = {
-        ActionType.ADS_ACTION_SUGGESTED: "📢 Реклама",
-        ActionType.PRODUCT_ACTION_SUGGESTED: "🛠 Продукт",
-        ActionType.PAYMENT_ACTION_SUGGESTED: "💳 Оплата",
-        ActionType.DO_NOT_TOUCH: "🚫 Не трогать",
-        ActionType.WAIT_FOR_DATA: "⏳ Ждать данных",
+        ActionType.ADS_ACTION_SUGGESTED:     "📢 Реклама",
+        ActionType.PRODUCT_ACTION_SUGGESTED:  "🛠 Продукт",
+        ActionType.PAYMENT_ACTION_SUGGESTED:  "💳 Оплата",
+        ActionType.DO_NOT_TOUCH:              "🚫 Не трогать",
+        ActionType.WAIT_FOR_DATA:             "⏳ Ждать данных",
     }
 
-    # Группируем по типу, убираем дубли по description
     seen: set[str] = set()
     by_type: dict[ActionType, list] = {}
-    for ai in di.action_items:
-        if ai.description in seen:
-            continue
-        seen.add(ai.description)
-        by_type.setdefault(ai.action_type, []).append(ai)
 
-    lines = ["Что сделать / Кому задача:"]
+    def _add(action_type: ActionType, description: str) -> None:
+        if description not in seen:
+            seen.add(description)
+            by_type.setdefault(action_type, []).append(description)
+
+    # Берём action items из DI если есть
+    if di and di.action_items:
+        for ai in di.action_items:
+            _add(ai.action_type, ai.description)
+
+    # Дополняем из payment_path и метрик
+    if metrics is not None:
+        payment_started = int(metrics.payment_started or 0)
+        payment_success = int(metrics.payment_success or 0)
+
+        # Ads: если safe negatives есть из DI — уже в action_items
+        if not di or not di.safe_negatives:
+            _add(ActionType.ADS_ACTION_SUGGESTED, "Не менять резко ставки/бюджет/кампании — реклама даёт регистрации")
+
+        # Product: payment_path сигнал
+        pricing_viewed = None
+        if payment_path:
+            pricing_viewed = payment_path.get("pricing_viewed")
+        if pricing_viewed is not None and isinstance(pricing_viewed, int) and pricing_viewed < 5:
+            _add(ActionType.PRODUCT_ACTION_SUGGESTED,
+                 "Проверить путь от генерации поста к тарифному экрану/paywall — мало пользователей его открывают")
+
+        # Payment
+        if payment_started == 0 and payment_success == 0:
+            _add(ActionType.PAYMENT_ACTION_SUGGESTED,
+                 "Payment flow не чинить: нет попыток оплаты — YooKassa/шлюз пока вне зоны проверки")
+        elif payment_started > 0 and payment_success == 0:
+            _add(ActionType.PAYMENT_ACTION_SUGGESTED,
+                 "Проверить YooKassa логи по начатым оплатам — есть попытки без успеха")
+
+        # Wait for data
+        _add(ActionType.WAIT_FOR_DATA, "Собрать больше payment-path событий (pricing_viewed, payment_cta_clicked)")
+
+    # Do not touch — всегда добавляем базовый набор
+    for item in [
+        "Ставки, бюджет, кампании — реклама работает",
+        "Цены, тарифы, free quota",
+        "Лендинг — без доказанного узкого места",
+    ]:
+        _add(ActionType.DO_NOT_TOUCH, item)
+
+    lines = ["Что сделать сегодня:"]
     for action_type in [
         ActionType.ADS_ACTION_SUGGESTED,
         ActionType.PRODUCT_ACTION_SUGGESTED,
         ActionType.PAYMENT_ACTION_SUGGESTED,
-        ActionType.DO_NOT_TOUCH,
         ActionType.WAIT_FOR_DATA,
+        ActionType.DO_NOT_TOUCH,
     ]:
         items = by_type.get(action_type, [])
         if not items:
             continue
         label = type_labels[action_type]
-        for ai in items:
-            lines.append(f"{label}: {ai.description}")
+        for desc in items[:3]:  # max 3 на тип
+            lines.append(f"{label}: {desc}")
 
     if len(lines) == 1:
         return None
     return "\n".join(lines)
-
-
 
 
 
@@ -807,7 +872,11 @@ def build_owner_report(
         blocks.append(spend_gate_block)
 
     # Action items: Ads / Product / Payment / Do Not Touch
-    action_items_block = _format_action_items_block(direct_intelligence)
+    action_items_block = _format_action_items_block(
+        direct_intelligence,
+        metrics=metrics,
+        payment_path=payment_path_diagnostics,
+    )
     if action_items_block:
         blocks.append(action_items_block)
 

@@ -707,8 +707,10 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
         cpa = (spend / signups) if signups and spend else None
 
         lines.append(
-            "Гранулярный отчёт Директа по группам и поисковым запросам сейчас не готов. "
-            f"Показываю быстрый fallback по последнему сохранённому замеру от {cache_time}."
+            "Legacy granular отчёт Директа по группам не готов "
+            f"(последний сохранённый замер от {cache_time}). "
+            "Новый Direct Intelligence по поисковым запросам обновляется отдельно через /deep_direct "
+            "и будет использован в следующем /run."
         )
         lines.append("")
         lines.append("Что известно по рекламе за 7 дней:")
