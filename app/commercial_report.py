@@ -564,8 +564,8 @@ def build_funnel_report(
         deltas: list[str] = []
         pairs = [
             (signup, _n(prev_metrics.signup), "регистраций"),
-            (activation_1, _n(prevmetrics.activation1), "каналов"),
-            (activation_2, _n(prevmetrics.activation2), "генераций"),
+            (activation_1, _n(prev_metrics.activation_1), "каналов"),
+            (activation_2, _n(prev_metrics.activation_2), "генераций"),
             (pp_success, _n(prev_metrics.payment_success), "оплат"),
         ]
         for cur, prv, label in pairs:

@@ -705,11 +705,26 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if payment_path_outcome["status"] == "ok":
                 result.payment_path_diagnostics = payment_path_outcome["result"]
                 result.payment_path_diagnostics["_from_cache"] = False
-                # Сохраняем в кэш — чтобы fallback /run тоже мог показать payment-path блок
+                # Сохраняем в кэш — чтобы fallback /run тоже мог показать payment-path блок.
+                # Очищаем datetime объекты — JSON column не принимает нативные datetime.
                 try:
+                    import json as _json
+                    from datetime import datetime as _dt
+
+                    def _make_json_safe(obj):
+                        """Рекурсивно конвертируем datetime → isoformat строку."""
+                        if isinstance(obj, dict):
+                            return {k: _make_json_safe(v) for k, v in obj.items()}
+                        if isinstance(obj, list):
+                            return [_make_json_safe(v) for v in obj]
+                        if isinstance(obj, _dt):
+                            return obj.isoformat()
+                        return obj
+
+                    safe_payload = _make_json_safe(result.payment_path_diagnostics)
                     save_diagnostics_cache(
                         session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY,
-                        "live_run", result.payment_path_diagnostics, ok=True,
+                        "live_run", safe_payload, ok=True,
                     )
                     logger.info(
                         "Payment-path diagnostics cached (project_id=%s, key=%s)",
