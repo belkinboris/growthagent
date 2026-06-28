@@ -717,15 +717,27 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # Direct Intelligence: /run ТОЛЬКО читает последний сохранённый кэш.
         # Тяжёлый Direct granular report НЕ запускается в /run --
         # только через /deep_direct или background refresh.
-        # Если кэш пуст -- result.direct_intelligence = None, owner_report
-        # покажет "данные ещё не собраны; запустите /deep_direct".
+        # Читаем ORM-объект DeepDiagnosticsCache: поля .ok и .result_json,
+        # а НЕ .get("ok")/.get("result") -- это не dict.
         direct_intel_cached = get_cached_diagnostics(
             session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
         )
-        if direct_intel_cached is not None and direct_intel_cached.get("ok"):
-            result.direct_intelligence = direct_intel_cached.get("result")
+        if direct_intel_cached is not None and direct_intel_cached.ok:
+            result.direct_intelligence = dict(direct_intel_cached.result_json or {})
+            logger.info(
+                "Direct Intelligence cache read ok (project_id=%s, rows=%s, cache_key=%s)",
+                project.id,
+                (direct_intel_cached.result_json or {}).get("total_queries_analyzed", "?"),
+                DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
+            )
         else:
             result.direct_intelligence = None
+            logger.info(
+                "Direct Intelligence cache miss (project_id=%s, cache_key=%s, found=%s)",
+                project.id,
+                DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
+                direct_intel_cached is not None,
+            )
 
         return result
 

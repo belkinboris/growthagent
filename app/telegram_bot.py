@@ -40,6 +40,7 @@ from app.service import (
     AlertChange,
     AlertChangeType,
     CycleResult,
+    DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
     extract_normalized_metrics_from_snapshot,
     get_cached_diagnostics,
 )
@@ -1803,6 +1804,7 @@ def _format_cached_business_report(
     *,
     reason: str,
     deep_diagnostics: dict | None = None,
+    direct_intelligence_dict: dict | None = None,
 ) -> str:
     metrics = _normalized_metrics_from_snapshot(snapshot)
     raw = snapshot.metrics_json or {}
@@ -1819,12 +1821,15 @@ def _format_cached_business_report(
             f"отчёт по последнему сохранённому замеру от {_format_dt(snapshot.created_at)}."
         )
 
+    di = _deserialize_direct_intelligence(direct_intelligence_dict)
+
     report = build_owner_report(
         project_name,
         metrics,
         source_statuses=source_statuses,
         previous_metrics=None,
         deep_diagnostics=deep_diagnostics,
+        direct_intelligence=di,
         period_label="7д",
         preface=preface,
     )
@@ -1849,11 +1854,34 @@ def _build_cached_cycle_response(reason: str) -> str | None:
         snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
         if snapshot is None or not _snapshot_has_product_metrics(snapshot):
             return None
+        # Legacy deep_direct кэш (ad_group / query level diagnostics)
         cached_direct = get_cached_diagnostics(session, project.id, "7d")
         deep_diagnostics = dict(cached_direct.result_json or {}) if cached_direct is not None else None
         if deep_diagnostics is not None:
             deep_diagnostics["_from_cache"] = True
-        return _format_cached_business_report(project.name, snapshot, reason=reason, deep_diagnostics=deep_diagnostics)
+        # Direct Intelligence кэш -- читаем отдельно, с правильным ключом
+        # и правильным доступом к ORM-полям (.ok, .result_json)
+        di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
+        di_dict: dict | None = None
+        if di_cached is not None and di_cached.ok:
+            di_dict = dict(di_cached.result_json or {})
+            logger.info(
+                "Fallback /run: Direct Intelligence cache read ok (project_id=%s, rows=%s)",
+                project.id,
+                di_dict.get("total_queries_analyzed", "?"),
+            )
+        else:
+            logger.info(
+                "Fallback /run: Direct Intelligence cache miss (project_id=%s, found=%s)",
+                project.id,
+                di_cached is not None,
+            )
+        return _format_cached_business_report(
+            project.name, snapshot,
+            reason=reason,
+            deep_diagnostics=deep_diagnostics,
+            direct_intelligence_dict=di_dict,
+        )
 
 
 def _build_cycle_response(result: CycleResult, started_at: datetime | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
