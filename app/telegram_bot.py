@@ -2241,12 +2241,93 @@ async def _send_deep_direct_result(chat_id: int, bot, deep_result: dict, project
         await _send_long_message(bot, chat_id, details_text)
 
 
+def _format_intel_status_note(status: str, error: str | None, rows: int) -> str | None:
+    """Короткая заметка о статусе Direct Intelligence для отправки после /deep_direct."""
+    if status == "ok":
+        return f"Direct Intelligence: обновлён ✓ ({rows} запросов проанализировано). Следующий /run покажет блок рекламы."
+    if status == "not_started":
+        return None
+    if status == "no_project":
+        return "Direct Intelligence: проект не найден, кэш не обновлён."
+    if status == "timeout":
+        return f"Direct Intelligence: таймаут ({error}). Кэш не обновлён. Попробуйте /deep_direct позже."
+    if status in ("error", "exception"):
+        return f"Direct Intelligence: ошибка — {error}. Кэш не обновлён."
+    return None
+
+
 async def _deep_direct_background(chat_id: int, bot, project_id: int | None, started_at: datetime) -> None:
     global _deep_direct_task, _deep_direct_started_at
 
     current_task = asyncio.current_task()
     logger.info("Manual /deep_direct started (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
 
+    # --- Direct Intelligence: запускаем ВСЕГДА, до legacy deep_direct ---
+    # Ключевое: старый granular deep diagnostics может падать/таймаутиться,
+    # но Direct Intelligence (search query classifier) обновляется независимо.
+    intel_status = "not_started"
+    intel_error: str | None = None
+    intel_rows = 0
+
+    try:
+        from app.scheduler import run_direct_intelligence_for_project
+        from app.config import get_settings as _get_settings
+        _settings = _get_settings()
+        with get_session() as _session:
+            _project = _session.get(Project, project_id) if project_id is not None else _get_active_project(_session)
+
+        if _project is None:
+            intel_status = "no_project"
+            logger.warning("Direct Intelligence: project not found (project_id=%s)", project_id)
+        else:
+            logger.info(
+                "Direct Intelligence starting (build=%s, chat_id=%s, project_id=%s)",
+                BUILD_MARKER, chat_id, _project.id,
+            )
+            intel_result = await asyncio.wait_for(
+                run_direct_intelligence_for_project(
+                    _project, _settings,
+                    period_hours=7 * 24,
+                ),
+                timeout=MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+            )
+            if intel_result.get("status") == "ok":
+                result_data = intel_result.get("result") or {}
+                intel_rows = result_data.get("total_queries_analyzed", 0)
+                intel_status = "ok"
+                logger.info(
+                    "Direct Intelligence cached (build=%s, chat_id=%s, project_id=%s, rows=%s, cache_key=direct_intelligence_24h)",
+                    BUILD_MARKER, chat_id, _project.id, intel_rows,
+                )
+            elif intel_result.get("status") == "not_configured":
+                intel_status = "not_started"
+                logger.info(
+                    "Direct Intelligence not_configured (build=%s, chat_id=%s) — no oauth_token/client_login",
+                    BUILD_MARKER, chat_id,
+                )
+            else:
+                intel_status = "error"
+                intel_error = intel_result.get("error") or "unknown"
+                logger.warning(
+                    "Direct Intelligence failed (build=%s, chat_id=%s, status=%s, error=%s)",
+                    BUILD_MARKER, chat_id, intel_result.get("status"), intel_error,
+                )
+    except asyncio.TimeoutError:
+        intel_status = "timeout"
+        intel_error = f"timeout after {MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS:.0f}s"
+        logger.warning(
+            "Direct Intelligence timeout (build=%s, chat_id=%s, timeout=%.1f)",
+            BUILD_MARKER, chat_id, MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        intel_status = "exception"
+        intel_error = str(exc)
+        logger.exception(
+            "Direct Intelligence unexpected error (build=%s, chat_id=%s): %s",
+            BUILD_MARKER, chat_id, exc,
+        )
+
+    # --- Legacy granular deep diagnostics (ad_group + search_query) ---
     try:
         from app.scheduler import force_refresh_deep_diagnostics_sync_with_timeout
 
@@ -2264,48 +2345,18 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
                 project = session.get(Project, project_id) if project_id is not None else _get_active_project(session)
                 project_name = project.name if project else "Проект"
 
-            # Параллельно запускаем Direct Intelligence (classify_search_queries)
-            # и сохраняем в кэш для следующего /run.
-            # Не блокируем отправку результата /deep_direct если intelligence упадёт.
-            try:
-                from app.scheduler import run_direct_intelligence_for_project
-                from app.config import get_settings as _get_settings
-                _settings = _get_settings()
-                with get_session() as _session:
-                    _project = _session.get(Project, project_id) if project_id is not None else _get_active_project(_session)
-                if _project is not None:
-                    intel_result = await asyncio.wait_for(
-                        run_direct_intelligence_for_project(
-                            _project, _settings,
-                            period_hours=7 * 24,  # 7д
-                        ),
-                        timeout=MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
-                    )
-                    if intel_result.get("status") == "ok":
-                        logger.info(
-                            "Direct Intelligence cached after /deep_direct (build=%s, chat_id=%s)",
-                            BUILD_MARKER, chat_id,
-                        )
-                    else:
-                        logger.warning(
-                            "Direct Intelligence failed after /deep_direct: %s",
-                            intel_result.get("error"),
-                        )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Direct Intelligence timeout after %.1f sec in _deep_direct_background (build=%s, chat_id=%s)",
-                    MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS, BUILD_MARKER, chat_id,
-                )
-            except Exception as exc:
-                logger.warning("Direct Intelligence error in _deep_direct_background: %s", exc)
-
             await _send_deep_direct_result(chat_id, bot, refresh_result["result"], project_name)
             logger.info(
-                "Manual /deep_direct finished (build=%s, chat_id=%s, elapsed=%.1f sec)",
-                BUILD_MARKER,
-                chat_id,
+                "Manual /deep_direct finished (build=%s, chat_id=%s, intel=%s, elapsed=%.1f sec)",
+                BUILD_MARKER, chat_id, intel_status,
                 (datetime.now(timezone.utc) - started_at).total_seconds(),
             )
+            intel_note = _format_intel_status_note(intel_status, intel_error, intel_rows)
+            if intel_note:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=intel_note)
+                except Exception:
+                    pass
             return
 
         logger.warning(
@@ -2316,20 +2367,24 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             refresh_result.get("error"),
         )
         cached_result, project_name = await asyncio.to_thread(_get_best_deep_direct_fallback_sync, project_id)
+        intel_note = _format_intel_status_note(intel_status, intel_error, intel_rows)
         if cached_result is not None:
             logger.info("Manual /deep_direct cached/summary fallback used (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
             await _send_deep_direct_result(chat_id, bot, cached_result, project_name)
         else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Глубокая диагностика Директа сейчас не завершилась.\n\n"
-                    f"Причина: {refresh_result.get('error') or 'источник не ответил вовремя'}.\n\n"
-                    "Нет ни granular-кэша, ни последнего агрегированного замера Директа, "
-                    "поэтому показать полезный fallback не могу. Обычный /run и /funnel продолжают работать; "
-                    "попробуйте /deep_direct позже."
-                ),
+            error_text = (
+                "Глубокая диагностика Директа сейчас не завершилась.\n\n"
+                f"Причина: {refresh_result.get('error') or 'источник не ответил вовремя'}.\n\n"
+                "Нет ни granular-кэша, ни последнего агрегированного замера Директа, "
+                "поэтому показать полезный fallback не могу. Обычный /run и /funnel продолжают работать; "
+                "попробуйте /deep_direct позже."
             )
+            await bot.send_message(chat_id=chat_id, text=error_text)
+        if intel_note:
+            try:
+                await bot.send_message(chat_id=chat_id, text=intel_note)
+            except Exception:
+                pass
         logger.info("Manual /deep_direct final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
     except asyncio.TimeoutError:
         logger.warning(
@@ -2338,6 +2393,7 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             BUILD_MARKER,
             chat_id,
         )
+        intel_note = _format_intel_status_note(intel_status, intel_error, intel_rows)
         cached_result, project_name = await asyncio.to_thread(_get_best_deep_direct_fallback_sync, project_id)
         if cached_result is not None:
             logger.info("Manual /deep_direct cached/summary fallback used after outer timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
@@ -2351,6 +2407,11 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
                     "Бот не заблокирован: /ping, /status, /run и /funnel должны отвечать."
                 ),
             )
+        if intel_note:
+            try:
+                await bot.send_message(chat_id=chat_id, text=intel_note)
+            except Exception:
+                pass
         logger.info("Manual /deep_direct final timeout message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
     except asyncio.CancelledError:
         logger.warning("Manual /deep_direct task cancelled (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
@@ -2378,6 +2439,7 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             if _deep_direct_task is current_task:
                 _deep_direct_task = None
                 _deep_direct_started_at = None
+
 
 
 async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

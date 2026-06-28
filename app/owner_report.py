@@ -451,14 +451,19 @@ def _format_metrics_line(metrics: NormalizedMetrics) -> str:
     ])
 
 
-def _format_direct_intelligence_block(di: DirectIntelligenceResult | None) -> str | None:
+def _format_direct_intelligence_block(di: "DirectIntelligenceResult | None") -> str | None:
     """
     Форматирует блок 'Реклама' из DirectIntelligenceResult.
     Если данных нет — возвращает однострочную пометку, не None,
     чтобы владелец видел что данные недоступны, а не просто пустоту.
     """
     if di is None:
-        return "Реклама (Deep Analysis):\n— данные ещё не собраны; запустите /deep_direct для обновления."
+        return (
+            "Реклама (Deep Analysis):\n"
+            "— данные ещё не собраны; запустите /deep_direct для обновления.\n"
+            "— если /deep_direct уже запускался и не помог, проверьте Railway logs "
+            "на строку 'Direct Intelligence cached' или 'Direct Intelligence failed'."
+        )
 
     lines = [f"Реклама — запросы ({di.period_label}):"]
 
