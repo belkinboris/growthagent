@@ -812,9 +812,17 @@ class TestGarbageOverridesProtected:
         assert r.label != QueryLabel.SAFE_NEGATIVE
 
     def test_autoposting_with_context_not_negative(self):
-        """'автопостинг по группам без премиума тг' — неоднозначно, но не safe_negative."""
+        """'автопостинг по группам без премиума тг' — массовый постинг/обход, должен быть watch или safe_negative."""
         r = classify_query("автопостинг по группам без премиума тг", clicks=10, cost=150.0)
-        assert r.label != QueryLabel.SAFE_NEGATIVE
+        # Это интент обхода ограничений, а не core AI-постинг — не должен быть do_not_touch
+        assert r.label != QueryLabel.DO_NOT_TOUCH, \
+            "Запрос с обходом ограничений не должен быть в 'Что оставить'"
+
+    def test_autoposting_bypass_is_watch_or_negative(self):
+        """'постинг по группам без премиума' с достаточным расходом — safe_negative."""
+        r = classify_query("постинг по группам без премиума", clicks=10, cost=150.0)
+        assert r.label in (QueryLabel.SAFE_NEGATIVE, QueryLabel.WATCH), \
+            f"Ожидали safe_negative или watch, получили {r.label}"
 
     def test_bot_for_posts_not_negative(self):
         """'бот для постов в телеграм' — do_not_touch."""
