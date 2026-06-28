@@ -142,7 +142,7 @@ def build_run_report(
     MIN_PRICING_FOR_CONCLUSION = 5
 
     # ── Главный вывод ────────────────────────────────────────────────────
-    lines.append("\n🎯 *Главный вывод:*")
+    lines.append("\n🎯 Главный вывод:")
     if signup == 0:
         lines.append(
             "Регистраций пока нет. Реклама только запущена или ещё не приводит пользователей."
@@ -181,7 +181,7 @@ def build_run_report(
         )
 
     # ── Что сейчас не так ────────────────────────────────────────────────
-    lines.append("\n❗ *Что сейчас не так:*")
+    lines.append("\n❗ Что сейчас не так:")
     issues: list[str] = []
 
     if signup > 0 and activation_1 < signup * 0.5:
@@ -240,7 +240,7 @@ def build_run_report(
         lines.append(f"— {issue}")
 
     # ── Что сделать сегодня ───────────────────────────────────────────────
-    lines.append("\n✅ *Что сделать сегодня:*")
+    lines.append("\n✅ Что сделать сегодня:")
 
     # Product
     if activation_1 > 0 and not pricing_viewed_tracked:
@@ -260,7 +260,7 @@ def build_run_report(
         )
     else:
         product_action = "Следить за воронкой, собирать данные по пути к оплате."
-    lines.append(f"— 🛠 *Продукт:* {product_action}")
+    lines.append(f"— 🛠 Продукт: {product_action}")
 
     # Ads
     if safe_negs:
@@ -270,7 +270,7 @@ def build_run_report(
         )
     else:
         ads_action = "Не менять ставки и бюджет резко. Очевидного рекламного мусора сейчас не видно."
-    lines.append(f"— 📢 *Реклама:* {ads_action}")
+    lines.append(f"— 📢 Реклама: {ads_action}")
 
     # Payment
     if pp_payment_started == 0:
@@ -279,19 +279,19 @@ def build_run_report(
         payment_action = "Проверить платёжный шлюз: есть попытки оплаты без успеха."
     else:
         payment_action = "Платёжная воронка работает. Следить за качеством."
-    lines.append(f"— 💳 *Оплата:* {payment_action}")
+    lines.append(f"— 💳 Оплата: {payment_action}")
 
     # Data
-    lines.append("— 📈 *Данные:* продолжать собирать события по тарифам и оплате.")
+    lines.append("— 📈 Данные: продолжать собирать события по тарифам и оплате.")
 
     # ── Что не трогать ───────────────────────────────────────────────────
-    lines.append("\n🚫 *Что не трогать:*")
+    lines.append("\n🚫 Что не трогать:")
     do_not_touch = ["цены", "тарифы", "бесплатная квота", "лендинг", "рекламный бюджет", "ставки"]
     for item in do_not_touch:
         lines.append(f"— {item}")
 
     # ── Ключевые числа ───────────────────────────────────────────────────
-    lines.append("\n📊 *Ключевые числа:*")
+    lines.append("\n📊 Ключевые числа:")
     if clicks:
         lines.append(f"— {clicks} кликов из рекламы")
     reg_word = _plural(signup, "регистрация", "регистрации", "регистраций")
@@ -307,7 +307,7 @@ def build_run_report(
         lines.append(f"— {spend:.0f} ₽ потрачено на рекламу")
 
     # ── Уверенность ──────────────────────────────────────────────────────
-    lines.append("\n🔍 *Уверенность:*")
+    lines.append("\n🔍 Уверенность:")
     if signup > 5:
         lines.append("— реклама даёт регистрации: средняя/высокая")
     else:
@@ -326,7 +326,7 @@ def build_run_report(
         lines.append("— нужно настроить отслеживание тарифов: высокая")
 
     # ── Итог ─────────────────────────────────────────────────────────────
-    lines.append("\n💡 *Итог:*")
+    lines.append("\n💡 Итог:")
     if activation_1 > 0 and pricing_viewed_tracked and pricing_viewed < MIN_PRICING_FOR_CONCLUSION:
         lines.append(
             "Следующая задача не «чинить оплату» и не «чистить рекламу» — "
@@ -345,7 +345,7 @@ def build_run_report(
         lines.append("Продолжать собирать данные и наблюдать за воронкой.")
 
     # ── Подробности ───────────────────────────────────────────────────────
-    lines.append("\n📋 *Подробности:*")
+    lines.append("\n📋 Подробности:")
     lines.append("— реклама: /ads")
     lines.append("— воронка: /funnel")
     lines.append("— оплата: /pay")
@@ -493,7 +493,8 @@ def build_funnel_report(
     payment_started = _n(metrics.payment_started)
     payment_success = _n(metrics.payment_success)
 
-    pricing_viewed = _n(payment_path.get("pricing_viewed")) if payment_path else None
+    pricing_viewed_raw = payment_path.get("pricing_viewed") if payment_path else None
+    pricing_viewed = _n(pricing_viewed_raw) if pricing_viewed_raw is not None else None
     pp_started = _n(payment_path.get("payment_started")) if payment_path else payment_started
     pp_success = _n(payment_path.get("payment_success")) if payment_path else payment_success
 
@@ -514,7 +515,7 @@ def build_funnel_report(
     lines.append(f"— {pp_success} раз успешно оплатили")
 
     # Вывод
-    lines.append("\n*Вывод:*")
+    lines.append("\nВывод:")
     if signup == 0:
         lines.append("Регистраций пока нет. Смотреть на качество трафика.")
     elif activation_1 == 0:

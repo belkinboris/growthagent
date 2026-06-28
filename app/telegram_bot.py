@@ -49,6 +49,48 @@ from app.owner_report import build_owner_report, format_snapshot_age
 
 logger = logging.getLogger("growth_agent.telegram")
 
+_MAX_MSG_LEN = 4000  # Telegram лимит ~4096, оставляем запас
+
+
+async def safe_reply(update_or_message, text: str, **kwargs) -> None:
+    """
+    Единый helper для отправки owner-facing сообщений.
+    - Plain text без parse_mode (избегаем сырого markdown в Telegram)
+    - Длинные сообщения делит на части
+    - Логирует ошибку отправки, не кидает исключение наружу
+    """
+    # Поддерживаем как update.message, так и объект message напрямую
+    msg = getattr(update_or_message, "message", update_or_message)
+    # kwargs без parse_mode — всегда plain text
+    kwargs.pop("parse_mode", None)
+
+    parts: list[str] = []
+    if len(text) <= _MAX_MSG_LEN:
+        parts = [text]
+    else:
+        # Делим по двойным переносам (абзацы), не посередине слова
+        paragraphs = text.split("\n\n")
+        chunk = ""
+        for para in paragraphs:
+            candidate = (chunk + "\n\n" + para).lstrip("\n")
+            if len(candidate) <= _MAX_MSG_LEN:
+                chunk = candidate
+            else:
+                if chunk:
+                    parts.append(chunk)
+                chunk = para
+        if chunk:
+            parts.append(chunk)
+
+    for i, part in enumerate(parts):
+        try:
+            await msg.reply_text(part, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "safe_reply: failed to send message part %d/%d: %s: %s",
+                i + 1, len(parts), type(exc).__name__, exc,
+            )
+
 
 CONFIDENCE_RU = {
     "low": "данных мало, вывод осторожный",
@@ -61,6 +103,8 @@ SERVICE_STARTED_AT = datetime.now(timezone.utc)
 _manual_run_lock = asyncio.Lock()
 _manual_run_task: asyncio.Task | None = None
 _manual_run_started_at: datetime | None = None
+_last_run_finished_at: datetime | None = None   # когда последний /run завершился
+_last_run_was_live: bool = False                 # был ли последний /run живым сбором
 _deep_direct_lock = asyncio.Lock()
 _deep_direct_task: asyncio.Task | None = None
 _deep_direct_started_at: datetime | None = None
@@ -1495,12 +1539,12 @@ def _manual_run_state_text(now: datetime | None = None) -> str:
 
 def _build_status_text_sync() -> str:
     """
-    Cheap /status payload builder. It reads only local DB state and never calls
-    Direct, Metrika, YooKassa, TruePost, deep diagnostics or run_cycle_once.
-    The async handler wraps this in a short timeout and falls back to an even
-    cheaper response if the DB is temporarily slow.
+    Cheap /status payload builder. Reads only local DB state.
     """
+    from app.commercial_report import _fmt_dt_msk, _MSK
     now = datetime.now(timezone.utc)
+    now_msk = now.astimezone(_MSK)
+
     mode_ru = {
         "watch_only": "наблюдение",
         "recommend_only": "рекомендации",
@@ -1508,16 +1552,38 @@ def _build_status_text_sync() -> str:
         "autopilot_limited": "ограниченный автопилот",
     }
 
+    # Uptime в понятном виде
+    uptime_sec = int((now - SERVICE_STARTED_AT).total_seconds())
+    if uptime_sec < 3600:
+        uptime_str = f"{uptime_sec // 60} мин."
+    elif uptime_sec < 86400:
+        h, m = divmod(uptime_sec // 60, 60)
+        uptime_str = f"{h} ч. {m} мин."
+    else:
+        d, rem = divmod(uptime_sec, 86400)
+        uptime_str = f"{d} дн. {rem // 3600} ч."
+
+    # Последний /run
+    if _last_run_finished_at is not None:
+        run_dt_str = _fmt_dt_msk(_last_run_finished_at)
+        if _last_run_was_live:
+            last_run_line = f"Последний отчёт /run: {run_dt_str} (свежий сбор данных)"
+        else:
+            last_run_line = f"Последний отчёт /run: {run_dt_str} (использован сохранённый замер)"
+    elif _manual_run_task is not None and not _manual_run_task.done():
+        last_run_line = "Отчёт /run: сейчас выполняется..."
+    else:
+        last_run_line = "Отчёт /run: ещё не запускался после перезапуска"
+
     with get_session() as session:
         project = _get_active_project(session)
         if project is None:
             return "\n".join([
-                "Аналитик Воронки — статус",
-                "Проект: активный проект не найден",
+                "Состояние Аналитика Воронки",
                 f"Версия: {BUILD_MARKER}",
-                "Telegram-бот: работает (этот ответ получен)",
-                f"Ручная проверка /run: {_manual_run_state_text(now)}",
-                "Внешние источники: не проверяются внутри /status, чтобы команда отвечала быстро.",
+                "Telegram-бот: работает",
+                last_run_line,
+                "Проект: не найден",
             ])
 
         current_mode = (project.settings_json or {}).get("mode", "watch_only")
@@ -1539,34 +1605,51 @@ def _build_status_text_sync() -> str:
         ).all()
 
         if snapshot is not None:
-            snapshot_line = (
-                f"Последний сохранённый замер: {_format_dt(snapshot.created_at)}, "
-                f"{format_snapshot_age(snapshot.created_at, now)}. Период отчёта: {snapshot.period_key}."
-            )
+            snap_msk = _fmt_dt_msk(snapshot.created_at)
+            age_min = int((now - (snapshot.created_at.replace(tzinfo=timezone.utc)
+                                  if snapshot.created_at.tzinfo is None
+                                  else snapshot.created_at)).total_seconds() / 60)
+            if age_min < 60:
+                freshness = f"{age_min} мин. назад"
+            elif age_min < 1440:
+                freshness = f"{age_min // 60} ч. назад"
+            else:
+                freshness = f"{age_min // 1440} дн. назад"
+            snapshot_line = f"Последний замер данных: {snap_msk} ({freshness})"
         else:
-            snapshot_line = "Последний сохранённый замер: пока не найден."
+            snapshot_line = "Последний замер данных: пока не сохранён (запустите /run)"
+
+        signals_line = (
+            f"Открытых сигналов: {len(open_signal_ids)}"
+            if open_signal_ids else "Активных сигналов: нет"
+        )
 
         return "\n".join([
-            "Аналитик Воронки — статус",
+            "Состояние Аналитика Воронки",
             f"Проект: {project.name}",
             f"Версия: {BUILD_MARKER}",
-            f"Режим бота: {mode_ru.get(current_mode, current_mode)}",
-            "Telegram-бот: работает (этот ответ получен)",
-            f"Ручная проверка /run: {_manual_run_state_text(now)}",
+            f"Режим: {mode_ru.get(current_mode, current_mode)}",
+            f"Работает без перезапуска: {uptime_str}",
+            "",
+            last_run_line,
             snapshot_line,
-            f"Открытых сигналов: {len(open_signal_ids)}",
-            "Внешние источники: не проверяются внутри /status, чтобы команда отвечала быстро. Для отдельных проверок используйте /test_metrika, /test_direct или /run.",
+            signals_line,
+            "",
+            "Технические детали — Railway logs.",
+            "Внешние источники проверяются через /test_metrika, /test_direct или /run.",
         ])
 
 
 def _build_status_fallback_text(reason: str) -> str:
+    from app.commercial_report import _fmt_dt_msk
+    last_run_str = _fmt_dt_msk(_last_run_finished_at) if _last_run_finished_at else "ещё не запускался"
     return "\n".join([
         "Аналитик Воронки — статус",
         f"Версия: {BUILD_MARKER}",
-        "Telegram-бот: работает (этот ответ получен)",
-        f"Ручная проверка /run: {_manual_run_state_text()}",
-        f"Локальная БД статуса временно недоступна или отвечает медленно: {reason}.",
-        "Внешние источники не проверялись. /status остаётся быстрой командой и не вызывает Директ, Метрику, YooKassa или продуктовый API.",
+        "Telegram-бот: работает",
+        f"Последний /run: {last_run_str}",
+        f"База данных статуса временно недоступна: {reason}.",
+        "Для детальной проверки источников используйте /test_metrika, /test_direct.",
     ])
 
 
@@ -1925,6 +2008,9 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
         )
         text, keyboard = _build_cycle_response(result, started_at=started_at)
         await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        global _last_run_finished_at, _last_run_was_live
+        _last_run_finished_at = datetime.now(timezone.utc)
+        _last_run_was_live = True
         logger.info("report generated from fresh/cached/mixed data (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         logger.info("final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         logger.info(
@@ -1947,6 +2033,8 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
             logger.info("cached fallback used after manual /run timeout (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
             logger.info("report generated from cached data (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
             await bot.send_message(chat_id=chat_id, text=fallback_text)
+            _last_run_finished_at = datetime.now(timezone.utc)
+            _last_run_was_live = False
             logger.info("final message sent (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
         else:
             await bot.send_message(
@@ -2116,75 +2204,78 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Продуктовая воронка — быстро из кэша, без внешних API."""
-    from app.commercial_report import build_funnel_report
-    from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
+    try:
+        from app.commercial_report import build_funnel_report
+        from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
 
-    with get_session() as session:
-        project = _get_active_project(session)
-        if project is None:
-            await update.message.reply_text("Активный проект не найден.")
-            return
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
 
-        snapshot = session.exec(
-            select(MetricSnapshot)
-            .where(
-                MetricSnapshot.project_id == project.id,
-                MetricSnapshot.period_key == "7d",
-                MetricSnapshot.source == "combined",
-            )
-            .order_by(MetricSnapshot.created_at.desc())
-            .limit(1)
-        ).first()
+            snapshot = session.exec(
+                select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.project_id == project.id,
+                    MetricSnapshot.period_key == "7d",
+                    MetricSnapshot.source == "combined",
+                )
+                .order_by(MetricSnapshot.created_at.desc())
+                .limit(1)
+            ).first()
 
-        if snapshot is None:
-            await update.message.reply_text(
-                "Данных по воронке пока нет. Запустите /run один раз — "
-                "после этого /funnel будет отвечать быстро."
-            )
-            return
+            if snapshot is None:
+                await safe_reply(update,
+                    "Данных по воронке пока нет. Запустите /run один раз — "
+                    "после этого /funnel будет отвечать быстро."
+                )
+                return
 
-        current = extract_normalized_metrics_from_snapshot(snapshot)
-        from app.rules import NormalizedMetrics
-        metrics_obj = NormalizedMetrics(
-            period_key="7d",
-            signup=current.get("signup"),
-            activation_1=current.get("activation_1"),
-            activation_2=current.get("activation_2"),
-            payment_started=current.get("payment_started"),
-            payment_success=current.get("payment_success"),
-            spend=current.get("spend"),
-            clicks=current.get("clicks"),
-            sources_ok=set(),
-        )
-
-        # Читаем payment_path кэш
-        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
-        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
-
-        prev_snapshot = get_previous_snapshot(session, project.id, "7d")
-        prev_metrics = None
-        if prev_snapshot and prev_snapshot.id != snapshot.id:
-            prev_raw = extract_normalized_metrics_from_snapshot(prev_snapshot)
-            prev_metrics = NormalizedMetrics(
+            current = extract_normalized_metrics_from_snapshot(snapshot)
+            from app.rules import NormalizedMetrics
+            metrics_obj = NormalizedMetrics(
                 period_key="7d",
-                signup=prev_raw.get("signup"),
-                activation_1=prev_raw.get("activation_1"),
-                activation_2=prev_raw.get("activation_2"),
-                payment_started=prev_raw.get("payment_started"),
-                payment_success=prev_raw.get("payment_success"),
+                signup=current.get("signup"),
+                activation_1=current.get("activation_1"),
+                activation_2=current.get("activation_2"),
+                payment_started=current.get("payment_started"),
+                payment_success=current.get("payment_success"),
+                spend=current.get("spend"),
+                clicks=current.get("clicks"),
                 sources_ok=set(),
             )
 
-        project_name = project.name
+            pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
-    text = build_funnel_report(
-        project_name,
-        metrics_obj,
-        payment_path=pp_dict,
-        snapshot_dt=snapshot.created_at,
-        prev_metrics=prev_metrics,
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+            prev_snapshot = get_previous_snapshot(session, project.id, "7d")
+            prev_metrics = None
+            if prev_snapshot and prev_snapshot.id != snapshot.id:
+                prev_raw = extract_normalized_metrics_from_snapshot(prev_snapshot)
+                prev_metrics = NormalizedMetrics(
+                    period_key="7d",
+                    signup=prev_raw.get("signup"),
+                    activation_1=prev_raw.get("activation_1"),
+                    activation_2=prev_raw.get("activation_2"),
+                    payment_started=prev_raw.get("payment_started"),
+                    payment_success=prev_raw.get("payment_success"),
+                    sources_ok=set(),
+                )
+
+            project_name = project.name
+
+        text = build_funnel_report(
+            project_name,
+            metrics_obj,
+            payment_path=pp_dict,
+            snapshot_dt=snapshot.created_at,
+            prev_metrics=prev_metrics,
+        )
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/funnel failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось получить данные по воронке. Технические детали: /status")
 
 
 async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2466,11 +2557,12 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
 
 async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Рекламный вывод из кэша — без внешних API."""
-    from app.commercial_report import build_ads_report
-    from app.service import extract_normalized_metrics_from_snapshot
+    try:
+        from app.commercial_report import build_ads_report
+        from app.service import extract_normalized_metrics_from_snapshot
 
-    with get_session() as session:
-        project = _get_active_project(session)
+        with get_session() as session:
+            project = _get_active_project(session)
         if project is None:
             await update.message.reply_text("Активный проект не найден.")
             return
@@ -2507,64 +2599,71 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         di = _deserialize_direct_intelligence(di_dict)
         project_name = project.name
 
-    text = build_ads_report(
-        project_name,
-        direct_intelligence=di,
-        metrics=metrics_obj,
-        snapshot_dt=snapshot.created_at if snapshot else None,
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text = build_ads_report(
+            project_name,
+            direct_intelligence=di,
+            metrics=metrics_obj,
+            snapshot_dt=snapshot.created_at if snapshot else None,
+        )
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/ads failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось получить рекламные данные. Технические детали: /status")
 
 
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Путь к оплате из кэша — без внешних API."""
-    from app.commercial_report import build_pay_report
-    from app.service import extract_normalized_metrics_from_snapshot
+    try:
+        from app.commercial_report import build_pay_report
+        from app.service import extract_normalized_metrics_from_snapshot
 
-    with get_session() as session:
-        project = _get_active_project(session)
-        if project is None:
-            await update.message.reply_text("Активный проект не найден.")
-            return
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
 
-        snapshot = session.exec(
-            select(MetricSnapshot)
-            .where(
-                MetricSnapshot.project_id == project.id,
-                MetricSnapshot.period_key == "7d",
-                MetricSnapshot.source == "combined",
-            )
-            .order_by(MetricSnapshot.created_at.desc())
-            .limit(1)
-        ).first()
+            snapshot = session.exec(
+                select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.project_id == project.id,
+                    MetricSnapshot.period_key == "7d",
+                    MetricSnapshot.source == "combined",
+                )
+                .order_by(MetricSnapshot.created_at.desc())
+                .limit(1)
+            ).first()
 
-        metrics_obj = None
-        if snapshot:
-            from app.rules import NormalizedMetrics
-            raw = extract_normalized_metrics_from_snapshot(snapshot)
-            metrics_obj = NormalizedMetrics(
-                period_key="7d",
-                signup=raw.get("signup"),
-                activation_1=raw.get("activation_1"),
-                activation_2=raw.get("activation_2"),
-                payment_started=raw.get("payment_started"),
-                payment_success=raw.get("payment_success"),
-                spend=raw.get("spend"),
-                clicks=raw.get("clicks"),
-                sources_ok=set(),
-            )
+            metrics_obj = None
+            if snapshot:
+                from app.rules import NormalizedMetrics
+                raw = extract_normalized_metrics_from_snapshot(snapshot)
+                metrics_obj = NormalizedMetrics(
+                    period_key="7d",
+                    signup=raw.get("signup"),
+                    activation_1=raw.get("activation_1"),
+                    activation_2=raw.get("activation_2"),
+                    payment_started=raw.get("payment_started"),
+                    payment_success=raw.get("payment_success"),
+                    spend=raw.get("spend"),
+                    clicks=raw.get("clicks"),
+                    sources_ok=set(),
+                )
 
-        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
-        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
-        project_name = project.name
+            pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+            project_name = project.name
 
-    text = build_pay_report(
-        project_name,
-        payment_path=pp_dict,
-        metrics=metrics_obj,
-        snapshot_dt=snapshot.created_at if snapshot else None,
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text = build_pay_report(
+            project_name,
+            payment_path=pp_dict,
+            metrics=metrics_obj,
+            snapshot_dt=snapshot.created_at if snapshot else None,
+        )
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/pay failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось получить данные по оплате. Технические детали: /status")
 
 
 async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
