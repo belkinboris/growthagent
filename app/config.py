@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     direct_campaign_ids: str = ""  # список через запятую
     direct_oauth_token: Optional[str] = None
     direct_sandbox: bool = False
+    # GoalId Яндекс.Директа для атрибуции конверсий по целям.
+    # НЕЛЬЗЯ считать total conversions регистрациями без явного GoalId.
+    # Если не задан -- классификация winner/safe_negative только по семантике.
+    direct_registration_goal_id: Optional[int] = None   # goal_id для "регистрация"
 
     # --- YooKassa ---
     yookassa_shop_id: Optional[str] = None

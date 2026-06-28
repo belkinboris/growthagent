@@ -223,6 +223,87 @@ def format_alert_details(alert: Alert) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _deserialize_direct_intelligence(data: dict | None) -> "DirectIntelligenceResult | None":
+    """
+    Конвертирует сохранённый в кэше dict обратно в DirectIntelligenceResult.
+    Если data=None или невалиден -- возвращает None (безопасно для owner_report).
+    """
+    if not data:
+        return None
+    try:
+        from app.query_classifier import (
+            DirectIntelligenceResult, QueryClassification, QueryLabel,
+            ActionItem, ActionType, SpendGateResult, SpendGateVerdict,
+        )
+
+        def _qa(d: dict) -> QueryClassification:
+            ai = None
+            if d.get("action_item"):
+                a = d["action_item"]
+                ai = ActionItem(
+                    action_type=ActionType(a["action_type"]),
+                    description=a["description"],
+                    rationale=a["rationale"],
+                    confidence=a.get("confidence", "medium"),
+                )
+            return QueryClassification(
+                query=d["query"],
+                label=QueryLabel(d["label"]),
+                reason=d["reason"],
+                campaign_name=d.get("campaign_name", ""),
+                ad_group_name=d.get("ad_group_name", ""),
+                clicks=d.get("clicks", 0),
+                cost=d.get("cost", 0.0),
+                impressions=d.get("impressions", 0),
+                registrations=d.get("registrations"),
+                registration_attribution=d.get("registration_attribution", "none"),
+                action_item=ai,
+                garbage_category=d.get("garbage_category"),
+            )
+
+        def _aa(d: dict) -> ActionItem:
+            return ActionItem(
+                action_type=ActionType(d["action_type"]),
+                description=d["description"],
+                rationale=d["rationale"],
+                confidence=d.get("confidence", "medium"),
+                payload=d.get("payload", {}),
+            )
+
+        sg = None
+        if data.get("spend_gate"):
+            sg_d = data["spend_gate"]
+            sg_actions = [_aa(a) for a in sg_d.get("action_items", [])]
+            sg = SpendGateResult(
+                verdict=SpendGateVerdict(sg_d["verdict"]),
+                spend_rub=sg_d.get("spend_rub", 0.0),
+                registrations=sg_d.get("registrations", 0),
+                has_activation=sg_d.get("has_activation", False),
+                has_payment_intent=sg_d.get("has_payment_intent", False),
+                has_payment_success=sg_d.get("has_payment_success", False),
+                explanation=sg_d.get("explanation", ""),
+                action_items=sg_actions,
+            )
+
+        return DirectIntelligenceResult(
+            period_label=data.get("period_label", ""),
+            winners=[_qa(q) for q in data.get("winners", [])],
+            watch=[_qa(q) for q in data.get("watch", [])],
+            safe_negatives=[_qa(q) for q in data.get("safe_negatives", [])],
+            do_not_touch=[_qa(q) for q in data.get("do_not_touch", [])],
+            action_items=[_aa(a) for a in data.get("action_items", [])],
+            spend_gate=sg,
+            has_registration_attribution=data.get("has_registration_attribution", False),
+            registration_attribution_note=data.get("registration_attribution_note", ""),
+            missing_data=data.get("missing_data", []),
+            total_queries_analyzed=data.get("total_queries_analyzed", 0),
+            total_spend=data.get("total_spend", 0.0),
+            total_clicks=data.get("total_clicks", 0),
+        )
+    except Exception:
+        return None
+
+
 def _format_metrics_line(metrics: NormalizedMetrics) -> str:
     parts = []
     if metrics.spend is not None or metrics.clicks is not None:
@@ -400,6 +481,7 @@ def format_cycle_message(result: CycleResult, project_name: str) -> str:
         previous_metrics=(result.previous_metrics_by_window or {}).get("7d"),
         deep_diagnostics=result.deep_diagnostics,
         payment_path_diagnostics=result.payment_path_diagnostics,
+        direct_intelligence=_deserialize_direct_intelligence(result.direct_intelligence),
         period_label="7д",
     )
     if owner_report is not None:
@@ -2181,6 +2263,42 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
             with get_session() as session:
                 project = session.get(Project, project_id) if project_id is not None else _get_active_project(session)
                 project_name = project.name if project else "Проект"
+
+            # Параллельно запускаем Direct Intelligence (classify_search_queries)
+            # и сохраняем в кэш для следующего /run.
+            # Не блокируем отправку результата /deep_direct если intelligence упадёт.
+            try:
+                from app.scheduler import run_direct_intelligence_for_project
+                from app.config import get_settings as _get_settings
+                _settings = _get_settings()
+                with get_session() as _session:
+                    _project = _session.get(Project, project_id) if project_id is not None else _get_active_project(_session)
+                if _project is not None:
+                    intel_result = await asyncio.wait_for(
+                        run_direct_intelligence_for_project(
+                            _project, _settings,
+                            period_hours=7 * 24,  # 7д
+                        ),
+                        timeout=MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+                    )
+                    if intel_result.get("status") == "ok":
+                        logger.info(
+                            "Direct Intelligence cached after /deep_direct (build=%s, chat_id=%s)",
+                            BUILD_MARKER, chat_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Direct Intelligence failed after /deep_direct: %s",
+                            intel_result.get("error"),
+                        )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Direct Intelligence timeout after %.1f sec in _deep_direct_background (build=%s, chat_id=%s)",
+                    MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS, BUILD_MARKER, chat_id,
+                )
+            except Exception as exc:
+                logger.warning("Direct Intelligence error in _deep_direct_background: %s", exc)
+
             await _send_deep_direct_result(chat_id, bot, refresh_result["result"], project_name)
             logger.info(
                 "Manual /deep_direct finished (build=%s, chat_id=%s, elapsed=%.1f sec)",

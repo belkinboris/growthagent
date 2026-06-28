@@ -117,6 +117,10 @@ class CycleResult:
     # цикле". Запускается всегда при manual /run и при плановом цикле, если
     # product connector настроен. Не блокирует /run при недоступности.
     payment_path_diagnostics: dict | None = None
+    # Direct Intelligence: результат classify_search_queries() из кэша.
+    # None -- кэш пуст или ещё не заполнен (нужен /deep_direct).
+    # /run ТОЛЬКО читает этот кэш, не запускает тяжёлый Direct granular report.
+    direct_intelligence: dict | None = None
     # Независимо от того, запускалась ли диагностика автоматически в этом
     # цикле -- показывать ли кнопки ручного запуска. См. service.
     # should_show_deep_direct_button/should_show_onboarding_button: кнопки
@@ -678,6 +682,7 @@ def collect_milestone_notifications(
 LANDING_FUNNEL_TRIGGER_CATEGORIES = DEEP_DIAGNOSTICS_TRIGGER_CATEGORIES | ONBOARDING_DIAGNOSTICS_TRIGGER_CATEGORIES
 
 LANDING_FUNNEL_CACHE_PERIOD_KEY = "landing_funnel_24h"
+DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY = "direct_intelligence_24h"
 
 
 def should_run_landing_funnel_diagnostics(primary_candidate: AlertCandidate | None) -> bool:

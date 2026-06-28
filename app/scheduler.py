@@ -42,11 +42,13 @@ from app.connectors import truepost as truepost_connector
 from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
 from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding, analyze_landing_funnel, finding_fingerprint
+from app.query_classifier import classify_search_queries, DirectIntelligenceResult
 from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, MetricSnapshot, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
 from app.service import (
     CycleResult,
+    DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
     LANDING_FUNNEL_CACHE_PERIOD_KEY,
     ONBOARDING_CACHE_PERIOD_KEY,
     check_integration_freshness,
@@ -712,7 +714,133 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                 }
                 logger.warning("Payment-path diagnostics failed: %s", payment_path_outcome.get("error"))
 
+        # Direct Intelligence: /run ТОЛЬКО читает последний сохранённый кэш.
+        # Тяжёлый Direct granular report НЕ запускается в /run --
+        # только через /deep_direct или background refresh.
+        # Если кэш пуст -- result.direct_intelligence = None, owner_report
+        # покажет "данные ещё не собраны; запустите /deep_direct".
+        direct_intel_cached = get_cached_diagnostics(
+            session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        )
+        if direct_intel_cached is not None and direct_intel_cached.get("ok"):
+            result.direct_intelligence = direct_intel_cached.get("result")
+        else:
+            result.direct_intelligence = None
+
         return result
+
+
+async def run_direct_intelligence_for_project(
+    project: Project,
+    settings,
+    period_hours: int,
+    payment_path_data: dict | None = None,
+) -> dict:
+    """
+    Запускает goal-aware Direct search query report и classify_search_queries().
+    Сохраняет результат в кэш DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY.
+
+    Вызывается из:
+      - /deep_direct (принудительно)
+      - фонового планировщика (ежедневно, не блокирует /run)
+
+    /run НЕ вызывает эту функцию -- только читает кэш.
+
+    Возвращает {"status": "ok"|"not_configured"|"error",
+               "result": dict|None, "error": str|None}.
+
+    payment_path_data -- опциональный dict для Spend Gate:
+      registrations, channels_created, payment_started, payment_success,
+      pricing_viewed. Берётся из последнего payment_path snapshot.
+    """
+    oauth_token = settings.effective_direct_oauth_token
+    client_login = settings.direct_client_login
+    campaign_ids = settings.direct_campaign_ids_list
+    registration_goal_id = settings.direct_registration_goal_id
+
+    if not oauth_token or not client_login:
+        return {"status": "not_configured", "result": None, "error": None}
+
+    # Определяем clean-period окно (если задан cutoff для Direct)
+    date_from_override = None
+    date_to_override = None
+    with get_session() as session:
+        cutoff = get_latest_cutoff(session, project.id, "direct")
+    if cutoff is not None:
+        from datetime import timezone as _tz
+        cutoff_dt = cutoff if cutoff.tzinfo else cutoff.replace(tzinfo=_tz.utc)
+        date_from_override = cutoff_dt.date().isoformat()
+        from datetime import datetime as _dt
+        date_to_override = _dt.now(_tz.utc).date().isoformat()
+        logger.info(
+            "Direct Intelligence using clean-period: %s -> %s",
+            date_from_override, date_to_override,
+        )
+
+    # Direct Reports API не поддерживает per-goal разбивку конверсий в
+    # SEARCH_QUERY_PERFORMANCE_REPORT. Поэтому registration_attribution="none"
+    # всегда -- winner/safe-negative строятся только на семантике запросов,
+    # не на данных конверсий из Директа.
+    # registration_goal_id используется только как метаданные для будущей
+    # интеграции с другими источниками (backend truth).
+    try:
+        raw_report = await _run_with_timeout(
+            direct_connector.fetch_search_query_report(
+                oauth_token=oauth_token,
+                client_login=client_login,
+                campaign_ids=campaign_ids,
+                period_hours=period_hours,
+                sandbox=settings.direct_sandbox,
+                date_from_override=date_from_override,
+                date_to_override=date_to_override,
+            ),
+            CONNECTOR_CALL_TIMEOUT_SECONDS,
+            "Direct Intelligence (search query)",
+        )
+    except asyncio.TimeoutError:
+        return {
+            "status": "error",
+            "result": None,
+            "error": f"Direct search query report timeout ({CONNECTOR_CALL_TIMEOUT_SECONDS:.0f}s)",
+        }
+    except (direct_connector.DirectConnectorError, direct_connector.NotConfiguredError) as exc:
+        return {"status": "error", "result": None, "error": str(exc)}
+
+    rows = raw_report.get("rows", [])
+    period_label = f"{date_from_override} — {date_to_override}" if date_from_override else f"{period_hours // 24}д"
+
+    # Spend Gate данные: берём из payment_path_data если переданы
+    spend_gate_data = None
+    if payment_path_data and payment_path_data.get("registrations") is not None:
+        from app.rules import NormalizedMetrics as _NM  # noqa: avoid circular at module level
+
+        # Расход из Direct summary (не из query-level, чтобы не суммировать ещё раз)
+        spend_gate_data = {
+            "spend_rub": raw_report.get("_diagnostics", {}).get("total_cost", 0.0),
+            "registrations": payment_path_data.get("registrations", 0),
+            "channels_created": payment_path_data.get("channels_created", 0),
+            "payment_started": payment_path_data.get("payment_started", 0),
+            "payment_success": payment_path_data.get("payment_success", 0),
+            "pricing_viewed": payment_path_data.get("pricing_viewed"),
+        }
+
+    di_result = classify_search_queries(
+        query_rows=rows,
+        period_label=period_label,
+        registration_goal_id=None,   # Direct API не даёт per-goal attribution в SEARCH_QUERY
+        spend_gate_data=spend_gate_data,
+    )
+
+    result_dict = di_result.to_dict()
+
+    # Сохраняем в кэш
+    with get_session() as session:
+        save_diagnostics_cache(
+            session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
+            "deep_direct", result_dict, ok=True, error=None,
+        )
+
+    return {"status": "ok", "result": result_dict, "error": None}
 
 
 async def run_deep_diagnostics_for_project(project: Project, settings, period_hours: int):
