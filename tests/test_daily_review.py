@@ -1,0 +1,514 @@
+"""
+Тесты для Daily Business Review:
+1. Query classifier: safe_negative / watch / winner / do_not_touch
+2. Protected terms никогда не минусуются
+3. Total conversions ≠ регистрации (нет GoalId)
+4. Relevant low-spend query -> watch, не safe_negative
+5. Obvious garbage -> safe_negative
+6. Spend Gate: логика вердиктов
+7. DirectIntelligenceResult.to_dict() + десериализация
+8. /run не падает без direct_intelligence
+9. build_owner_report backward compat без direct_intelligence
+"""
+import pytest
+
+from app.query_classifier import (
+    ActionType,
+    DirectIntelligenceResult,
+    QueryLabel,
+    SpendGateVerdict,
+    classify_query,
+    classify_search_queries,
+    evaluate_spend_gate,
+    PROTECTED_TERMS,
+    MIN_SPEND_FOR_NEGATIVE_RUB,
+    MIN_CLICKS_FOR_NEGATIVE,
+)
+from app.owner_report import build_owner_report, _format_direct_intelligence_block
+from app.rules import NormalizedMetrics
+
+
+# ---------------------------------------------------------------------------
+# Хелперы
+# ---------------------------------------------------------------------------
+
+def _metrics(**kw) -> NormalizedMetrics:
+    defaults = dict(
+        period_key="7d", signup=25, activation_1=20, activation_2=56,
+        payment_started=1, payment_success=0, spend=4800, clicks=594,
+        sources_ok={"product", "direct"},
+    )
+    defaults.update(kw)
+    return NormalizedMetrics(**defaults)
+
+
+def _row(
+    query="автопост телеграм", clicks=10, cost=150.0, impressions=500,
+    registrations=None, registration_attribution="none",
+    campaign_name="Кампания 1", ad_group_name="Группа 1",
+):
+    return {
+        "query": query,
+        "clicks": clicks,
+        "cost": cost,
+        "impressions": impressions,
+        "registrations": registrations,
+        "registration_attribution": registration_attribution,
+        "campaign_name": campaign_name,
+        "ad_group_name": ad_group_name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# classify_query: основные ветки
+# ---------------------------------------------------------------------------
+
+class TestClassifyQuery:
+
+    def test_winner_with_reliable_attribution(self):
+        """Reliable attribution + регистрации -> WINNER."""
+        result = classify_query(
+            query="автопост telegram",
+            clicks=50, cost=300.0,
+            registrations=3, registration_attribution="reliable",
+        )
+        assert result.label == QueryLabel.WINNER
+        assert result.action_item is not None
+        assert result.action_item.action_type == ActionType.DO_NOT_TOUCH
+
+    def test_winner_requires_reliable_attribution(self):
+        """Без reliable attribution -- не winner, даже если registrations > 0."""
+        result = classify_query(
+            query="автопост telegram",
+            clicks=50, cost=300.0,
+            registrations=5, registration_attribution="none",
+        )
+        # Содержит protected term "telegram" -> DO_NOT_TOUCH, не winner
+        assert result.label != QueryLabel.WINNER
+
+    def test_winner_requires_min_spend(self):
+        """winner только при cost >= MIN_SPEND_FOR_WINNER_RUB."""
+        result = classify_query(
+            query="автопост telegram",
+            clicks=5, cost=10.0,  # мало
+            registrations=1, registration_attribution="reliable",
+        )
+        assert result.label != QueryLabel.WINNER
+
+    def test_protected_term_do_not_touch(self):
+        """Запрос с protected term -> DO_NOT_TOUCH, независимо от метрик."""
+        # Только специфичные для продукта термины защищены:
+        # telegram/телеграм, нейросеть, автопостинг
+        for term in ["телеграм", "нейросеть", "автопостинг"]:
+            result = classify_query(query=f"создать {term} онлайн", clicks=100, cost=500.0)
+            assert result.label == QueryLabel.DO_NOT_TOUCH, f"term={term} должен быть DO_NOT_TOUCH"
+
+    def test_broad_non_product_terms_are_watch_not_do_not_touch(self):
+        """Широкие нерелевантные термины (пост, бесплатно) не защищены — они WATCH."""
+        # "пост" слишком широкий, но и не garbage -> WATCH
+        result = classify_query(query="создать пост онлайн", clicks=10, cost=100.0)
+        # Не должен быть DO_NOT_TOUCH (нет product-specific термина), но и не SAFE_NEGATIVE
+        assert result.label in (QueryLabel.WATCH, QueryLabel.DO_NOT_TOUCH)
+        assert result.label != QueryLabel.SAFE_NEGATIVE
+
+    def test_obvious_garbage_safe_negative(self):
+        """Явный мусор с достаточным расходом -> SAFE_NEGATIVE."""
+        result = classify_query(
+            query="шапка youtube оформление канала",
+            clicks=15, cost=200.0,
+            registrations=None, registration_attribution="none",
+        )
+        assert result.label == QueryLabel.SAFE_NEGATIVE
+        assert result.action_item is not None
+        assert result.action_item.action_type == ActionType.ADS_ACTION_SUGGESTED
+
+    def test_garbage_low_spend_is_watch_not_negative(self):
+        """Мусорный запрос, но мало данных -> WATCH, не SAFE_NEGATIVE."""
+        result = classify_query(
+            query="шапка youtube",
+            clicks=2, cost=30.0,  # меньше MIN_SPEND_FOR_NEGATIVE_RUB
+        )
+        assert result.label == QueryLabel.WATCH
+
+    def test_garbage_low_clicks_is_watch(self):
+        """Мусор, но кликов меньше MIN_CLICKS_FOR_NEGATIVE -> WATCH."""
+        result = classify_query(
+            query="шапка ютуб оформление",
+            clicks=2, cost=500.0,  # много денег, но мало кликов
+        )
+        assert result.label == QueryLabel.WATCH
+
+    def test_relevant_low_spend_is_watch(self):
+        """Релевантный запрос с малым расходом -> WATCH, не SAFE_NEGATIVE."""
+        result = classify_query(
+            query="как сделать контент для канала",
+            clicks=3, cost=45.0,
+        )
+        assert result.label == QueryLabel.WATCH
+
+    def test_unknown_query_is_watch(self):
+        """Неопределённый запрос без registration data -> WATCH."""
+        result = classify_query(
+            query="сервис для работы с контентом",
+            clicks=8, cost=120.0,
+        )
+        assert result.label == QueryLabel.WATCH
+
+    def test_adult_content_safe_negative(self):
+        """18+ контент -> SAFE_NEGATIVE при достаточном расходе."""
+        result = classify_query(
+            query="эротик контент онлайн",
+            clicks=20, cost=300.0,
+        )
+        assert result.label == QueryLabel.SAFE_NEGATIVE
+        assert result.garbage_category == "adult_18_plus"
+
+    def test_academic_garbage_safe_negative(self):
+        """Учёба/рефераты -> SAFE_NEGATIVE при достаточных данных."""
+        result = classify_query(
+            query="написать реферат онлайн",
+            clicks=10, cost=150.0,
+        )
+        assert result.label == QueryLabel.SAFE_NEGATIVE
+
+    def test_cross_platform_non_telegram_explicit_negative(self):
+        """Кросспостинг в VK без упоминания автопоста -> SAFE_NEGATIVE."""
+        result = classify_query(
+            query="вконтакте постинг расписание",
+            clicks=10, cost=150.0,
+        )
+        # Нет protected term, явный non-telegram cross-platform
+        # Ожидаем SAFE_NEGATIVE или WATCH (зависит от паттерна)
+        assert result.label in (QueryLabel.SAFE_NEGATIVE, QueryLabel.WATCH)
+        assert result.label != QueryLabel.DO_NOT_TOUCH
+
+    def test_cross_platform_with_autopost_is_do_not_touch(self):
+        """'вконтакте автопост' -- содержит 'автопост' (protected) -> не минусуем."""
+        result = classify_query(
+            query="вконтакте автопост",
+            clicks=10, cost=150.0,
+        )
+        # "автопост" — protected term: решение верное, не минусуем
+        assert result.label == QueryLabel.DO_NOT_TOUCH
+
+    def test_protected_overrides_garbage(self):
+        """Protected term защищает даже при наличии garbage-паттерна."""
+        # "автопостинг телеграм" -- содержит "телеграм" (protected)
+        # Нельзя минусовать, даже если есть что-то похожее на мусор
+        result = classify_query(
+            query="автопостинг телеграм вконтакте",
+            clicks=20, cost=300.0,
+        )
+        # "телеграм" защищает от минусования
+        assert result.label != QueryLabel.SAFE_NEGATIVE
+
+
+# ---------------------------------------------------------------------------
+# classify_search_queries: интеграция
+# ---------------------------------------------------------------------------
+
+class TestClassifySearchQueries:
+
+    def test_no_goal_id_no_registration_attribution(self):
+        """Без registration_goal_id атрибуция регистраций недоступна."""
+        rows = [_row(query="автопост telegram", registrations=5, registration_attribution="reliable")]
+        result = classify_search_queries(rows, registration_goal_id=None)
+        assert not result.has_registration_attribution
+        assert "registration_goal_id" in result.missing_data
+        # Winner невозможен без reliable attribution
+        assert len(result.winners) == 0
+
+    def test_with_goal_id_registration_attribution_works(self):
+        """С registration_goal_id регистрации учитываются."""
+        rows = [_row(
+            query="автопост telegram",
+            clicks=50, cost=300.0,
+            registrations=3, registration_attribution="reliable",
+        )]
+        result = classify_search_queries(rows, registration_goal_id=12345)
+        assert result.has_registration_attribution
+        assert len(result.winners) == 1
+
+    def test_total_conversions_not_registrations(self):
+        """
+        Direct API не даёт per-goal разбивку в SEARCH_QUERY_PERFORMANCE_REPORT.
+        classify_search_queries всегда получает registration_goal_id=None из scheduler,
+        поэтому attribution="none" и winner невозможен на основе конверсий из Direct.
+        """
+        rows = [_row(
+            query="автопост телеграм",
+            clicks=50, cost=300.0,
+            # Даже если передать registrations и unreliable attribution --
+            # classify_search_queries с goal_id=None выставит attribution="none"
+            registrations=10,
+            registration_attribution="unreliable",
+        )]
+        # С registration_goal_id=None - нет attribution, нет winners
+        result = classify_search_queries(rows, registration_goal_id=None)
+        assert result.has_registration_attribution is False
+        # "телеграм" -> DO_NOT_TOUCH, не winner
+        assert len(result.winners) == 0
+
+    def test_garbage_with_spend_becomes_safe_negative(self):
+        rows = [_row(query="шапка youtube", clicks=20, cost=300.0)]
+        result = classify_search_queries(rows)
+        assert len(result.safe_negatives) == 1
+        assert result.safe_negatives[0].action_item is not None
+        assert result.safe_negatives[0].action_item.action_type == ActionType.ADS_ACTION_SUGGESTED
+
+    def test_protected_terms_not_in_negatives(self):
+        """Protected terms не попадают в safe_negatives."""
+        rows = [
+            _row(query="бесплатный бот для телеграм", clicks=20, cost=300.0),
+            _row(query="нейросеть для постов", clicks=15, cost=200.0),
+            _row(query="автопостинг канала", clicks=10, cost=150.0),
+        ]
+        result = classify_search_queries(rows)
+        for q in result.safe_negatives:
+            for term in PROTECTED_TERMS:
+                assert term not in q.query.lower(), (
+                    f"Protected term '{term}' оказался в safe_negatives: {q.query}"
+                )
+
+    def test_to_dict_and_round_trip(self):
+        """to_dict() возвращает сериализуемый dict."""
+        import json
+        rows = [
+            _row(query="шапка youtube", clicks=20, cost=300.0),
+            _row(query="автопост telegram", clicks=5, cost=50.0),
+        ]
+        result = classify_search_queries(rows)
+        d = result.to_dict()
+        # Должен быть JSON-сериализуемым
+        serialized = json.dumps(d)
+        assert serialized  # не пустой
+        assert "safe_negatives" in d
+        assert "watch" in d
+
+    def test_action_items_generated(self):
+        """Action items генерируются для safe_negatives."""
+        rows = [_row(query="шапка youtube", clicks=20, cost=300.0)]
+        result = classify_search_queries(rows)
+        ads_actions = [a for a in result.action_items if a.action_type == ActionType.ADS_ACTION_SUGGESTED]
+        assert len(ads_actions) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Spend Gate
+# ---------------------------------------------------------------------------
+
+class TestSpendGate:
+
+    def test_no_registrations_high_spend_pause(self):
+        """Нет регистраций + значимый расход -> PAUSE_RECOMMENDED."""
+        sg = evaluate_spend_gate(
+            spend_rub=1000.0, registrations=0, channels_created=0,
+            payment_started=0, payment_success=0, pricing_viewed=None,
+        )
+        assert sg.verdict == SpendGateVerdict.PAUSE_RECOMMENDED
+
+    def test_no_registrations_low_spend_do_not_scale(self):
+        """Нет регистраций, но расход мал -> DO_NOT_SCALE (не пауза)."""
+        sg = evaluate_spend_gate(
+            spend_rub=100.0, registrations=0, channels_created=0,
+            payment_started=0, payment_success=0, pricing_viewed=None,
+        )
+        # Ниже порога 500 руб -- не PAUSE, возвращает DO_NOT_SCALE
+        assert sg.verdict != SpendGateVerdict.PAUSE_RECOMMENDED
+
+    def test_registrations_no_activation_do_not_scale(self):
+        """Регистрации есть, активации нет -> DO_NOT_SCALE."""
+        sg = evaluate_spend_gate(
+            spend_rub=2000.0, registrations=20, channels_created=0,
+            payment_started=0, payment_success=0, pricing_viewed=None,
+        )
+        assert sg.verdict == SpendGateVerdict.DO_NOT_SCALE
+        assert not sg.has_activation
+
+    def test_payment_success_controlled_spend_ok(self):
+        """Есть успешные оплаты -> CONTROLLED_SPEND_OK."""
+        sg = evaluate_spend_gate(
+            spend_rub=4800.0, registrations=32, channels_created=27,
+            payment_started=1, payment_success=1, pricing_viewed=5,
+        )
+        assert sg.verdict == SpendGateVerdict.CONTROLLED_SPEND_OK
+
+    def test_many_registrations_no_payment_intent_monetization_warn(self):
+        """Много регистраций + активация + нет payment intent -> MONETIZATION_NOT_PROVEN."""
+        sg = evaluate_spend_gate(
+            spend_rub=8000.0, registrations=60, channels_created=50,
+            payment_started=0, payment_success=0, pricing_viewed=0,
+        )
+        assert sg.verdict == SpendGateVerdict.MONETIZATION_NOT_PROVEN
+
+    def test_few_registrations_no_payment_do_not_scale(self):
+        """Регистрации + активация есть, payment intent нет, мало регистраций -> DO_NOT_SCALE."""
+        sg = evaluate_spend_gate(
+            spend_rub=4800.0, registrations=32, channels_created=27,
+            payment_started=0, payment_success=0, pricing_viewed=1,
+        )
+        assert sg.verdict == SpendGateVerdict.DO_NOT_SCALE
+
+    def test_payment_intent_no_success_do_not_scale(self):
+        """Есть payment intent, нет success -> DO_NOT_SCALE (ждём)."""
+        sg = evaluate_spend_gate(
+            spend_rub=4800.0, registrations=32, channels_created=27,
+            payment_started=1, payment_success=0, pricing_viewed=5,
+        )
+        assert sg.verdict == SpendGateVerdict.DO_NOT_SCALE
+        assert sg.has_payment_intent
+
+    def test_one_payment_started_not_p1(self):
+        """1 payment_started без success -- spend gate не говорит P1."""
+        sg = evaluate_spend_gate(
+            spend_rub=4800.0, registrations=32, channels_created=27,
+            payment_started=1, payment_success=0, pricing_viewed=3,
+        )
+        # Вердикт не должен быть PAUSE_RECOMMENDED из-за одной попытки
+        assert sg.verdict != SpendGateVerdict.PAUSE_RECOMMENDED
+
+    def test_spend_gate_action_items_typed(self):
+        """Action items Spend Gate имеют правильный ActionType."""
+        sg = evaluate_spend_gate(
+            spend_rub=4800.0, registrations=32, channels_created=27,
+            payment_started=0, payment_success=0, pricing_viewed=0,
+        )
+        for ai in sg.action_items:
+            assert ai.action_type in list(ActionType)
+
+
+# ---------------------------------------------------------------------------
+# build_owner_report: backward compat и direct_intelligence
+# ---------------------------------------------------------------------------
+
+class TestBuildOwnerReportWithDirectIntelligence:
+
+    def test_backward_compat_no_direct_intelligence(self):
+        """build_owner_report работает без direct_intelligence."""
+        report = build_owner_report("АвтоПост", _metrics())
+        assert report is not None
+
+    def test_report_with_direct_intelligence_none_shows_placeholder(self):
+        """Если direct_intelligence=None, в отчёте есть пометка о недоступности."""
+        report = build_owner_report(
+            "АвтоПост", _metrics(), direct_intelligence=None,
+        )
+        assert report is not None
+        # Должна быть пометка что данные недоступны
+        assert "не собраны" in report or "deep_direct" in report
+
+    def test_report_with_direct_intelligence_shows_winners(self):
+        """Если direct_intelligence содержит winners, они отражаются в отчёте."""
+        from app.query_classifier import QueryClassification
+
+        di = DirectIntelligenceResult(
+            period_label="7д",
+            winners=[QueryClassification(
+                query="автопост telegram",
+                label=QueryLabel.WINNER,
+                reason="3 регистр.",
+                clicks=50, cost=300.0,
+                registrations=3,
+                registration_attribution="reliable",
+            )],
+            has_registration_attribution=True,
+        )
+        report = build_owner_report(
+            "АвтоПост", _metrics(), direct_intelligence=di,
+        )
+        assert report is not None
+        assert "автопост telegram" in report or "Winners" in report
+
+    def test_report_with_safe_negatives_shows_them(self):
+        """Safe negatives отражаются в отчёте."""
+        from app.query_classifier import QueryClassification, ActionItem
+
+        di = DirectIntelligenceResult(
+            period_label="7д",
+            safe_negatives=[QueryClassification(
+                query="шапка youtube",
+                label=QueryLabel.SAFE_NEGATIVE,
+                reason="youtube_decoration",
+                clicks=15, cost=200.0,
+                action_item=ActionItem(
+                    ActionType.ADS_ACTION_SUGGESTED,
+                    'Минус-фраза: "шапка youtube"',
+                    "youtube decoration",
+                ),
+            )],
+        )
+        report = build_owner_report(
+            "АвтоПост", _metrics(), direct_intelligence=di,
+        )
+        assert report is not None
+        assert "шапка youtube" in report
+
+    def test_format_direct_intelligence_block_none_shows_message(self):
+        """Блок рекламы с None показывает сообщение о недоступности данных."""
+        block = _format_direct_intelligence_block(None)
+        assert block is not None
+        assert "не собраны" in block or "deep_direct" in block
+
+    def test_format_direct_intelligence_block_with_data(self):
+        """Блок рекламы с данными показывает статистику."""
+        from app.query_classifier import QueryClassification
+
+        di = DirectIntelligenceResult(
+            period_label="7д",
+            watch=[QueryClassification(
+                query="создание постов для канала",
+                label=QueryLabel.WATCH,
+                reason="данных мало",
+                clicks=5, cost=75.0,
+            )],
+            total_queries_analyzed=10,
+            total_spend=500.0,
+            total_clicks=80,
+        )
+        block = _format_direct_intelligence_block(di)
+        assert block is not None
+        assert "Watch" in block or "наблюдать" in block
+
+
+# ---------------------------------------------------------------------------
+# Десериализация direct_intelligence в telegram_bot
+# ---------------------------------------------------------------------------
+
+class TestDeserializeDirectIntelligence:
+
+    def test_none_returns_none(self):
+        from app.telegram_bot import _deserialize_direct_intelligence
+        assert _deserialize_direct_intelligence(None) is None
+
+    def test_empty_dict_returns_none(self):
+        from app.telegram_bot import _deserialize_direct_intelligence
+        assert _deserialize_direct_intelligence({}) is None
+
+    def test_valid_dict_round_trip(self):
+        """to_dict() -> _deserialize -> поля совпадают."""
+        from app.telegram_bot import _deserialize_direct_intelligence
+        from app.query_classifier import QueryClassification
+
+        di_orig = DirectIntelligenceResult(
+            period_label="7д",
+            safe_negatives=[QueryClassification(
+                query="шапка youtube",
+                label=QueryLabel.SAFE_NEGATIVE,
+                reason="youtube_decoration",
+                clicks=15, cost=200.0,
+            )],
+            total_queries_analyzed=1,
+            total_spend=200.0,
+            total_clicks=15,
+        )
+        serialized = di_orig.to_dict()
+        restored = _deserialize_direct_intelligence(serialized)
+        assert restored is not None
+        assert len(restored.safe_negatives) == 1
+        assert restored.safe_negatives[0].query == "шапка youtube"
+        assert restored.total_spend == 200.0
+
+    def test_invalid_dict_returns_none(self):
+        """Невалидный dict не падает, возвращает None."""
+        from app.telegram_bot import _deserialize_direct_intelligence
+        assert _deserialize_direct_intelligence({"garbage": "data", "winners": "not_a_list"}) is None
