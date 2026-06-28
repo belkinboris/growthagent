@@ -512,3 +512,166 @@ class TestDeserializeDirectIntelligence:
         """Невалидный dict не падает, возвращает None."""
         from app.telegram_bot import _deserialize_direct_intelligence
         assert _deserialize_direct_intelligence({"garbage": "data", "winners": "not_a_list"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Тесты _format_intel_status_note и fallback path
+# ---------------------------------------------------------------------------
+
+class TestIntelStatusNote:
+    """_format_intel_status_note всегда возвращает непустую строку."""
+
+    def test_ok_with_rows(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("ok", None, 45)
+        assert "45" in note
+        assert "обновлён" in note
+
+    def test_ok_zero_rows(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("ok", None, 0)
+        assert "0" in note
+        assert note  # не пустая
+
+    def test_not_configured(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("not_configured", None, 0)
+        assert "не настроен" in note or "DIRECT_" in note
+        assert note
+
+    def test_timeout(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("timeout", ">60s", 0)
+        assert "таймаут" in note or "timeout" in note.lower()
+        assert note
+
+    def test_error(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("error", "HTTP 500", 0)
+        assert "HTTP 500" in note
+        assert note
+
+    def test_exception(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("exception", "NoneType error", 0)
+        assert "NoneType error" in note
+        assert note
+
+    def test_unknown_status_not_empty(self):
+        from app.telegram_bot import _format_intel_status_note
+        note = _format_intel_status_note("weird_status", None, 0)
+        assert note  # не пустая, не None
+
+
+class TestDeepDirectFallbackPath:
+    """
+    Проверяем что Direct Intelligence запускается даже когда
+    legacy refresh_result.get('ok') == False (fallback сценарий).
+    """
+
+    @pytest.mark.asyncio
+    async def test_intel_runs_when_legacy_fails(self):
+        """
+        При legacy refresh ok=False — Direct Intelligence всё равно вызывается
+        и пользователь получает статусное сообщение.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        sent_messages = []
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock(side_effect=lambda chat_id, text, **kw: sent_messages.append(text))
+
+        mock_project = MagicMock()
+        mock_project.id = 1
+        mock_project.name = "Test"
+
+        # legacy deep_direct возвращает ok=False
+        legacy_fail = {"ok": False, "error": "timeout", "timeout": True}
+        # Direct Intelligence возвращает ok с 10 строками
+        intel_ok = {"status": "ok", "result": {"total_queries_analyzed": 10}}
+
+        with patch(
+            "app.telegram_bot.get_session"
+        ) as mock_gs, patch(
+            "app.scheduler.run_direct_intelligence_for_project",
+            new_callable=AsyncMock,
+            return_value=intel_ok,
+        ), patch(
+            "app.scheduler.force_refresh_deep_diagnostics_sync_with_timeout",
+            return_value=legacy_fail,
+        ), patch(
+            "app.telegram_bot._get_active_project",
+            return_value=mock_project,
+        ), patch(
+            "app.telegram_bot._get_best_deep_direct_fallback_sync",
+            return_value=(None, "Test"),
+        ):
+            mock_session = MagicMock()
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get = MagicMock(return_value=mock_project)
+            mock_gs.return_value = mock_session
+
+            from app.telegram_bot import _deep_direct_background
+            from datetime import datetime, timezone
+            await _deep_direct_background(
+                chat_id=123, bot=mock_bot,
+                project_id=1,
+                started_at=datetime.now(timezone.utc),
+            )
+
+        # Пользователь должен получить как минимум 2 сообщения:
+        # 1) статус Direct Intelligence
+        # 2) сообщение о fallback legacy
+        assert len(sent_messages) >= 1, f"Ожидали хотя бы 1 сообщение, получили: {sent_messages}"
+
+        # Первое сообщение — статус Direct Intelligence
+        intel_msg = sent_messages[0]
+        assert "Direct Intelligence" in intel_msg, f"Ожидали статус DI в первом сообщении: {intel_msg!r}"
+        assert "10" in intel_msg or "обновлён" in intel_msg, f"Ожидали кол-во строк: {intel_msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_intel_status_sent_when_not_configured(self):
+        """При not_configured пользователь видит понятное сообщение."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        sent_messages = []
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock(side_effect=lambda chat_id, text, **kw: sent_messages.append(text))
+
+        mock_project = MagicMock()
+        mock_project.id = 1
+        mock_project.name = "Test"
+
+        intel_not_configured = {"status": "not_configured", "result": None, "error": None}
+        legacy_fail = {"ok": False, "error": "timeout"}
+
+        with patch("app.telegram_bot.get_session") as mock_gs, \
+             patch("app.scheduler.run_direct_intelligence_for_project",
+                   new_callable=AsyncMock, return_value=intel_not_configured), \
+             patch("app.scheduler.force_refresh_deep_diagnostics_sync_with_timeout",
+                   return_value=legacy_fail), \
+             patch("app.telegram_bot._get_active_project", return_value=mock_project), \
+             patch("app.telegram_bot._get_best_deep_direct_fallback_sync",
+                   return_value=(None, "Test")):
+
+            mock_session = MagicMock()
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get = MagicMock(return_value=mock_project)
+            mock_gs.return_value = mock_session
+
+            from app.telegram_bot import _deep_direct_background
+            from datetime import datetime, timezone
+            await _deep_direct_background(
+                chat_id=123, bot=mock_bot,
+                project_id=1,
+                started_at=datetime.now(timezone.utc),
+            )
+
+        assert len(sent_messages) >= 1
+        intel_msg = sent_messages[0]
+        assert "Direct Intelligence" in intel_msg
+        assert "не настроен" in intel_msg or "DIRECT_" in intel_msg
