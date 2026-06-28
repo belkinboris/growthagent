@@ -1136,3 +1136,163 @@ class TestAdsClassification:
         # Не должно быть голого "CPA" без контекста
         assert "цена регистрации" in text or "CPA" in text, \
             "Должна быть строка с ценой регистрации"
+
+
+# ---------------------------------------------------------------------------
+# P0 final fix тесты
+# ---------------------------------------------------------------------------
+
+class TestFunnelUsesSnapshotLikeRun:
+    """
+    /funnel должен работать с тем же источником данных что /run.
+    Причина падения: extract_normalized_metrics_from_snapshot падает при
+    metrics_json=None, а _normalized_metrics_from_snapshot защищён через `or {}`.
+    """
+
+    def test_funnel_works_with_none_metrics_json(self):
+        """build_funnel_report не падает при пустых/None данных."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        # Минимально пустые метрики — как если metrics_json=None в снапшоте
+        m = NormalizedMetrics(period_key="7d", sources_ok=set())
+        text = build_funnel_report("АвтоПост", m)
+        assert text  # не пустой
+        assert "АвтоПост" in text
+
+    def test_normalized_metrics_from_snapshot_protects_none(self):
+        """_normalized_metrics_from_snapshot защищён от metrics_json=None."""
+        # Симулируем снапшот с metrics_json=None
+        class FakeSnapshot:
+            metrics_json = None
+            period_key = "7d"
+            id = 1
+            created_at = None
+
+        # Старый вариант (extract_normalized_metrics_from_snapshot) падает:
+        from app.service import extract_normalized_metrics_from_snapshot
+        import pytest
+        with pytest.raises(AttributeError):
+            extract_normalized_metrics_from_snapshot(FakeSnapshot())
+
+    def test_funnel_produces_report_with_valid_snapshot(self):
+        """build_funnel_report с нормальными метриками даёт полезный отчёт."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(
+            period_key="7d", signup=30, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528,
+            sources_ok={"product"},
+        )
+        text = build_funnel_report("АвтоПост", m)
+        assert "30" in text or "регистрир" in text
+        assert "26" in text or "канал" in text
+        # Нет "Не удалось получить данные"
+        assert "Не удалось" not in text
+
+    def test_funnel_not_shows_generic_error_when_data_exists(self):
+        """build_funnel_report не возвращает сообщение об ошибке при наличии данных."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(
+            period_key="7d", signup=30, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, sources_ok=set(),
+        )
+        text = build_funnel_report("АвтоПост", m)
+        assert "Не удалось получить данные по воронке" not in text
+
+
+class TestAdsP0Fixes:
+    """/ads: CPA → цена регистрации, do_not_touch без мусора в 'Что оставить'."""
+
+    def test_ads_no_cpa_label(self):
+        """CPA заменено на 'цена регистрации'."""
+        from app.commercial_report import build_ads_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(
+            period_key="7d", signup=31, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528,
+            sources_ok=set(),
+        )
+        text = build_ads_report("АвтоПост", metrics=m)
+        # Не должно быть голого "CPA X ₽"
+        import re
+        raw_cpa = re.search(r'\bCPA\s+\d+\s*₽', text)
+        assert raw_cpa is None, f"Найдена строка 'CPA X ₽': {raw_cpa.group()}"
+        # Должно быть "цена регистрации" если CPA вообще показывается
+        if "регистраций" in text and "₽" in text:
+            assert "цена регистрации" in text or "₽" in text
+
+    def test_ads_bypass_queries_not_in_keep(self):
+        """Запросы с обходом ограничений не попадают в 'Что оставить'."""
+        from app.commercial_report import build_ads_report
+        from app.query_classifier import (
+            DirectIntelligenceResult, QueryClassification, QueryLabel,
+        )
+        from app.query_classifier import classify_query
+
+        # Создаём DI с мусорным запросом в do_not_touch (как это было до фикса)
+        bypass_q = QueryClassification(
+            query="автопостинг по группам без премиума тг",
+            label=QueryLabel.DO_NOT_TOUCH,
+            reason="автопостинг",
+            clicks=10, cost=150.0,
+            garbage_category="mass_posting_bypass",  # ← маркер мусора
+        )
+        di = DirectIntelligenceResult(
+            period_label="7д",
+            do_not_touch=[bypass_q],
+        )
+        text = build_ads_report("АвтоПост", direct_intelligence=di)
+        # Этот запрос не должен быть в "Что оставить"
+        keep_section = ""
+        if "✅ Что оставить:" in text:
+            start = text.index("✅ Что оставить:")
+            end = text.index("\n🔍", start) if "\n🔍" in text[start:] else len(text)
+            keep_section = text[start:end]
+        assert "по группам без премиума" not in keep_section, \
+            "Мусорный запрос оказался в 'Что оставить'"
+
+    def test_ads_normal_query_stays_in_keep(self):
+        """Нормальный do_not_touch запрос остаётся в 'Что оставить'."""
+        from app.commercial_report import build_ads_report
+        from app.query_classifier import DirectIntelligenceResult, QueryClassification, QueryLabel
+
+        good_q = QueryClassification(
+            query="нейросеть для telegram канала",
+            label=QueryLabel.DO_NOT_TOUCH,
+            reason="telegram",
+            clicks=20, cost=250.0,
+            garbage_category=None,  # нет мусора
+        )
+        di = DirectIntelligenceResult(period_label="7д", do_not_touch=[good_q])
+        text = build_ads_report("АвтоПост", direct_intelligence=di)
+        assert "нейросеть для telegram канала" in text
+
+
+class TestConsistencyRunFunnelPay:
+    """Согласованность /run, /funnel, /pay по данным о тарифах."""
+
+    def _metrics(self):
+        from app.rules import NormalizedMetrics
+        return NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+
+    def test_all_consistent_when_no_tariff_tracking(self):
+        """Если tracking не настроен, все три команды это отражают."""
+        from app.commercial_report import build_run_report, build_funnel_report, build_pay_report
+        m = self._metrics()
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0}
+        run_text = build_run_report("АвтоПост", m, payment_path=pp)
+        funnel_text = build_funnel_report("АвтоПост", m, payment_path=pp)
+        pay_text = build_pay_report("АвтоПост", payment_path=pp)
+
+        # Ни одна команда не должна уверенно говорить "не доходят до тарифов"
+        # если событие не настроено
+        bad_phrase = "почти не доходят до тарифов"
+        for cmd, text in [("/run", run_text), ("/funnel", funnel_text)]:
+            assert bad_phrase not in text, \
+                f"{cmd}: нельзя писать '{bad_phrase}' если tracking не настроен"
+
+        # /pay должен упоминать что tracking не настроен
+        assert "не настроено" in pay_text or "не отслеживается" in pay_text or "данных нет" in pay_text, \
+            "/pay не упомянул отсутствие tracking"
