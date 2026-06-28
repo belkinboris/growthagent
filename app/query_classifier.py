@@ -105,7 +105,8 @@ _GARBAGE_PATTERNS: dict[str, list[str]] = {
     "profile_decoration_non_post": [
         # Оформление профиля/аватара без связи с постингом
         "оформление профиля", "аватар профиль", "аватарка профиль",
-        "фото профиля", "шапка профиля",
+        "фото профиля", "шапка профиля", "шапку профиля", "шапке профиля",
+        "шапку канала", "шапке канала",
     ],
     "irrelevant_platform": [
         # Явно нерелевантные платформы без связи с Telegram/AI-постингом
@@ -450,17 +451,12 @@ def _contains_protected_term(query_lower: str) -> Optional[str]:
     return None
 
 
-def _detect_garbage_category(query_lower: str) -> Optional[str]:
+def _detect_garbage_category_raw(query_lower: str) -> Optional[str]:
     """
-    Возвращает название garbage-категории если запрос подходит под мусор,
-    иначе None. Не называем мусором то что содержит protected term.
+    Возвращает garbage-категорию без учёта protected terms.
+    Используется когда нужно проверить garbage независимо от контекста
+    (например, для UNCONDITIONAL_GARBAGE категорий).
     """
-    if _contains_protected_term(query_lower):
-        return None
-
-    # Специальные случаи: однословные или двусловные запросы без контекста.
-    # "max" / "макс" сами по себе почти всегда стриминг MAX, не наш продукт.
-    # "хентай" — взрослый контент.
     stripped = query_lower.strip()
     if stripped in ("max", "макс", "хентай", "hentai"):
         return "max_streaming" if stripped in ("max", "макс") else "adult_18_plus"
@@ -470,6 +466,17 @@ def _detect_garbage_category(query_lower: str) -> Optional[str]:
             if pattern in query_lower:
                 return category
     return None
+
+
+def _detect_garbage_category(query_lower: str) -> Optional[str]:
+    """
+    Возвращает название garbage-категории если запрос подходит под мусор,
+    иначе None. Не называем мусором то что содержит protected term.
+    """
+    if _contains_protected_term(query_lower):
+        return None
+
+    return _detect_garbage_category_raw(query_lower)
 
 
 def classify_query(
@@ -522,20 +529,46 @@ def classify_query(
             ),
         )
 
-    # 2. Safe negative -- семантический мусор + достаточно данных.
-    # Проверяем ДО protected-check: очевидный мусор (18+, youtube-шапки,
-    # перенос файлов и т.п.) минусуется даже если рядом стоит слово "канал",
-    # "контент" и т.п. -- контекст здесь явно нерелевантный.
-    # НО: если запрос содержит сильный protected term (telegram, телеграм,
-    # нейросеть, автопостинг, бот), garbage-вывод отменяется.
+    # 2. Safe negative / garbage detection.
+    # Правило приоритетов:
+    #   a) "Безусловный мусор" (adult, youtube_decoration, file_transfer,
+    #      profile_decoration_non_post, max_streaming, academic) — минусуем
+    #      даже если в запросе есть strong protected term (telegram/нейросеть).
+    #      Пример: "шапка профиля в телеграм" — profile decoration, не
+    #      telegram-постинг; "через ии" не меняет интент.
+    #   b) "Условный мусор" (cross_platform_not_telegram, irrelevant_platform) —
+    #      НЕ минусуем если есть strong protected term.
+    #      Пример: "автопостинг по группам тг" — cross-platform сигнал слабый,
+    #      а "автопост" защищает.
+
+    UNCONDITIONAL_GARBAGE: frozenset[str] = frozenset([
+        "adult_18_plus",
+        "youtube_decoration",
+        "file_transfer",
+        "profile_decoration_non_post",
+        "max_streaming",
+        "academic",
+    ])
+
     STRONG_PROTECTED: frozenset[str] = frozenset([
         "telegram", "телеграм", "tg",
         "нейросеть", "нейросети",
         "автопостинг", "автопост",
         "бот", "боты",
     ])
+
     has_strong_protected = any(term in q for term in STRONG_PROTECTED)
-    garbage_cat = None if has_strong_protected else _detect_garbage_category(q)
+
+    # Всегда проверяем на мусор (без учёта protected)
+    raw_garbage_cat = _detect_garbage_category_raw(q)
+
+    # Применяем правила приоритета
+    if raw_garbage_cat in UNCONDITIONAL_GARBAGE:
+        garbage_cat = raw_garbage_cat  # garbage overrides protected
+    elif raw_garbage_cat and not has_strong_protected:
+        garbage_cat = raw_garbage_cat  # обычная garbage без strong protected
+    else:
+        garbage_cat = None
 
     if garbage_cat and clicks >= MIN_CLICKS_FOR_NEGATIVE and cost >= MIN_SPEND_FOR_NEGATIVE_RUB:
         return QueryClassification(

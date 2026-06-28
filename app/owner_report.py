@@ -363,11 +363,18 @@ def _finding_payload(finding: dict) -> dict:
     return finding.get("payload") or {}
 
 
-def _format_direct_decision_layer(deep_diagnostics: dict | None) -> str:
+def _format_direct_decision_layer(deep_diagnostics: dict | None, has_direct_intelligence: bool = False) -> str:
     lines = ["Запросы и Директ:"]
     if not deep_diagnostics:
-        lines.append("— кэш глубокой диагностики запросов не приложен к этому /run; не делаю выводы по отдельным запросам.")
-        lines.append("— сейчас правило: не чистить рекламу по единичным низкозатратным запросам; для ручной проверки используйте /deep_direct.")
+        if has_direct_intelligence:
+            # DI cache есть — legacy deep diagnostics не нужен, не пишем "кэш не приложен"
+            lines.append(
+                "— legacy granular diagnostics по группам недоступен; "
+                "новый Direct Intelligence по поисковым запросам доступен ниже."
+            )
+        else:
+            lines.append("— кэш глубокой диагностики запросов не приложен к этому /run; не делаю выводы по отдельным запросам.")
+            lines.append("— сейчас правило: не чистить рекламу по единичным низкозатратным запросам; для ручной проверки используйте /deep_direct.")
         return "\n".join(lines)
 
     if deep_diagnostics.get("insufficient_data"):
@@ -859,7 +866,7 @@ def build_owner_report(
     blocks.append("\n".join(action_lines))
 
     blocks.append("Что не трогать:\n" + "\n".join(f"— {item}." for item in decision.do_not_touch))
-    blocks.append(_format_direct_decision_layer(deep_diagnostics))
+    blocks.append(_format_direct_decision_layer(deep_diagnostics, has_direct_intelligence=direct_intelligence is not None))
 
     # Блок рекламной аналитики из Direct Intelligence (cached snapshot)
     di_block = _format_direct_intelligence_block(direct_intelligence)
