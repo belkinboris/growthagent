@@ -108,6 +108,12 @@ _GARBAGE_PATTERNS: dict[str, list[str]] = {
         "фото профиля", "шапка профиля", "шапку профиля", "шапке профиля",
         "шапку канала", "шапке канала",
     ],
+    "mass_posting_bypass": [
+        # Массовый постинг/обход ограничений — не core intent АвтоПоста
+        "по группам без премиума", "постинг по группам", "без премиума тг",
+        "массовый постинг", "массовая рассылка", "спам бот",
+        "кросспостинг по группам",
+    ],
     "irrelevant_platform": [
         # Явно нерелевантные платформы без связи с Telegram/AI-постингом
         "wordpress блог", "blogger.com", "livejournal",
@@ -548,6 +554,7 @@ def classify_query(
         "profile_decoration_non_post",
         "max_streaming",
         "academic",
+        "mass_posting_bypass",  # обход ограничений/массовая рассылка
     ])
 
     STRONG_PROTECTED: frozenset[str] = frozenset([
