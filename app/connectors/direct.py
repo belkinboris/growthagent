@@ -570,6 +570,175 @@ def _parse_error_body(status_code: int, text: str) -> str:
     return f"HTTP {status_code} (error_code={error_code}): {detail}"
 
 
+def _build_search_query_goal_report_definition(
+    campaign_ids: list, date_from: str, date_to: str, goal_ids: list[int]
+) -> dict:
+    """
+    Report definition для SEARCH_QUERY_PERFORMANCE_REPORT с полем Conversions.
+
+    ВАЖНОЕ ОГРАНИЧЕНИЕ API Яндекс.Директ:
+    - SelectionCriteria.Goals -- фильтрует кампании/группы у которых есть
+      хотя бы одна из указанных целей. Это НЕ разбивка по GoalId.
+    - Поле "Conversions" в SEARCH_QUERY_PERFORMANCE_REPORT всегда возвращает
+      СУММАРНЫЕ конверсии по ВСЕМ целям, не только по переданным goal_ids.
+    - Per-goal разбивка (GoalsConversions) доступна только в
+      CAMPAIGN_PERFORMANCE_REPORT и AD_PERFORMANCE_REPORT, не в SEARCH_QUERY.
+
+    Таким образом: "Conversions" нельзя считать регистрациями даже при
+    передаче registration_goal_id. Атрибуция остаётся "unreliable".
+    Единственная польза goal_ids здесь -- фильтрация кампаний.
+
+    Эта функция оставлена для будущего использования когда/если API изменится.
+    Сейчас classifier получает registration_attribution="unreliable".
+    """
+    selection_criteria = {
+        "DateFrom": date_from,
+        "DateTo": date_to,
+    }
+    if goal_ids:
+        # Фильтрует кампании/группы, у которых есть эти цели.
+        # НЕ разбивает Conversions по целям.
+        selection_criteria["Goals"] = [str(g) for g in goal_ids]
+    if campaign_ids:
+        selection_criteria["Filter"] = [
+            {"Field": "CampaignId", "Operator": "IN", "Values": [str(c) for c in campaign_ids]}
+        ]
+
+    return {
+        "params": {
+            "SelectionCriteria": selection_criteria,
+            "FieldNames": [
+                "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
+                "Query", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc",
+                "Conversions",  # СУММАРНЫЕ по всем целям, не per-goal
+            ],
+            "ReportName": f"GrowthAgent_QueryGoal_{date_from}_{date_to}",
+            "ReportType": "SEARCH_QUERY_PERFORMANCE_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "YES",
+            "IncludeDiscount": "NO",
+        }
+    }
+
+
+async def fetch_search_query_goal_report(
+    oauth_token: Optional[str],
+    client_login: Optional[str],
+    campaign_ids: list,
+    goal_ids: list[int],
+    period_hours: int,
+    sandbox: bool = False,
+    timeout_seconds: float = 30.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    date_from_override: Optional[str] = None,
+    date_to_override: Optional[str] = None,
+) -> dict:
+    """
+    Поисковые запросы с полем Conversions (суммарным).
+
+    КРИТИЧЕСКОЕ ОГРАНИЧЕНИЕ: Яндекс.Директ SEARCH_QUERY_PERFORMANCE_REPORT
+    не поддерживает per-goal разбивку конверсий. Поле "Conversions" всегда
+    возвращает total по всем целям кампании, независимо от goal_ids.
+
+    По этой причине:
+    - registration_attribution в строках = "unreliable" (не "reliable")
+    - Данные конверсий НЕЛЬЗЯ использовать как число регистраций
+    - classify_search_queries() при attribution="none"|"unreliable" не строит
+      winner-классификацию на основе этих данных
+
+    goal_ids используется только как фильтр кампаний (SelectionCriteria.Goals),
+    не как per-goal разбивка.
+
+    Если goal_ids пустой -- работает как fetch_search_query_report + Conversions.
+    Не бросает ValueError (в отличие от предыдущей версии) -- фильтр по целям
+    просто не применяется.
+
+    Для надёжной атрибуции регистраций к поисковым запросам нужны данные из
+    AutoPost backend (product truth), а не из Direct API.
+    """
+    if not oauth_token or not client_login:
+        raise NotConfiguredError(
+            "DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set"
+        )
+
+    if date_from_override is not None and date_to_override is not None:
+        date_from, date_to = date_from_override, date_to_override
+    else:
+        date_from, date_to = _period_to_dates(period_hours)
+
+    report_definition = _build_search_query_goal_report_definition(
+        campaign_ids, date_from, date_to, goal_ids
+    )
+
+    text, attempt_statuses = await _execute_report_request(
+        report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
+    )
+
+    header, data_rows = _parse_tsv(text)
+    rows = []
+    for row in data_rows:
+        metrics = _row_metrics(row)
+        query = row.get("Query", "").strip()
+        if not query:
+            continue
+
+        # Conversions -- суммарные, НЕ per-goal. Не считать регистрациями.
+        try:
+            conversions = int(row.get("Conversions", 0) or 0)
+        except (ValueError, TypeError):
+            conversions = 0
+
+        rows.append({
+            "campaign_id": row.get("CampaignId", ""),
+            "campaign_name": row.get("CampaignName", ""),
+            "ad_group_id": row.get("AdGroupId", ""),
+            "ad_group_name": row.get("AdGroupName", ""),
+            "query": query,
+            "conversions_total": conversions,        # total, не регистрации
+            "registrations": None,                   # нет надёжной per-goal атрибуции
+            "registration_attribution": "unreliable", # НЕ reliable
+            **metrics,
+        })
+
+    return {
+        "rows": rows,
+        "goal_ids": goal_ids,
+        "registration_attribution": "unreliable",   # честная маркировка
+        "attribution_note": (
+            "SEARCH_QUERY_PERFORMANCE_REPORT не поддерживает per-goal разбивку. "
+            "Conversions = total по всем целям. Используйте backend product truth "
+            "для атрибуции регистраций."
+        ),
+        "_diagnostics": {
+            "attempt_statuses": attempt_statuses,
+            "date_from": date_from,
+            "date_to": date_to,
+            "rows_returned": len(rows),
+            "goal_ids": goal_ids,
+        },
+    }
+
+
+
+    import json
+
+    try:
+        body = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return f"HTTP {status_code}: {text[:300]}"
+
+    error = body.get("error", {})
+    error_code = error.get("error_code", "")
+    error_string = error.get("error_string", "")
+    error_detail = error.get("error_detail", "")
+
+    parts = [p for p in [error_string, error_detail] if p]
+    detail = "; ".join(parts) if parts else text[:300]
+
+    return f"HTTP {status_code} (error_code={error_code}): {detail}"
+
+
 # ---------------------------------------------------------------------------
 # Debug-функция
 # ---------------------------------------------------------------------------
