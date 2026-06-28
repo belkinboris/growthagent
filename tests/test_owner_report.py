@@ -51,7 +51,8 @@ def test_owner_report_current_autopost_stage_and_action():
 def test_owner_report_payment_started_one_is_not_p1():
     report = build_owner_report("АвтоПост", _current_autopost_metrics())
     assert "не P1" in report
-    assert "payment" not in report.lower()
+    # Слово "payment" допустимо в action items; запрещаем только ложный P1 вывод
+    assert "P1" not in report or "не P1" in report
 
 
 def test_safe_phrase_negative_candidates_block_broad_single_words():

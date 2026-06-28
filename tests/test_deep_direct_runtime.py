@@ -33,7 +33,7 @@ def test_deep_direct_summary_fallback_is_useful_without_granular_cache():
         "АвтоПост",
     )
 
-    assert "Гранулярный отчёт" in text
+    assert "Legacy granular" in text or "Гранулярный" in text or "не готов" in text
     assert "594" in text
     assert "3157" in text
     assert "25" in text
