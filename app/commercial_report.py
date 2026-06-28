@@ -470,6 +470,99 @@ def build_ads_report(
 # /funnel — продуктовая воронка
 # ---------------------------------------------------------------------------
 
+def _format_new_product_signals(payment_path: dict | None) -> str:
+    """
+    Форматирует блок новых ProductEvent сигналов: onboarding choice,
+    first post feedback, breakdown генераций.
+
+    Правила:
+    - Если все новые поля None/0 или payment_path=None — компактная фраза
+      "Новые сигналы ещё не накопились после деплоя."
+    - Без технических названий событий (нет onboarding_choice_selected и т.д.)
+    - Причины "не подошёл" показываем только если first_post_feedback_bad > 0
+    - Breakdown verified/unverified — только если хотя бы одно поле не None
+    """
+    if payment_path is None:
+        return ""
+
+    # Читаем новые поля — все опциональные
+    choice_counts = payment_path.get("onboarding_choice_counts")   # dict | None
+    fb_good = payment_path.get("first_post_feedback_good")          # int | None
+    fb_bad = payment_path.get("first_post_feedback_bad")            # int | None
+    fb_reasons = payment_path.get("first_post_feedback_reasons")    # dict | None
+    gen_verified = payment_path.get("post_generations_verified")    # int | None
+    gen_unverified = payment_path.get("post_generations_unverified") # int | None
+
+    # Определяем есть ли хоть что-то новое
+    has_choice = bool(choice_counts)
+    has_feedback = fb_good is not None or fb_bad is not None
+    has_gen_breakdown = gen_verified is not None or gen_unverified is not None
+
+    if not has_choice and not has_feedback and not has_gen_breakdown:
+        return "\nНовые сигналы ещё не накопились после деплоя."
+
+    lines = ["\nНовые сигналы:"]
+
+    # Onboarding choice
+    if has_choice and isinstance(choice_counts, dict):
+        generate = _n(choice_counts.get("generate_post") or choice_counts.get("first_post"))
+        analyze = _n(choice_counts.get("analyze_channel") or choice_counts.get("channel_analysis"))
+        skip = _n(choice_counts.get("skip") or choice_counts.get("skipped"))
+        if generate or analyze or skip:
+            lines.append(f"— Сгенерировать первый пост: {generate}")
+            lines.append(f"— Проанализировать канал: {analyze}")
+            lines.append(f"— Пропустить онбординг: {skip}")
+
+    # First post feedback
+    if has_feedback:
+        if fb_good is not None:
+            lines.append(f"— Первый пост подошёл: {_n(fb_good)}")
+        if fb_bad is not None:
+            lines.append(f"— Первый пост не подошёл: {_n(fb_bad)}")
+
+        # Причины — только если есть отрицательные отзывы
+        if fb_bad and _n(fb_bad) > 0 and fb_reasons and isinstance(fb_reasons, dict):
+            # Человекочитаемые названия причин
+            reason_labels = {
+                "too_generic":      "Слишком общий",
+                "wrong_style":      "Не тот стиль",
+                "wrong_topic":      "Не про тему",
+                "too_dry":          "Слишком сухо",
+                "too_promotional":  "Слишком рекламно",
+                "other":            "Другое",
+                # Возможные альтернативные ключи от AutoPost
+                "not_my_style":     "Не тот стиль",
+                "off_topic":        "Не про тему",
+                "too_salesy":       "Слишком рекламно",
+                "too_formal":       "Слишком сухо",
+            }
+            shown: set[str] = set()  # дедупликация если несколько ключей → одна метка
+            reasons_lines: list[str] = []
+            for key, count in fb_reasons.items():
+                if _n(count) == 0:
+                    continue
+                label = reason_labels.get(key)
+                if label and label not in shown:
+                    shown.add(label)
+                    reasons_lines.append(f"  — {label}: {_n(count)}")
+            if reasons_lines:
+                lines.append("  Причины:")
+                lines.extend(reasons_lines)
+
+    # Breakdown верифицированные/неверифицированные каналы
+    if has_gen_breakdown:
+        if gen_verified is not None:
+            lines.append(f"— Генерации у подключённых каналов: {_n(gen_verified)}")
+        if gen_unverified is not None:
+            lines.append(f"— Генерации у неподключённых каналов: {_n(gen_unverified)}")
+
+    if len(lines) == 1:
+        # Заголовок есть, но данных не добавилось — что-то пошло не так с форматом
+        return "\nНовые сигналы ещё не накопились после деплоя."
+
+    return "\n".join(lines)
+
+
 def build_funnel_report(
     project_name: str,
     metrics: "NormalizedMetrics | None",
@@ -577,6 +670,11 @@ def build_funnel_report(
             lines.append(f"\nДинамика: {', '.join(deltas)}.")
         else:
             lines.append("\nДинамика: без изменений.")
+
+    # ── Новые сигналы (onboarding choice + first post feedback) ─────────
+    new_signals_block = _format_new_product_signals(payment_path)
+    if new_signals_block:
+        lines.append(new_signals_block)
 
     lines.append("\n← /run  /ads →  /pay →")
     return "\n".join(lines)
