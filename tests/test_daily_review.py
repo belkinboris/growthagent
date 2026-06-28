@@ -1296,3 +1296,175 @@ class TestConsistencyRunFunnelPay:
         # /pay должен упоминать что tracking не настроен
         assert "не настроено" in pay_text or "не отслеживается" in pay_text or "данных нет" in pay_text, \
             "/pay не упомянул отсутствие tracking"
+
+
+# ---------------------------------------------------------------------------
+# Тесты новых ProductEvent сигналов в /funnel
+# ---------------------------------------------------------------------------
+
+class TestNewProductSignals:
+    """Блок новых сигналов: onboarding choice, first post feedback, gen breakdown."""
+
+    def _pp_base(self, **extra) -> dict:
+        base = {
+            "registrations": 30, "channels_created": 26, "post_generations": 75,
+            "pricing_viewed": None, "payment_cta_clicked": 0,
+            "payment_started": 0, "payment_success": 0,
+            "payment_failed": 0, "payment_returned": 0, "missing_data": [],
+        }
+        base.update(extra)
+        return base
+
+    def test_no_new_signals_shows_placeholder(self):
+        """Если новых данных нет — компактная фраза без пустого блока."""
+        from app.commercial_report import _format_new_product_signals
+        pp = self._pp_base()  # без новых полей
+        result = _format_new_product_signals(pp)
+        assert "не накопились" in result
+        assert "Новые сигналы" in result
+
+    def test_none_payment_path_returns_empty(self):
+        """Если payment_path=None — блок не добавляется."""
+        from app.commercial_report import _format_new_product_signals
+        result = _format_new_product_signals(None)
+        assert result == ""
+
+    def test_onboarding_choice_shown(self):
+        """onboarding_choice_counts отображается в понятном виде."""
+        from app.commercial_report import _format_new_product_signals
+        pp = self._pp_base(onboarding_choice_counts={
+            "generate_post": 15, "analyze_channel": 5, "skip": 3
+        })
+        result = _format_new_product_signals(pp)
+        assert "Сгенерировать первый пост: 15" in result
+        assert "Проанализировать канал: 5" in result
+        assert "Пропустить онбординг: 3" in result
+        # Нет технических названий событий
+        assert "onboarding_choice" not in result
+        assert "generate_post" not in result
+
+    def test_feedback_good_and_bad_shown(self):
+        """Feedback good/bad отображается."""
+        from app.commercial_report import _format_new_product_signals
+        pp = self._pp_base(first_post_feedback_good=12, first_post_feedback_bad=3)
+        result = _format_new_product_signals(pp)
+        assert "Первый пост подошёл: 12" in result
+        assert "Первый пост не подошёл: 3" in result
+
+    def test_feedback_reasons_shown_only_when_bad_gt_0(self):
+        """Причины показываются только при fb_bad > 0."""
+        from app.commercial_report import _format_new_product_signals
+        # С отрицательными отзывами — причины показываем
+        pp_with = self._pp_base(
+            first_post_feedback_bad=3,
+            first_post_feedback_reasons={"too_generic": 2, "wrong_style": 1}
+        )
+        result_with = _format_new_product_signals(pp_with)
+        assert "Слишком общий: 2" in result_with
+        assert "Не тот стиль: 1" in result_with
+
+        # Без отрицательных — причины не показываем
+        pp_without = self._pp_base(
+            first_post_feedback_good=5,
+            first_post_feedback_bad=0,
+            first_post_feedback_reasons={"too_generic": 0}
+        )
+        result_without = _format_new_product_signals(pp_without)
+        assert "Слишком общий" not in result_without
+
+    def test_feedback_reasons_no_technical_keys(self):
+        """Технические ключи (too_generic, wrong_style) не попадают в текст."""
+        from app.commercial_report import _format_new_product_signals
+        pp = self._pp_base(
+            first_post_feedback_bad=5,
+            first_post_feedback_reasons={
+                "too_generic": 2, "wrong_style": 1, "too_dry": 1, "other": 1
+            }
+        )
+        result = _format_new_product_signals(pp)
+        # Технические ключи не в тексте
+        assert "too_generic" not in result
+        assert "wrong_style" not in result
+        # Но русские метки есть
+        assert "Слишком общий" in result
+        assert "Не тот стиль" in result
+
+    def test_gen_breakdown_shown_only_when_data_exists(self):
+        """Breakdown verified/unverified показывается только если поля есть."""
+        from app.commercial_report import _format_new_product_signals
+        # С данными
+        pp_with = self._pp_base(
+            post_generations_verified=60, post_generations_unverified=15
+        )
+        result_with = _format_new_product_signals(pp_with)
+        assert "подключённых каналов: 60" in result_with
+        assert "неподключённых каналов: 15" in result_with
+
+        # Без данных — не показываем
+        pp_without = self._pp_base()  # нет этих полей
+        result_without = _format_new_product_signals(pp_without)
+        assert "подключённых" not in result_without
+
+    def test_funnel_report_includes_new_signals(self):
+        """build_funnel_report включает блок новых сигналов."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        pp = {
+            "pricing_viewed": None, "payment_started": 0, "payment_success": 0,
+            "onboarding_choice_counts": {"generate_post": 20, "analyze_channel": 5, "skip": 2},
+            "first_post_feedback_good": 15, "first_post_feedback_bad": 4,
+            "first_post_feedback_reasons": {"too_generic": 2, "wrong_style": 2},
+            "post_generations_verified": 60, "post_generations_unverified": 15,
+        }
+        text = build_funnel_report("АвтоПост", m, payment_path=pp)
+        assert "Новые сигналы:" in text
+        assert "Сгенерировать первый пост: 20" in text
+        assert "Слишком общий: 2" in text
+        assert "подключённых каналов: 60" in text
+        # Нет технических терминов
+        assert "onboarding_choice" not in text
+        assert "first_post_feedback" not in text
+
+    def test_funnel_report_zero_new_signals_shows_placeholder(self):
+        """Если новых данных нет — не ломается, показывает 'ещё не накопились'."""
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=75,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0}
+        text = build_funnel_report("АвтоПост", m, payment_path=pp)
+        assert "не накопились" in text
+        # Весь отчёт работает
+        assert "АвтоПост" in text
+        assert "Воронка" in text
+
+
+class TestPaymentPathConnectorNewFields:
+    """Connector читает новые поля через _EXPECTED_FIELDS."""
+
+    def test_new_fields_in_expected_fields(self):
+        from app.connectors.payment_path import _EXPECTED_FIELDS
+        for field in [
+            "onboarding_choice_counts", "first_post_feedback_good",
+            "first_post_feedback_bad", "first_post_feedback_reasons",
+            "post_generations_verified", "post_generations_unverified",
+        ]:
+            assert field in _EXPECTED_FIELDS, f"{field} не в _EXPECTED_FIELDS"
+
+    def test_aliases_for_new_fields(self):
+        from app.connectors.payment_path import _FIELD_ALIASES
+        assert "onboarding_choice_counts" in _FIELD_ALIASES
+        assert "first_post_feedback_good" in _FIELD_ALIASES
+        assert "post_generations_verified" in _FIELD_ALIASES
+
+    def test_resolve_field_with_alias(self):
+        from app.connectors.payment_path import _resolve_field
+        raw = {"feedback_good": 5}
+        assert _resolve_field(raw, "first_post_feedback_good") == 5
+
+    def test_resolve_field_canonical(self):
+        from app.connectors.payment_path import _resolve_field
+        raw = {"onboarding_choice_counts": {"generate_post": 10}}
+        assert _resolve_field(raw, "onboarding_choice_counts") == {"generate_post": 10}
