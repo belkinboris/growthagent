@@ -409,13 +409,17 @@ def build_ads_report(
             )
 
     if spend or clicks:
-        lines.append(f"\nЦифры: {spend:.0f} ₽ / {clicks} кликов" +
-                     (f" / {signup} регистраций / CPA {cpa:.0f} ₽" if cpa else ""))
+        cpa_str = f" / цена регистрации: {cpa:.0f} ₽" if cpa else ""
+        lines.append(f"\nЦифры: {spend:.0f} ₽ / {clicks} кликов{cpa_str}")
 
     # Запросы
     if direct_intelligence is not None:
-        # Что оставить
-        good_queries = direct_intelligence.do_not_touch[:5]
+        # Что оставить — только DO_NOT_TOUCH запросы БЕЗ garbage_category
+        # (garbage_category означает что запрос мусорный, пусть и с защищённым термином)
+        good_queries = [
+            q for q in direct_intelligence.do_not_touch
+            if not q.garbage_category  # исключаем обход ограничений, шапки и т.п.
+        ][:5]
         if good_queries:
             lines.append("\n✅ Что оставить:")
             for q in good_queries:
@@ -440,8 +444,8 @@ def build_ads_report(
                 lines.append(f"— «{q.query}»")
             if len(direct_intelligence.safe_negatives) > 5:
                 lines.append(
-                    f"  _... и ещё {len(direct_intelligence.safe_negatives) - 5} запросов. "
-                    "Добавлять в минус-фразы только точные формулировки, не широкие слова._"
+                    f"  ... и ещё {len(direct_intelligence.safe_negatives) - 5} запросов. "
+                    "Добавлять в минус-фразы только точные формулировки, не широкие слова."
                 )
         else:
             lines.append("\n🗑 Что можно исключить:")

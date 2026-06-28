@@ -2203,10 +2203,12 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Продуктовая воронка — быстро из кэша, без внешних API."""
+    """Продуктовая воронка — быстро из кэша, без внешних API.
+    Использует тот же источник данных (_normalized_metrics_from_snapshot),
+    что и /run — гарантирует согласованность.
+    """
     try:
         from app.commercial_report import build_funnel_report
-        from app.service import get_previous_snapshot, extract_normalized_metrics_from_snapshot
 
         with get_session() as session:
             project = _get_active_project(session)
@@ -2214,16 +2216,7 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await safe_reply(update, "Активный проект не найден.")
                 return
 
-            snapshot = session.exec(
-                select(MetricSnapshot)
-                .where(
-                    MetricSnapshot.project_id == project.id,
-                    MetricSnapshot.period_key == "7d",
-                    MetricSnapshot.source == "combined",
-                )
-                .order_by(MetricSnapshot.created_at.desc())
-                .limit(1)
-            ).first()
+            snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
 
             if snapshot is None:
                 await safe_reply(update,
@@ -2232,44 +2225,28 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
                 return
 
-            current = extract_normalized_metrics_from_snapshot(snapshot)
-            from app.rules import NormalizedMetrics
-            metrics_obj = NormalizedMetrics(
-                period_key="7d",
-                signup=current.get("signup"),
-                activation_1=current.get("activation_1"),
-                activation_2=current.get("activation_2"),
-                payment_started=current.get("payment_started"),
-                payment_success=current.get("payment_success"),
-                spend=current.get("spend"),
-                clicks=current.get("clicks"),
-                sources_ok=set(),
-            )
+            # Используем тот же хелпер что и /run (_normalized_metrics_from_snapshot),
+            # у него защита от metrics_json=None через `or {}`
+            metrics_obj = _normalized_metrics_from_snapshot(snapshot)
 
             pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
             pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
+            # Предыдущий снапшот для динамики
+            from app.service import get_previous_snapshot
             prev_snapshot = get_previous_snapshot(session, project.id, "7d")
             prev_metrics = None
             if prev_snapshot and prev_snapshot.id != snapshot.id:
-                prev_raw = extract_normalized_metrics_from_snapshot(prev_snapshot)
-                prev_metrics = NormalizedMetrics(
-                    period_key="7d",
-                    signup=prev_raw.get("signup"),
-                    activation_1=prev_raw.get("activation_1"),
-                    activation_2=prev_raw.get("activation_2"),
-                    payment_started=prev_raw.get("payment_started"),
-                    payment_success=prev_raw.get("payment_success"),
-                    sources_ok=set(),
-                )
+                prev_metrics = _normalized_metrics_from_snapshot(prev_snapshot)
 
             project_name = project.name
+            snapshot_dt = snapshot.created_at
 
         text = build_funnel_report(
             project_name,
             metrics_obj,
             payment_path=pp_dict,
-            snapshot_dt=snapshot.created_at,
+            snapshot_dt=snapshot_dt,
             prev_metrics=prev_metrics,
         )
         await safe_reply(update, text)
