@@ -752,10 +752,10 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
         cpa = (spend / signups) if signups and spend else None
 
         lines.append(
-            "Legacy granular отчёт Директа по группам не готов "
+            f"Детализация по группам объявлений сейчас недоступна "
             f"(последний сохранённый замер от {cache_time}). "
-            "Новый Direct Intelligence по поисковым запросам обновляется отдельно через /deep_direct "
-            "и будет использован в следующем /run."
+            "Анализ поисковых запросов обновляется через /deep_direct "
+            "и будет учтён в следующем /run."
         )
         lines.append("")
         lines.append("Что известно по рекламе за 7 дней:")
@@ -777,13 +777,13 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
             lines.append(line + ".")
 
         lines.append(
-            "\nВывод: legacy granular diagnostics по группам не готов. "
-            "Новый Direct Intelligence по поисковым запросам обновлён и используется в /run. "
-            "Атрибуции регистраций на query-level нет, поэтому выводы по запросам ограничены семантикой/расходом."
+            "\nАнализ рекламы по группам объявлений обновлён — результаты учтены в /run.\n"
+            "Выводы по поисковым запросам основаны на смысле запросов и расходе.\n"
+            "Точная привязка каждого запроса к регистрации сейчас недоступна."
         )
         lines.append(
-            "\nЧто делать: не минусовать одиночные низкозатратные запросы, не менять резко ставки/бюджет. "
-            "Direct Intelligence в /run покажет safe negatives и watch-запросы."
+            "\nЧто делать: не менять резко ставки и бюджет. "
+            "Подробности по запросам и возможным лишним тратам: /ads"
         )
         return "\n".join(lines)
 
@@ -823,8 +823,6 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
                 lines.append(f"— {risk['detail']}")
         else:
             lines.append("Проверил группы объявлений и поисковые запросы — явных проблем не нашёл.")
-        attribution_status = deep_diagnostics.get("attribution_status", "not_available")
-        lines.append(f"\nАтрибуция регистраций к Директу: {attribution_ru.get(attribution_status, attribution_status)}.")
         return "\n".join(lines)
 
     lines.append(f"Главная находка:\n{main_finding['detail']}")
@@ -849,10 +847,7 @@ def format_deep_diagnostics_details(deep_diagnostics: dict, project_name: str) -
     # Confidence факта (находки) и confidence атрибуции -- РАЗНЫЕ строки,
     # явно подписанные, чтобы не читались как противоречие друг другу.
     finding_confidence = confidence_ru.get(main_finding.get("confidence", "medium"), "средняя")
-    lines.append(f"\nУверенность в самой находке (фактах и цифрах): {finding_confidence}.")
-
-    attribution_status = deep_diagnostics.get("attribution_status", "not_available")
-    lines.append(f"Атрибуция к рекламе: {attribution_ru.get(attribution_status, attribution_status)}.")
+    lines.append(f"\nУверенность в выводах: {finding_confidence}.")
 
     known_risks = deep_diagnostics.get("known_risks", [])
     if known_risks:
@@ -1625,17 +1620,16 @@ def _build_status_text_sync() -> str:
         )
 
         return "\n".join([
-            "Состояние Аналитика Воронки",
+            "Аналитик Воронки — состояние",
             f"Проект: {project.name}",
-            f"Версия: {BUILD_MARKER}",
+            f"Версия сборки: {BUILD_MARKER.removeprefix('growth-agent-')}",
             f"Режим: {mode_ru.get(current_mode, current_mode)}",
-            f"Работает без перезапуска: {uptime_str}",
+            f"Бот работает без перезапуска: {uptime_str}",
             "",
             last_run_line,
             snapshot_line,
             signals_line,
             "",
-            "Технические детали — Railway logs.",
             "Внешние источники проверяются через /test_metrika, /test_direct или /run.",
         ])
 
@@ -1644,8 +1638,8 @@ def _build_status_fallback_text(reason: str) -> str:
     from app.commercial_report import _fmt_dt_msk
     last_run_str = _fmt_dt_msk(_last_run_finished_at) if _last_run_finished_at else "ещё не запускался"
     return "\n".join([
-        "Аналитик Воронки — статус",
-        f"Версия: {BUILD_MARKER}",
+        "Аналитик Воронки — состояние",
+        f"Версия сборки: {BUILD_MARKER.removeprefix('growth-agent-')}",
         "Telegram-бот: работает",
         f"Последний /run: {last_run_str}",
         f"База данных статуса временно недоступна: {reason}.",
@@ -2081,6 +2075,56 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
                 _manual_run_started_at = None
 
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Техническая информация для разработчика.
+    Сюда вынесено всё что не показывается владельцу в обычных командах:
+    полный build marker, состояние кэшей, внутренние статусы.
+    """
+    from app.commercial_report import _fmt_dt_msk
+    lines = [
+        "DEBUG — Аналитик Воронки",
+        f"BUILD_MARKER: {BUILD_MARKER}",
+        f"SERVICE_STARTED_AT: {_fmt_dt_msk(SERVICE_STARTED_AT)}",
+    ]
+    if _last_run_finished_at:
+        lines.append(f"last_run_finished_at: {_fmt_dt_msk(_last_run_finished_at)}")
+        lines.append(f"last_run_was_live: {_last_run_was_live}")
+    else:
+        lines.append("last_run_finished_at: None")
+
+    if _manual_run_task and not _manual_run_task.done():
+        lines.append("manual_run_task: RUNNING")
+    else:
+        lines.append("manual_run_task: idle")
+
+    if _deep_direct_task and not _deep_direct_task.done():
+        lines.append("deep_direct_task: RUNNING")
+    else:
+        lines.append("deep_direct_task: idle")
+
+    try:
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project:
+                lines.append(f"project_id: {project.id}")
+                lines.append(f"project_name: {project.name}")
+                # Проверяем наличие DI кэша
+                di_cache = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
+                if di_cache and di_cache.ok:
+                    rows = (di_cache.result_json or {}).get("total_queries_analyzed", "?")
+                    lines.append(f"DI cache: ok, rows={rows}")
+                else:
+                    lines.append("DI cache: miss")
+                pp_cache = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+                lines.append(f"payment_path cache: {'ok' if pp_cache and pp_cache.ok else 'miss'}")
+    except Exception as exc:
+        lines.append(f"DB error: {type(exc).__name__}: {exc}")
+
+    lines.append("\nПолные логи: Railway Deploy logs.")
+    await safe_reply(update, "\n".join(lines))
+
+
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Manual /run is isolated from Telegram update processing.
@@ -2203,10 +2247,7 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Продуктовая воронка — быстро из кэша, без внешних API.
-    Использует тот же источник данных (_normalized_metrics_from_snapshot),
-    что и /run — гарантирует согласованность.
-    """
+    """Продуктовая воронка — быстро из кэша, без внешних API."""
     try:
         from app.commercial_report import build_funnel_report
 
@@ -2225,34 +2266,67 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
                 return
 
-            # Используем тот же хелпер что и /run (_normalized_metrics_from_snapshot),
-            # у него защита от metrics_json=None через `or {}`
-            metrics_obj = _normalized_metrics_from_snapshot(snapshot)
+            # Строим метрики максимально защищённо — избегаем любых lazy-load
+            # и обращений к snapshot за пределами сессии
+            raw = snapshot.metrics_json or {}
+            product = raw.get("product") or {}
+            direct_data = raw.get("direct") or {}
+            snap_period = snapshot.period_key or "7d"
+            snap_sources = {
+                name for name in ["product", "metrika", "direct", "yookassa"]
+                if raw.get(name) is not None
+            }
+            snap_created_at = snapshot.created_at
+            project_name = project.name
+            snap_id = snapshot.id
+
+            metrics_obj = NormalizedMetrics(period_key=snap_period, sources_ok=snap_sources)
+            metrics_obj.signup = product.get("signup")
+            metrics_obj.activation_1 = product.get("activation_1")
+            metrics_obj.activation_2 = product.get("activation_2")
+            metrics_obj.payment_started = product.get("payment_started")
+            metrics_obj.payment_success = product.get("payment_success")
+            metrics_obj.spend = direct_data.get("spend")
+            metrics_obj.clicks = direct_data.get("clicks")
 
             pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
             pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
-            # Предыдущий снапшот для динамики
+            # Предыдущий снапшот — безопасно извлекаем данные внутри сессии
             from app.service import get_previous_snapshot
             prev_snapshot = get_previous_snapshot(session, project.id, "7d")
             prev_metrics = None
-            if prev_snapshot and prev_snapshot.id != snapshot.id:
-                prev_metrics = _normalized_metrics_from_snapshot(prev_snapshot)
+            if prev_snapshot and prev_snapshot.id != snap_id:
+                prev_raw = prev_snapshot.metrics_json or {}
+                prev_product = prev_raw.get("product") or {}
+                prev_direct = prev_raw.get("direct") or {}
+                prev_metrics = NormalizedMetrics(period_key="7d", sources_ok=set())
+                prev_metrics.signup = prev_product.get("signup")
+                prev_metrics.activation_1 = prev_product.get("activation_1")
+                prev_metrics.activation_2 = prev_product.get("activation_2")
+                prev_metrics.payment_started = prev_product.get("payment_started")
+                prev_metrics.payment_success = prev_product.get("payment_success")
+                prev_metrics.spend = prev_direct.get("spend")
+                prev_metrics.clicks = prev_direct.get("clicks")
 
-            project_name = project.name
-            snapshot_dt = snapshot.created_at
-
+        # Всё нужное уже скопировано из объектов сессии — сессия закрыта безопасно
         text = build_funnel_report(
             project_name,
             metrics_obj,
             payment_path=pp_dict,
-            snapshot_dt=snapshot_dt,
+            snapshot_dt=snap_created_at,
             prev_metrics=prev_metrics,
         )
         await safe_reply(update, text)
+
     except Exception as exc:
         logger.exception("/funnel failed: %s: %s", type(exc).__name__, exc)
-        await safe_reply(update, "Не удалось получить данные по воронке. Технические детали: /status")
+        # Показываем тип ошибки — помогает диагностировать без Railway logs
+        await safe_reply(update,
+            f"Не удалось получить данные по воронке.\n"
+            f"Причина: {type(exc).__name__}: {str(exc)[:200]}\n"
+            "Полный traceback: Railway logs (строка '/funnel failed')."
+        )
 
 
 async def cmd_test_metrika(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2662,8 +2736,8 @@ async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     settings = get_settings()
     if not (settings.effective_direct_oauth_token and settings.direct_client_login):
         await update.message.reply_text(
-            "Директ не настроен (нет OAuth-токена или DIRECT_CLIENT_LOGIN) — "
-            "глубокая диагностика недоступна."
+            "Подключение к Яндекс.Директу не настроено — анализ рекламных запросов недоступен.\n"
+            "Остальные команды /run, /ads, /funnel и /pay работают в обычном режиме."
         )
         return
 
@@ -2693,8 +2767,8 @@ async def cmd_deep_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             _deep_direct_started_at = None
 
         await update.message.reply_text(
-            "Запускаю глубокую диагностику Директа (группы объявлений, поисковые запросы)...\n"
-            "Если Директ отвечает медленно, покажу последний сохранённый результат или понятную ошибку."
+            "Обновляю анализ рекламы: поисковые запросы и группы объявлений.\n"
+            "Это может занять 1–2 минуты."
         )
 
         try:
@@ -2937,6 +3011,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("ads", cmd_ads))
     app.add_handler(CommandHandler("pay", cmd_pay))
