@@ -1509,18 +1509,25 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cheap build diagnostics: no external APIs."""
+    """Версия сборки — редирект на /status для владельца, или краткая строка."""
+    from app.commercial_report import _fmt_dt_msk, _MSK
     now = datetime.now(timezone.utc)
-    uptime = (now - SERVICE_STARTED_AT).total_seconds()
-    run_state = "не запущена"
-    if _manual_run_task is not None and not _manual_run_task.done() and _manual_run_started_at is not None:
-        run_state = f"идёт {_format_duration((now - _manual_run_started_at).total_seconds())}"
-    await update.message.reply_text(
-        "Сборка Аналитика Воронки\n"
-        f"Версия: {BUILD_MARKER}\n"
-        f"Запущен: {SERVICE_STARTED_AT.isoformat()}\n"
-        f"Uptime: {_format_duration(uptime)}\n"
-        f"Ручная проверка /run: {run_state}"
+    uptime_sec = int((now - SERVICE_STARTED_AT).total_seconds())
+    if uptime_sec < 3600:
+        uptime_str = f"{uptime_sec // 60} мин."
+    elif uptime_sec < 86400:
+        h, m = divmod(uptime_sec // 60, 60)
+        uptime_str = f"{h} ч. {m} мин."
+    else:
+        d, rem = divmod(uptime_sec, 86400)
+        uptime_str = f"{d} дн. {rem // 3600} ч."
+    started_msk = _fmt_dt_msk(SERVICE_STARTED_AT)
+    await safe_reply(update,
+        f"Аналитик Воронки\n"
+        f"Версия сборки: {BUILD_MARKER.removeprefix('growth-agent-')}\n"
+        f"Запущен: {started_msk}\n"
+        f"Бот работает без перезапуска: {uptime_str}\n"
+        f"\nТехнические детали: /debug"
     )
 
 
