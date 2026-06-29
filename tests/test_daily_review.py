@@ -1468,3 +1468,125 @@ class TestPaymentPathConnectorNewFields:
         from app.connectors.payment_path import _resolve_field
         raw = {"onboarding_choice_counts": {"generate_post": 10}}
         assert _resolve_field(raw, "onboarding_choice_counts") == {"generate_post": 10}
+
+
+# ---------------------------------------------------------------------------
+# P0 Language Cleanup тесты
+# ---------------------------------------------------------------------------
+
+OWNER_BANNED_TERMS = [
+    "legacy", "fallback", "cache", "backend",
+    "Direct Intelligence", "safe negative", "watch quer",
+    "query level", "attribution", "GoalId",
+    "SEARCH_QUERY_PERFORMANCE_REPORT", "granular",
+    "uptime", "build marker", "Uptime",
+    "raw", "debug",
+]
+
+class TestBannedTermsInOwnerMessages:
+    """Технические термины не попадают в owner-facing сообщения."""
+
+    def _m(self):
+        from app.rules import NormalizedMetrics
+        return NormalizedMetrics(period_key="7d", signup=30, activation_1=26,
+            activation_2=74, payment_started=0, payment_success=0,
+            spend=4800, clicks=528, sources_ok=set())
+
+    def _pp(self):
+        return {"pricing_viewed": 1, "payment_started": 0, "payment_success": 0,
+                "payment_failed": 0, "payment_returned": 0, "missing_data": []}
+
+    def _check(self, text: str, cmd: str):
+        low = text.lower()
+        for term in OWNER_BANNED_TERMS:
+            assert term.lower() not in low, \
+                f"{cmd}: запрещённый термин {term!r} найден в тексте"
+
+    def test_run_no_banned_terms(self):
+        from app.commercial_report import build_run_report
+        self._check(build_run_report("АвтоПост", self._m(), payment_path=self._pp()), "/run")
+
+    def test_funnel_no_banned_terms(self):
+        from app.commercial_report import build_funnel_report
+        self._check(build_funnel_report("АвтоПост", self._m(), payment_path=self._pp()), "/funnel")
+
+    def test_pay_no_banned_terms(self):
+        from app.commercial_report import build_pay_report
+        self._check(build_pay_report("АвтоПост", payment_path=self._pp()), "/pay")
+
+    def test_ads_no_banned_terms(self):
+        from app.commercial_report import build_ads_report
+        self._check(build_ads_report("АвтоПост", metrics=self._m()), "/ads")
+
+    def test_deep_direct_success_no_banned_terms(self):
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="ok", intel_rows=3283,
+            intel_error=None, legacy_ok=True, project_name="АвтоПост")
+        self._check(text, "/deep_direct success")
+
+    def test_deep_direct_partial_no_banned_terms(self):
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="ok", intel_rows=3283,
+            intel_error=None, legacy_ok=False, project_name="АвтоПост")
+        self._check(text, "/deep_direct partial")
+        assert "группам" in text  # понятная замена legacy granular
+
+    def test_deep_direct_failure_no_banned_terms(self):
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="error", intel_rows=0,
+            intel_error="timeout", legacy_ok=False, project_name="АвтоПост")
+        self._check(text, "/deep_direct failure")
+        assert "/run" in text or "/ads" in text  # говорим что другие команды работают
+
+    def test_deep_direct_success_message_content(self):
+        """Успешный /deep_direct показывает что будет учтено."""
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="ok", intel_rows=3283,
+            intel_error=None, legacy_ok=True, project_name="АвтоПост")
+        assert "3283" in text
+        assert "/ads" in text
+        assert "/run" in text
+        assert "Анализ рекламы обновлён" in text
+
+    def test_deep_direct_start_message_human_language(self):
+        """Стартовое сообщение /deep_direct на человеческом языке."""
+        # Стартовое сообщение захардкожено в cmd_deep_direct
+        # Проверяем через grep что технических слов там нет
+        import subprocess
+        result = subprocess.run(
+            ["grep", "-n", "Запускаю глубокую диагностику", 
+             "/home/claude/growthagent-main/app/telegram_bot.py"],
+            capture_output=True, text=True
+        )
+        assert result.returncode != 0, \
+            "Старое стартовое сообщение с 'глубокую диагностику' ещё осталось"
+
+
+class TestStatusHumanLanguage:
+    """/status использует русские даты и не содержит Uptime/UTC/build marker."""
+
+    def test_no_raw_utc_in_status_output(self):
+        """UTC не должен показываться в обычном /status."""
+        # /status строится через _build_status_text_sync которая использует _fmt_dt_msk
+        from app.commercial_report import _fmt_dt_msk
+        from datetime import datetime, timezone
+        dt = datetime(2026, 6, 29, 10, 40, tzinfo=timezone.utc)
+        formatted = _fmt_dt_msk(dt)
+        assert "МСК" in formatted
+        assert "UTC" not in formatted
+        assert "2026" in formatted
+
+    def test_russian_month_names(self):
+        """Месяц отображается по-русски."""
+        from app.commercial_report import _fmt_dt_msk
+        from datetime import datetime, timezone
+        dt = datetime(2026, 6, 29, 10, 40, tzinfo=timezone.utc)
+        formatted = _fmt_dt_msk(dt)
+        assert "июня" in formatted
+
+    def test_deep_direct_status_no_utc(self):
+        """Статус /deep_direct не содержит UTC."""
+        from app.commercial_report import build_deep_direct_status
+        text = build_deep_direct_status(intel_status="ok", intel_rows=100,
+            intel_error=None, legacy_ok=True, project_name="АвтоПост")
+        assert "UTC" not in text
