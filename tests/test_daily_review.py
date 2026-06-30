@@ -1590,3 +1590,113 @@ class TestStatusHumanLanguage:
         text = build_deep_direct_status(intel_status="ok", intel_rows=100,
             intel_error=None, legacy_ok=True, project_name="АвтоПост")
         assert "UTC" not in text
+
+
+# ---------------------------------------------------------------------------
+# /today тесты
+# ---------------------------------------------------------------------------
+
+class TestTodayReport:
+
+    def _m(self, **kw):
+        from app.rules import NormalizedMetrics
+        d = dict(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        d.update(kw)
+        return NormalizedMetrics(**d)
+
+    def _pp(self, **kw):
+        base = {"pricing_viewed": 1, "payment_started": 0, "payment_success": 0}
+        base.update(kw)
+        return base
+
+    def test_today_basic_structure(self):
+        from app.commercial_report import build_today_report
+        text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
+        for section in ["Что сейчас проверяем", "Цель на неделю", "На что смотрим",
+                         "Прогресс", "Следующее решение", "Что сейчас не трогаем",
+                         "Главный кандидат"]:
+            assert section in text, f"Не найдена секция: {section}"
+
+    def test_today_no_banned_terms(self):
+        from app.commercial_report import build_today_report
+        text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
+        for term in ["legacy", "fallback", "cache", "Direct Intelligence",
+                     "attribution", "granular", "backend", "UTM"]:
+            assert term not in text, f"Запрещённый термин {term!r} в /today"
+
+    def test_today_path_to_tariffs_stage(self):
+        """При мало просмотров тарифов — стадия path_to_tariffs."""
+        from app.commercial_report import build_today_report
+        text = build_today_report("АвтоПост", self._m(), payment_path=self._pp(pricing_viewed=1))
+        assert "тарифы" in text.lower()
+        assert "Очередь постов" in text
+
+    def test_today_with_new_signals(self):
+        """При наличии feedback данных — прогресс показывает их."""
+        from app.commercial_report import build_today_report
+        pp = self._pp(
+            first_post_feedback_good=15, first_post_feedback_bad=3,
+            onboarding_choice_counts={"generate_post": 20, "skip": 2}
+        )
+        text = build_today_report("АвтоПост", self._m(), payment_path=pp)
+        assert "15" in text or "18" in text or "положительных" in text
+        assert "20" in text or "генерацию" in text
+
+    def test_today_payment_flow_stage(self):
+        """При payment_started > 0 — стадия payment_flow."""
+        from app.commercial_report import build_today_report
+        m = self._m(payment_started=2)
+        pp = self._pp(payment_started=2, pricing_viewed=8)
+        text = build_today_report("АвтоПост", m, payment_path=pp)
+        assert "платёж" in text.lower() or "YooKassa" in text
+
+    def test_today_no_payments_candidate_is_queue(self):
+        """Главный кандидат — очередь постов при стадии path_to_tariffs."""
+        from app.commercial_report import build_today_report
+        text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
+        assert "кандидат" in text.lower()
+        assert "не задача в работу" in text
+
+
+class TestTrafficSources:
+
+    def test_no_breakdown_returns_explanation(self):
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {"pricing_viewed": 1, "payment_started": 0}
+        breakdown = parse_source_breakdown(pp)
+        assert breakdown is None
+        text = format_source_breakdown(breakdown, pp)
+        assert "utm_source" in text or "источни" in text.lower()
+
+    def test_with_breakdown_shows_sources(self):
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 25, "channels_created": 20,
+                    "post_generations": 60, "pricing_viewed": 1,
+                    "payment_started": 0, "payment_success": 0},
+                "telegram_ads": {"registrations": 5, "channels_created": 4,
+                    "post_generations": 12, "pricing_viewed": 0,
+                    "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        assert breakdown is not None
+        text = format_source_breakdown(breakdown, pp)
+        assert "Яндекс.Директ" in text
+        assert "Telegram Ads" in text
+        assert "25" in text  # регистраций из Директа
+        assert "5" in text   # регистраций из TG Ads
+        assert "eLama" in text or "рекламного кабинета" in text
+
+    def test_utm_guide_available(self):
+        from app.connectors.traffic_sources import TELEGRAM_ADS_UTM_GUIDE
+        assert "utm_source=telegram_ads" in TELEGRAM_ADS_UTM_GUIDE
+        assert "tgads_" in TELEGRAM_ADS_UTM_GUIDE
+        assert "utm_medium=cpc" in TELEGRAM_ADS_UTM_GUIDE
+
+    def test_known_sources_mapping(self):
+        from app.connectors.traffic_sources import KNOWN_SOURCES
+        assert KNOWN_SOURCES["yandex_direct"] == "Яндекс.Директ"
+        assert KNOWN_SOURCES["telegram_ads"] == "Telegram Ads"
