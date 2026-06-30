@@ -2554,3 +2554,316 @@ class TestOldCommandsStillWorkAfterNotifications:
             build_experiments_report("TruePost"),
         ]:
             assert "штаб" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Per-user journeys (TruePost /api/internal/user-journeys)
+# ---------------------------------------------------------------------------
+
+class TestUserJourneysConnector:
+
+    @pytest.mark.asyncio
+    async def test_parses_journeys_successfully(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.user_journeys import fetch_user_journeys
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "ok": True,
+            "period_hours": 24,
+            "as_of": "2026-06-29T12:00:00Z",
+            "journeys": [
+                {
+                    "user_key": "u_febdae54",
+                    "source": "telegram_ads",
+                    "utm_source": "telegram_ads",
+                    "registered_at": "2026-06-29T10:00:00Z",
+                    "channel_created_at": "2026-06-29T10:05:00Z",
+                    "onboarding_choice": "generate_first_post",
+                    "first_post_feedback": None,
+                    "pricing_viewed_at": "2026-06-29T10:10:00Z",
+                    "payment_started_at": None,
+                    "payment_success_at": None,
+                    "last_step": "pricing_viewed",
+                    "stuck_at": "tariff_screen",
+                    "minutes_since_last_step": 5,
+                },
+            ],
+        }
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_journeys(
+                base_url="https://example.com", api_token="test-token",
+            )
+
+        assert result["ok"] is True
+        assert len(result["journeys"]) == 1
+        assert result["journeys"][0]["user_key"] == "u_febdae54"
+
+    @pytest.mark.asyncio
+    async def test_not_configured_returns_ok_false(self):
+        from app.connectors.user_journeys import fetch_user_journeys
+        result = await fetch_user_journeys(base_url=None, api_token=None)
+        assert result["ok"] is False
+        assert result["status"] == "not_configured"
+
+    @pytest.mark.asyncio
+    async def test_404_returns_ok_false_not_found(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.user_journeys import fetch_user_journeys
+
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_journeys(base_url="https://example.com", api_token="test")
+
+        assert result["ok"] is False
+        assert result["status"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_ok_false(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+        from app.connectors.user_journeys import fetch_user_journeys
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_journeys(base_url="https://example.com", api_token="test")
+
+        assert result["ok"] is False
+        assert result["status"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_skips_malformed_journey_entries(self):
+        """Записи без user_key пропускаются, не валят весь парсинг."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.user_journeys import fetch_user_journeys
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "ok": True, "period_hours": 24, "as_of": "...",
+            "journeys": [
+                {"user_key": "u_valid", "source": "telegram_ads"},
+                {"source": "yandex_direct"},  # нет user_key -- пропускается
+                "not_a_dict",  # тоже пропускается
+            ],
+        }
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_journeys(base_url="https://example.com", api_token="test")
+
+        assert result["ok"] is True
+        assert len(result["journeys"]) == 1
+        assert result["journeys"][0]["user_key"] == "u_valid"
+
+
+class TestJourneyEventKeys:
+
+    def test_event_key_format(self):
+        from app.notifications import build_journey_event_key
+        key = build_journey_event_key("u_febdae54", "pricing_viewed", "2026-06-29T10:10:00Z")
+        assert key == "journey:u_febdae54:pricing_viewed:2026-06-29T10:10:00Z"
+
+    def test_event_key_with_extra(self):
+        from app.notifications import build_journey_event_key
+        key = build_journey_event_key("u_x", "first_post_feedback", "2026-06-29T10:00:00Z", extra="good")
+        assert key == "journey:u_x:first_post_feedback:2026-06-29T10:00:00Z:good"
+
+    def test_event_key_stable_for_same_timestamp(self):
+        from app.notifications import build_journey_event_key
+        k1 = build_journey_event_key("u_x", "pricing_viewed", "T1")
+        k2 = build_journey_event_key("u_x", "pricing_viewed", "T1")
+        assert k1 == k2
+
+    def test_event_key_differs_for_different_timestamp(self):
+        from app.notifications import build_journey_event_key
+        k1 = build_journey_event_key("u_x", "pricing_viewed", "T1")
+        k2 = build_journey_event_key("u_x", "pricing_viewed", "T2")
+        assert k1 != k2
+
+
+class TestJourneyNotificationFormatting:
+
+    def _journey(self, **kw):
+        base = {
+            "user_key": "u_febdae54", "source": "telegram_ads",
+            "registered_at": "2026-06-29T10:00:00Z",
+            "channel_created_at": "2026-06-29T10:05:00Z",
+            "first_post_feedback": None,
+            "pricing_viewed_at": "2026-06-29T10:10:00Z",
+            "payment_started_at": None,
+            "payment_success_at": None,
+            "payment_failed_at": None,
+            "minutes_since_last_step": 0,
+        }
+        base.update(kw)
+        return base
+
+    def test_pricing_viewed_has_user_key_source_path(self):
+        from app.notifications import format_journey_pricing_viewed
+        text = format_journey_pricing_viewed(self._journey())
+        assert "u_febdae54" in text
+        assert "Telegram Ads" in text
+        assert "Путь:" in text
+        assert "регистрация ✓" in text
+        assert "канал создан ✓" in text
+        assert "тарифы открыты ✓" in text
+
+    def test_stuck_after_45_minutes(self):
+        from app.notifications import format_journey_stuck_tariff_screen
+        journey = self._journey(minutes_since_last_step=50)
+        text = format_journey_stuck_tariff_screen(journey, 50)
+        assert "u_febdae54" in text
+        assert "50" in text
+        assert "Пользователь застрял" in text
+
+    def test_stuck_not_triggered_before_45_minutes(self):
+        """pick_recent_stuck_journey не находит застрявших раньше 45 минут."""
+        from app.notifications import pick_recent_stuck_journey
+        journey = self._journey(minutes_since_last_step=20)
+        result = pick_recent_stuck_journey([journey])
+        assert result is None
+
+    def test_stuck_triggered_at_45_plus_minutes(self):
+        from app.notifications import pick_recent_stuck_journey
+        journey = self._journey(minutes_since_last_step=45)
+        result = pick_recent_stuck_journey([journey])
+        assert result is not None
+        j, minutes = result
+        assert minutes == 45
+
+    def test_stuck_not_triggered_if_payment_started(self):
+        """Если payment_started уже есть, это не stuck."""
+        from app.notifications import pick_recent_stuck_journey
+        journey = self._journey(minutes_since_last_step=60, payment_started_at="2026-06-29T11:00:00Z")
+        result = pick_recent_stuck_journey([journey])
+        assert result is None
+
+    def test_payment_started_notification_same_user_key(self):
+        from app.notifications import format_journey_payment_started
+        journey = self._journey(payment_started_at="2026-06-29T10:20:00Z")
+        text = format_journey_payment_started(journey)
+        assert "u_febdae54" in text
+        assert "начал оплату" in text
+
+    def test_payment_success_notification_same_user_key(self):
+        from app.notifications import format_journey_payment_success
+        journey = self._journey(payment_success_at="2026-06-29T10:30:00Z")
+        text = format_journey_payment_success(journey)
+        assert "u_febdae54" in text
+        assert "оплатил" in text
+
+    def test_no_raw_post_generations_in_journey_notifications(self):
+        from app.notifications import (
+            format_journey_pricing_viewed, format_journey_payment_started,
+            format_journey_payment_success,
+        )
+        journey = self._journey(payment_started_at="T", payment_success_at="T2")
+        for text in [
+            format_journey_pricing_viewed(journey),
+            format_journey_payment_started(journey),
+            format_journey_payment_success(journey),
+        ]:
+            assert "генерир" not in text.lower()
+            assert "post_generations" not in text.lower()
+
+
+class TestJourneyDedup:
+
+    def test_build_journey_notifications_skips_already_notified(self):
+        from app.notifications import build_journey_notifications, build_journey_event_key
+
+        journey = {
+            "user_key": "u_x", "pricing_viewed_at": "T1",
+            "payment_started_at": None, "payment_success_at": None,
+            "payment_failed_at": None, "minutes_since_last_step": 0,
+        }
+        already_key = build_journey_event_key("u_x", "pricing_viewed", "T1")
+        result = build_journey_notifications([journey], already_notified_keys={already_key})
+        # pricing_viewed уже отправлен -- не должно быть его в результате
+        pricing_results = [r for r in result if r[0] == already_key]
+        assert pricing_results == []
+
+    def test_build_journey_notifications_includes_new_events(self):
+        from app.notifications import build_journey_notifications
+
+        journey = {
+            "user_key": "u_x", "pricing_viewed_at": "T1",
+            "payment_started_at": None, "payment_success_at": None,
+            "payment_failed_at": None, "minutes_since_last_step": 0,
+        }
+        result = build_journey_notifications([journey], already_notified_keys=set())
+        assert len(result) >= 1
+        keys = [r[0] for r in result]
+        assert any("pricing_viewed" in k for k in keys)
+
+
+class TestTodayShowsCommercialPath:
+
+    def test_today_shows_recent_commercial_journey(self):
+        from app.commercial_report import build_today_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        journeys = [{
+            "user_key": "u_febdae54", "source": "telegram_ads",
+            "channel_created_at": "T", "pricing_viewed_at": "T2",
+            "payment_started_at": None, "payment_success_at": None,
+            "first_post_feedback": None,
+        }]
+        text = build_today_report("TruePost", m, payment_path={"pricing_viewed": 1}, recent_journeys=journeys)
+        assert "Последний коммерческий путь" in text
+        assert "u_febdae54" in text
+
+    def test_today_without_journeys_no_path_section(self):
+        from app.commercial_report import build_today_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        text = build_today_report("TruePost", m, payment_path={"pricing_viewed": 1}, recent_journeys=None)
+        assert "Последний коммерческий путь" not in text
+        assert "Последний застрявший путь" not in text
+
+
+class TestOldDeltaNotificationsStillWork:
+    """Старые aggregate delta notifications не сломаны journey-расширением."""
+
+    def test_compute_deltas_still_works(self):
+        from app.notifications import compute_deltas
+        prev = {"registrations": 30}
+        cur = {"registrations": 31}
+        deltas = compute_deltas(prev, cur)
+        assert len(deltas) == 1
+
+    def test_format_notification_still_works(self):
+        from app.notifications import StepDelta, format_notification
+        delta = StepDelta("user_registered", 1, 31, 30)
+        text = format_notification(delta)
+        assert "Новый пользователь" in text
+
+    def test_build_notification_batch_still_works(self):
+        from app.notifications import StepDelta, build_notification_batch
+        deltas = [StepDelta("user_registered", 5, 35, 30)]
+        batch = build_notification_batch(deltas)
+        assert batch.is_digest is False
