@@ -1,305 +1,252 @@
-# PROJECT_STATE — Growth Agent Watchtower
+# PROJECT_STATE
 
-Это человекочитаемый реестр для владельца проекта: стратегические решения,
-правила «не трогать», статус задач, отложенные решения, заметки на будущее.
-
-**Важно:** агент НЕ читает этот файл как runtime-контекст. Машинная память
-агента (clean-period cutoff'ы, история показов находок, кэш диагностик)
-живёт в БД (`ProjectChangeEvent`, `AlertRepeatTracker`, `DeepDiagnosticsCache`)
-— это осознанное архитектурное разделение, см. раздел «Архитектурные решения»
-ниже. Обновляется вручную, одним блоком, после завершения значимого этапа
-работы — не на каждое мелкое изменение.
+**Last updated:** 2026-06-30 (session 2: per-user journeys)
+**Current production status:** Attribution tracking + per-user journey endpoint реализованы и протестированы end-to-end (34/34 тестов проходят, включая полную регрессию). Готовы к деплою.
+**Current priority:** Задеплоить обе фичи этой сессии (attribution tracking + /api/internal/user-journeys). После деплоя — прогнать проверочные сценарии на проде.
+**Do not touch now:** Direct bids, Direct budget, тарифы/цены, free quota, лендинг-тексты, реклама, UX, payment logic, product funnel logic, персональные данные пользователей.
+**Next task:** 1) Деплой. 2) Проверить оба сценария attribution на проде (UTM-лендинг + /start у бота). 3) Дать Growth Agent доступ к `/api/internal/user-journeys` для построения per-user диагностики "на чём застрял".
 
 ---
 
-## Текущий статус: Аналитик Воронки 2.0
+## 1. AutoPost Core Product
 
-**Начат.** Цель этапа — сделать отчёты Growth Agent понятными владельцу
-бизнеса (не разработчику), исправить противоречивые формулировки уверенности,
-перестать повторять устаревшие выводы, добавить срезы диагностики вместо
-ручного просмотра таблиц в Директе/Метрике.
+**Scope:** registration/login; onboarding; first post generation; Telegram channel connection; publication; queue; autopublishing; settings; tariffs; delete account.
 
-### Сделано
+**Done:**
+- Quick start onboarding с экраном выбора («Что сделать сначала?»), feedback-блок под первым постом.
+- Topic validation, post-topic match check, идемпотентность quick start.
+- Нормализация Telegram username/ссылки.
+- Публикация: idempotent, reconciliation.
+- Удаление канала и аккаунта: пошаговое.
+- Free quota 200k токенов.
+- `qsSkip()` сохраняет флаг в localStorage.
+- **НОВОЕ (2026-06-30):** `AuthIn` (schemas.py) расширен полем `utm_content`. Форма регистрации в app.js теперь передаёт `utm_content` вместе с остальными UTM при наличии `lp_session`.
 
-- **Deep Direct fallback fix 2026-06-25 (`growth-agent-deepdirect-fallback-2026-06-25`)** —
-  исправлено поведение `/deep_direct`, когда Direct Reports API не успевал
-  подготовить granular-отчёты и пользователь видел только timeout без данных.
-  Теперь отчёты по группам и поисковым запросам запрашиваются best-effort,
-  а не как единый all-or-nothing шаг: если пришёл хотя бы один granular-отчёт,
-  бот показывает частичную диагностику с явной пометкой, какая часть не пришла.
-  Если granular-кэша ещё нет, `/deep_direct` использует последний combined
-  snapshot как лёгкий fallback: расход, клики, CTR/CPC, регистрации и ориентировочный
-  CPA. Команда по-прежнему не блокирует Telegram и не запускает параллельные
-  дубли, но больше не должна заканчиваться бесполезным «кэша пока нет», когда
-  есть обычный сохранённый замер Директа.
+**Tested:**
+- Полный quick start flow, DELETE endpoints, новые ProductEvent — все ранее пройденные тесты.
+- **НОВОЕ:** `test_attribution.py` — 9 тестов, все прошли через реальный HTTP-сервер.
 
-- **Status command fix 2026-06-25 (`growth-agent-statusfix-2026-06-25`)** —
-  исправлена production-проблема, при которой `/status` не отвечал после
-  cached-fallback фикса. Root cause: handler `/status` ссылался на
-  `IntegrationType.telegram`, но `IntegrationType` не был импортирован в
-  `telegram_bot.py`, поэтому команда падала с `NameError` до отправки
-  сообщения. Дополнительно `/status` упрощён до дешёвой runtime-команды:
-  не вызывает Direct, Метрику, YooKassa, TruePost, deep diagnostics или
-  `run_cycle_once`; показывает только project/build/mode, состояние
-  manual `/run`, последний сохранённый snapshot и число открытых сигналов.
-  DB-чтение обёрнуто в короткий timeout с fallback-ответом, чтобы команда
-  оставалась живой даже при медленной локальной БД. Добавлены логи:
-  `Status command received`, `Status response prepared`,
-  `Status response sent`, `Status failed with traceback`.
+**Open:**
+- DELETE /api/me — не подтверждён на реальном ранее падавшем аккаунте (BUG-005).
+- «Сессия истекла» при неверном пароле (BUG-001).
+- Auth state inconsistency после hard reload (BUG-002).
+- Landing → web app load 15-20 секунд (BUG-003).
+- Over-blocking медицинских/образовательных тем (BUG-004).
 
-- **Cached fallback fix 2026-06-24 (`growth-agent-cachefallback-2026-06-24`)** —
-  `/run` изменён с модели «live refresh или timeout» на модель «лучший
-  доступный бизнес-отчёт сейчас». Если живой сбор данных или отдельный
-  источник зависает/падает, команда использует последний сохранённый
-  snapshot/cache и всё равно присылает управленческий вывод по воронке.
-  В отчёте явно показывается свежесть источников: свежие данные текущего
-  запуска, кэш с timestamp или недоступный/не настроенный источник.
-  Timeout-only сообщение теперь допускается только если нет usable snapshot
-  с продуктовыми метриками. Regular `/run` больше не запускает тяжёлые
-  deep Direct / onboarding / landing diagnostics live; использует только
-  быстрый кэш, если он уже есть. `/status` больше не показывает
-  «Telegram: не настроено» для живого бота: runtime-статус Telegram-бота
-  выводится отдельной строкой «Telegram-бот: работает». Логи фиксируют
-  `/run live refresh started`, `source fresh`, `source timeout`,
-  `cached fallback used`, `report generated from ... data`,
-  `final message sent`.
-
-- **Emergency runtime fix 2026-06-24 (`growth-agent-emergencyfix-2026-06-24`)** —
-  `/run` больше не выполняет тяжёлый цикл внутри Telegram handler. Команда
-  только принимает задачу, ставит single-flight guard и запускает сбор данных
-  в отдельном thread/background task; Telegram dispatcher остаётся свободным
-  для `/ping`, `/build`, `/status`, `/start` и `/funnel`. Повторный `/run`
-  во время активной проверки отклоняется сообщением «Проверка уже запущена...».
-  Добавлен stale-lock cleanup и внешний timeout над thread-await, чтобы даже
-  при зависшем внутреннем event loop пользователь получил финальное сообщение.
-  `/funnel` переведён на последний сохранённый snapshot и больше не вызывает
-  внешние API. Добавлены дешёвые команды `/ping` и `/build`. Direct Reports
-  retry sleep ограничен сверху, чтобы `RetryIn` не удерживал manual `/run`
-  слишком долго. Логи теперь явно фиксируют: accepted/rejected/started/source
-  timeout/finished/failed with traceback.
-
-- **Runtime hotfix 2026-06-24 (`growth-agent-hotfix-2026-06-24`)** —
-  добавлена явная метка версии в `/start` и `/status`; `/run` теперь
-  обёрнут верхнеуровневым timeout и всегда отвечает финальным сообщением:
-  либо отчётом, либо понятной ошибкой о медленном внешнем источнике.
-  Источники в одном окне (`TruePost`, Метрика, Директ, YooKassa) собираются
-  параллельно, каждый внешний вызов имеет runtime-fuse. Для Direct summary
-  снижены max retries/timeout в обычном `/run`, а глубокие Direct-отчёты
-  имеют отдельный timeout/fallback, чтобы Reports API не зависал в retry-цикле.
-  Причина hotfix: после предыдущего деплоя Telegram присылал только
-  «Запускаю проверку...» без итогового отчёта — вероятнее всего из-за
-  долгого внешнего API/Director Reports retry path либо старого build-marker,
-  который не позволял отличить старый билд от нового.
-
-- **`app/vocabulary.py`** (новый файл) — человекочитаемый словарь метрик.
-  Расшифровка `activation_1`/`activation_2` взята из реального кода
-  (`connectors/truepost.py`), не придумана: `activation_1` = создание
-  канала (пользователи), `activation_2` = генерация постов (события, не
-  пользователи — отсюда кажущаяся «аномалия», что это число может быть
-  больше регистраций).
-- **`ProjectChangeEvent`** (таблица в БД, `app/models.py`) — clean-period
-  tracking. Хранит точки изменений (дата + описание + опциональная привязка
-  к конкретной группе объявлений). Используется, чтобы не смешивать
-  статистику до/после значимых изменений (например, очистки семантики
-  рекламной группы).
-- **`connectors/direct.py`** расширен параметрами `date_from_override`/
-  `date_to_override` — нужно для clean-period: Director Reports API не
-  отдаёт per-row timestamp клика, точная постфактум-фильтрация физически
-  невозможна без отдельного запроса за нужный период.
-- **Confidence split** — старая формулировка («Атрибуция не подтверждена.
-  Уровень уверенности: high.») была противоречивой. Теперь два раздельных,
-  явно подписанных понятия: уверенность в самой находке (фактах и цифрах)
-  и отдельно — атрибуция к рекламе (причинно-следственная связь).
-- **Anti-repetition logic, window-based** (`AlertRepeatTracker` в БД) —
-  находка не становится главным выводом больше `MAX_MAIN_REPEATS_IN_WINDOW`
-  раз за последние `REPEAT_WINDOW_DAYS` дней, ЕСЛИ её ключевая метрика не
-  изменилась существенно (`RESURFACE_IF_METRIC_CHANGED_BY`). Подавленные
-  находки не пропадают — попадают в раздел «известные риски» в отчёте.
-  Параметры (см. `app/service.py`):
-  - `REPEAT_WINDOW_DAYS = 7`
-  - `MAX_MAIN_REPEATS_IN_WINDOW = 2`
-  - `RESURFACE_IF_METRIC_CHANGED_BY = 0.30` (30%)
-
-### Не завершено
-
-- **`/analyze`** — сводный бизнес-отчёт поверх существующих диагностик
-  (`/deep_direct`, `/check_landing`, `/funnel`, `/check_onboarding`). Не
-  начат.
-- **Срез по целям Метрики** — разложить все достижения целей за период по
-  этапам воронки (верх воронки / регистрация / активация / оплата). Не
-  начат, нужна доработка `connectors/metrika.py`.
-- **Device-срез** — решение принято: брать только из Director API (он
-  реально это отдаёт), не пытаться связать с продуктовой/landing стороной,
-  которая такого разреза не даёт. Код не написан.
-- **Явные списки «запросы, давшие регистрации» / «запросы с риском мусора»**
-  — текущая кластеризация (`irrelevant_query_cluster`/`good_query_cluster`)
-  частично закрывает эту потребность, но не в требуемом формате (два явных
-  списка с явной пометкой «дал регистрацию — не минусовать автоматически»).
-- **Разделение регистраций продукт / Метрика / Директ с явным указанием
-  на возможные тестовые действия владельца** — не реализовано как отдельная
-  функция форматирования, хотя инфраструктура (`vocabulary.py`, разделение
-  источников) для этого готова.
-
-### Доводка 2.1 (по архитектурной обратной связи после деплоя 2.0)
-
-После деплоя 2.0 стало ясно: внутренняя работа была сделана, но снаружи
-почти не видна — отчёты выглядели как раньше. Сделан явный выбор: дёшево
-и видимо сейчас, не дорогой архитектурный сдвиг (см. раздел «Что
-сознательно отложено» ниже).
-
-Сделано:
-
-- **`/funnel` переписан на `vocabulary.py`** — больше нет «21 / 17 / 47 / 0»
-  и «Активация 1 / Активация 2» без расшифровки. Каждая метрика подписана
-  человеческим текстом с явной пометкой «пользователи» vs «события», и
-  откуда она взята (продукт / Метрика / Директ).
-- **Динамика день-к-дню** (`service.get_previous_snapshot`,
-  `extract_normalized_metrics_from_snapshot`) — `/funnel` сравнивает
-  текущие данные с предыдущим сохранённым снэпшотом (не младше 1 часа,
-  чтобы повторный ручной `/run` не показывал мнимую динамику «+0»). Если
-  истории нет — честно говорит об этом, не подставляет нули.
-- **Объяснимость выбора главной находки** (`diagnostics.explain_selection`)
-  — к каждой главной находке в `/deep_direct` добавлен текст вида «выбрано
-  как главный сигнал, потому что это единственная находка уровня P1 среди
-  N» — показывается и в коротком, и в детальном сообщении.
-- **Видимость clean-period в коротком сообщении** — раньше пометка про
-  «не могу отделить статистику до/после cutoff» была только в детальном
-  сообщении по кнопке. Теперь короткая версия попадает и в основной текст
-  `/run`/`/deep_direct`, не только при явном запросе деталей.
-- **`/alerts` менее шумный** — открытые/эскалированные алерты показываются
-  первыми и полностью, алерты «в работе» (acknowledged/snoozed) отдельным
-  блоком, resolved сворачиваются в одну строку с числом, не разворачиваются
-  построчно.
-
-### Что сознательно отложено (следующий большой этап)
-
-По итогам архитектурной обратной связи признано: агент пока остаётся
-**набором диагностик**, не становится **аналитиком бизнеса**. Описанный
-архитектором путь к этому — слой «стадия бизнеса → приоритет диагностики
-→ выводы» и объединение `/deep_direct`/`/check_landing`/`/check_onboarding`/
-`/funnel` в «глаза одного сотрудника» — явно признан архитектурным сдвигом,
-тем самым, от которого решили отказаться раньше в этом же проекте.
-
-**Решение:** не делать сейчас. Зафиксировать как следующий большой этап
-после текущей доводки: единый аналитический слой, где агент сначала
-определяет состояние/стадию бизнеса (нет регистраций → привлечение; есть
-регистрации, нет активации → онбординг; есть активация, нет оплат →
-монетизация; зрелый бизнес → удержание и экономика), и только потом
-выбирает, какую диагностику запускать и что считать главным выводом. Это
-будущая архитектура ИИ-офиса, не задача текущего пакета.
+**Do not touch:** generator.py, voice/format/emoji маппинги.
 
 ---
 
-## Архитектурные решения (зафиксированы, не пересматривать без причины)
+## 2. AutoPost Landing
 
-1. **Машинная память vs человеческое управление проектом.**
-   `ProjectChangeEvent`/`AlertRepeatTracker`/`DeepDiagnosticsCache` в БД —
-   это runtime-контекст, который агент читает и пишет сам в процессе работы
-   (clean-period cutoff'ы, история показов находок, кэш диагностик).
-   `PROJECT_STATE.md` (этот файл) — для человека, агент его не читает.
-   Причина разделения: чтение большого markdown-файла на каждый запуск
-   дорого по токенам и не даёт структуры для программной фильтрации по
-   дате/измерению — то, что реально нужно агенту для clean-period логики.
+**Done:**
+- CTA/Journey Diagnostics: `landing_session_id`, UTM/yclid проброс через `LandingEvent`.
+- **НОВОЕ (2026-06-30):** `landing.html` теперь читает и прокидывает `utm_content` (наряду с source/medium/campaign) во всех трёх местах: `getUTM()`, `logLandingEvent()` payload, и query string при переходе на SPA (`goCTA` для destination != 'bot').
+- **НОВОЕ:** При `landing_view` с `utm_source` пишется запись в `TrafficAttribution` (без `user_id`, привязка происходит позже при регистрации по `session_id`).
 
-2. **Anti-repetition — window-based, не «подряд».** Первая версия логики
-   («не повторять находку, если она была главной N раз подряд без
-   перерыва») давала мерцание: находка «отдыхала» один день и тут же
-   возвращалась, не решая исходную проблему. Текущая версия считает показы
-   в скользящем календарном окне (7 дней), независимо от перерывов.
+**Open:**
+- Landing → web app переход 15-20 секунд — инструментирован, причина не определена.
 
-3. **Device-срез — только из Direct, без новой интеграции под недостающие
-   данные.** Ни Director Reports API в части, который мы используем, ни
-   landing endpoint TruePost не отдают данные по устройствам для
-   продуктовой стороны воронки. Решено не вводить отдельную интеграцию
-   ради одного срез — использовать то, что Director реально отдаёт.
-
-4. **Clean-period фильтрация — через отдельный запрос, не постфактум.**
-   Director Reports API возвращает только дневные суммы, не привязку
-   клика к точному времени. Если для измерения есть активный cutoff,
-   единственный технически честный способ — отдельный запрос с явным
-   `date_from`, не попытка отфильтровать уже агрегированные данные.
+**Do not touch:** Текст и позиционирование лендинга.
 
 ---
 
-## Известные ограничения (зафиксированы для будущих решений, не баги)
+## 3. Growth Agent / Аналитик роста
 
-- `connectors/metrika.py` и `connectors/yookassa.py` — частично/полностью
-  stub. YooKassa отложена, потому что базовые `payments_started`/
-  `payments_success`/`revenue` уже приходят из TruePost internal metrics.
-- Окна `3h`/`24h` в Direct/Metrika Reports API на практике означают
-  «текущие календарные сутки», не строго скользящее «последние N часов» —
-  ограничение самих API Яндекса.
-- Пороги диагностики (`LANDING_VIEWS_VS_CLICKS_MIN_RATIO` и аналогичные в
-  `config.py`) — разумные дефолты, не откалиброванные на статистически
-  значимом объёме реальных данных АвтоПоста. Подлежат пересмотру, если на
-  практике дают много ложных срабатываний или пропускают реальные проблемы.
+**Done (предыдущие сессии):**
+- `ProductEvent` таблица, `payment-path-diagnostics`, исправление `succeeded`→`paid`, allowlist расширен (onboarding_choice_selected, first_post_feedback, first_post_feedback_reason), агрегаты feedback/onboarding в diagnostics.
 
----
+**Done (НОВОЕ, 2026-06-30 — attribution tracking):**
+- **Новая таблица `TrafficAttribution`** (database.py): `id, user_id (nullable, indexed), landing_session_id (nullable, indexed), source, medium, campaign, content, raw_start_param, created_at`. Создаётся через `create_all()`, без ALTER TABLE на существующих таблицах.
+- **Новый модуль `attribution.py`**: чистые функции `classify_utm(utm_source, utm_medium)` и `classify_start_param(raw)` — без побочных эффектов, юнит-тестируемые отдельно от HTTP.
+  - `classify_utm`: 'telegram'/'tgads' → telegram_ads; 'yandex'/'direct' → yandex_direct; иначе как есть; пусто → unknown.
+  - `classify_start_param`: `tgads_<campaign>_<content>` → telegram_ads/cpc; `lp_*` и `u<id>` явно НЕ источники трафика (другая семантика, не путаются); иначе unknown.
+- **`/api/register` (main.py)**: при наличии `utm_source` — классифицирует и пишет `TrafficAttribution` с `user_id`. При наличии только `lp_session` (без UTM, путь от Telegram-бота) — ищет существующую запись `TrafficAttribution` без `user_id` по тому же `landing_session_id` и привязывает её (не создаёт дубль).
+- **`/api/landing-event` (main.py)**: при первом событии `landing_view` с `utm_source` — пишет `TrafficAttribution` без `user_id` (привязка произойдёт при регистрации). `_LandingEventIn` расширен полем `utm_content`.
+- **`_process_main_bot_updates` (tasks.py)**: при `/start <param>` парсит параметр через `classify_start_param`. Если распознан как `telegram_ads` — генерирует `lp_session` вида `tg{chat_id}_{timestamp}`, пишет `TrafficAttribution` (без `user_id`), и встраивает `lp_session` в URL кнопки Mini App (`?lp_session=...`), чтобы веб-часть подхватила её и регистрация привязалась к той же записи.
+- **`source_breakdown` в payment-path diagnostics** (internal_payment_path.py): агрегаты `registrations, channels_created, post_generations, pricing_viewed, payment_cta_clicked, payment_started, payment_success` по `telegram_ads / yandex_direct / direct / unknown / other`. Вычисляется через `_source_breakdown(s, since)` — join по `user_id` без дополнительных SQL JOIN'ов (Python-side группировка после загрузки списков id).
+- Старые пользователи без `TrafficAttribution` записи автоматически попадают в `unknown` — ожидаемое поведение, не баг.
 
-## Hotfix 2026-06-24 — `/run`, `/deep_direct`, русификация, отключение онбординга
+**Tested:**
+- `test_attribution.py` (9 тестов): UTM telegram_ads/yandex_direct сохраняются при регистрации, регистрация без UTM → unknown, симуляция /start tgads_* → привязка к user_id без дублей, структура `source_breakdown`, регрессия всех 23 старых полей diagnostics, регрессия 6 старых ProductEvent.
+- Полный регрессионный прогон: `test_payment_path_diagnostics.py` (8) + `test_onboarding_feedback.py` (9) + `test_attribution.py` (9) = **26/26 тестов прошли**.
+- End-to-end ручная проверка через реальный HTTP-сервер: регистрация с `utm_source=telegram_ads&utm_content=test_ad` → `source_breakdown.telegram_ads.registrations` корректно увеличивается; регистрация без UTM → `unknown` увеличивается.
 
-**Статус:** реализовано локально, требует деплоя и проверки на живом боте.
+**Open:**
+- Проверить оба сценария на **реальном проде** после деплоя (см. Next task выше).
+- Ротация `TRUEPOST_INTERNAL_API_TOKEN` (засвечен ранее) — отложена, ждёт своей очереди.
 
-**Что изменено:**
-- `/run` теперь сначала определяет текущую бизнес-стадию. Для текущего состояния АвтоПоста главный вывод должен быть: регистрации и активации пошли, успешных оплат пока нет; привлечение начало работать; резких правок рекламы, лендинга, ставок, бюджета, цен и тарифов сейчас не делать.
-- Одна начатая оплата больше не считается P1-проблемой. Правило `payments_started_no_success` срабатывает только после минимального числа попыток оплаты без успеха.
-- Добавлены milestone-уведомления без спама: первая регистрация, каждые +5 регистраций, первая генерация, первая начатая оплата, первая успешная оплата, резкий рост/падение CPA.
-- `/deep_direct` больше не поднимает единичный низкозатратный мусорный запрос как главный сигнал. Scoring нерелевантных кластеров учитывает клики, расход, долю расхода, повторяемость по запросам/группам и отсутствие подтверждённой конверсионной атрибуции.
-- Минус-фразы теперь предлагаются только как безопасные фразовые кандидаты. Одиночные широкие минус-слова не предлагаются.
-- Пользовательские сообщения и простая HTML-страница русифицированы: основной бренд в интерфейсе — «Аналитик Воронки», режим — «наблюдение».
-- Кнопка/показ проверки онбординга отключены через флаг `ONBOARDING_DIAGNOSTICS_ENABLED = False`; команда `/check_onboarding` не запускает несуществующий endpoint и честно сообщает, что диагностика скрыта.
+**PowerShell для проверки source_breakdown на проде:**
+```powershell
+Invoke-RestMethod -Uri "https://autopost26.up.railway.app/api/internal/payment-path-diagnostics?period_hours=168" -Method Get -Headers @{"Authorization" = "Bearer YOUR_TOKEN_HERE"} | ConvertTo-Json -Depth 10
+```
 
-**Изменённые файлы:**
-- `app/telegram_bot.py`
-- `app/rules.py`
-- `app/diagnostics.py`
-- `app/service.py`
-- `app/scheduler.py`
-- `app/static/index.html`
-- `PROJECT_STATE.md`
+**Пример `source_breakdown` в ответе:**
+```json
+"source_breakdown": {
+  "telegram_ads":   {"registrations": 12, "channels_created": 4, "post_generations": 9, "pricing_viewed": 3, "payment_cta_clicked": 1, "payment_started": 1, "payment_success": 0},
+  "yandex_direct":  {"registrations": 38, "channels_created": 15, "post_generations": 60, "pricing_viewed": 11, "payment_cta_clicked": 5, "payment_started": 4, "payment_success": 2},
+  "direct":         {"registrations": 0, "channels_created": 0, "post_generations": 0, "pricing_viewed": 0, "payment_cta_clicked": 0, "payment_started": 0, "payment_success": 0},
+  "unknown":        {"registrations": 145, "channels_created": 50, "post_generations": 200, "pricing_viewed": 30, "payment_cta_clicked": 8, "payment_started": 6, "payment_success": 3},
+  "other":          {"registrations": 0, "channels_created": 0, "post_generations": 0, "pricing_viewed": 0, "payment_cta_clicked": 0, "payment_started": 0, "payment_success": 0}
+}
+```
+(`unknown` исторически большой -- это все регистрации ДО внедрения attribution tracking, ожидаемо.)
 
-**Проверено:** `python -m compileall app` проходит.
-
-**Не проверено:** живой запуск Telegram-бота, реальные запросы к Яндекс.Директу/Метрике/продуктовым endpoint'ам, end-to-end `/run` на продовых данных.
-
-
----
-
-## Owner Decision Layer hotfix — 2026-06-25
-
-**Статус:** реализовано в пакете `growth-agent-owner-layer-2026-06-25`.
-
-**Что изменено:** `/run` теперь должен быть не дампом метрик, а предпринимательским отчётом владельца АвтоПоста: стадия бизнеса, главный вывод, воронка с конверсиями, одно главное действие, что не трогать, интерпретация Директа/поисковых запросов из кэша, динамика относительно прошлого замера, уровень уверенности и свежесть источников.
-
-**Ключевая логика для текущей стадии АвтоПоста:** регистрации и активации пошли, успешных оплат пока нет. При 1 начатой оплате и 0 успешных `/run` не должен объявлять P1-проблему платежей. Главный фокус — качество регистраций, активация и путь до оплаты. Рекламу, лендинг, ставки, бюджет, цены и тарифы резко не трогать.
-
-**Direct/query logic:** обычный `/run` не запускает тяжёлый deep Direct live. Если есть кэш глубокой диагностики, `/run` использует его для блоков: что масштабировать, что наблюдать, что чистить, что не минусовать. Широкие одиночные минус-слова (`генерация`, `текст`, `поста`, `онлайн` и т.п.) блокируются; разрешены только безопасные фразовые кандидаты после ручной проверки. Единичный низкозатратный мусорный запрос не становится главным выводом.
-
-**Status fix:** `/status` больше не показывает `(7d)` как возраст последнего snapshot. Теперь возраст отображается отдельно (`только что`, `5 мин назад`, `1 ч назад`), а `7d` подписан как период отчёта.
-
-**Изменённые файлы:** `app/owner_report.py`, `app/service.py`, `app/scheduler.py`, `app/telegram_bot.py`, `app/config.py`, `tests/test_owner_report.py`, `PROJECT_STATE.md`.
-
-**Проверки:** `python -m compileall app`; `pytest -q` — 36 passed.
-
-**Оставшиеся риски:** Direct-блок в `/run` зависит от наличия свежего кэша deep diagnostics; без него `/run` честно пишет, что не делает выводы по отдельным запросам. Сквозной атрибуции запрос → регистрация/оплата пока нет, поэтому рекомендации по запросам остаются осторожными и read-only.
-
+**Do not touch:** Direct bids, Direct budget, Telegram Ads attribution **логика классификации** (рекламные кампании сами не менялись, только инфраструктура для их различения).
 
 ---
 
-## 2026-06-25 — Deep Direct runtime fix
+## 3b. Growth Agent / Per-user journeys (НОВОЕ, 2026-06-30 сессия 2)
 
-**Причина:** после Owner Decision Layer обычный `/run` стал работать, но `/deep_direct` остался тяжёлой live-командой: Telegram handler напрямую ждал granular Direct Reports API (`force_refresh_deep_diagnostics`). Если Директ долго готовил отчёт, команда могла оставить пользователя только с начальным сообщением. Дополнительный риск — длинный отчёт мог превысить лимит Telegram message size и упасть при отправке.
+**Done:**
+- **Новый internal endpoint** `GET /api/internal/user-journeys?period_hours=24&limit=100` (новый файл `internal_user_journeys.py`).
+- Возвращает per-user воронку для пользователей со значимым событием за период (регистрация, любой ProductEvent, или Payment попадающие в период). Если у юзера событие сегодня, но регистрация была месяц назад -- вся история юзера всё равно показывается (это намеренно: застревание часто произошло задолго до периода).
+- **Анонимизация:** `user_key = "u_" + sha256(INTERNAL_API_TOKEN + ":" + user_id)[:8]` -- стабильный в рамках одного значения токена, необратимый, не email/username/телефон. Меняется при ротации токена (приемлемо, см. docstring).
+- **Никаких персональных данных:** email, tg_username, tg_chat_id, password нигде не читаются и не возвращаются. Не использует и не импортирует `Post` вообще -- значит физически не может прочитать тексты постов или использовать сырое количество генераций как сигнал.
+- **events в journey:** registered_at, channel_created_at (самый ранний канал на юзера), onboarding_choice (+ at), first_post_feedback + reason (+ at), pricing_viewed_at, payment_cta_clicked_at, payment_started_at, payment_success_at, payment_failed_at.
+- **source attribution:** source/utm_source/utm_campaign/utm_content -- по той же TrafficAttribution что и в payment-path diagnostics.
+- **last_step:** строгий порядок шагов (registered → channel_created → onboarding_selected → first_post_feedback_good/bad → pricing_viewed → payment_started → payment_failed → payment_success), последний непустой шаг в этом порядке.
+- **stuck_at:** грубая бизнес-классификация (after_registration / after_channel_created / after_first_post / tariff_screen / payment_path / paid / unknown) -- НЕ использует post_generations как сигнал, явно проверено тестом #7 (статическая проверка что модуль не импортирует `Post`).
+- **minutes_since_last_step:** минуты с момента последнего известного события (максимум среди всех непустых timestamp'ов).
+- N+1 защита: данные тянутся пакетно (`.in_(candidate_ids)`) для Channel/ProductEvent/Payment/TrafficAttribution, не точечными запросами в цикле -- безопасно при `limit=500`.
 
-**Изменено:**
-- `/deep_direct` вынесен в background task + отдельный thread, по аналогии с `/run`; Telegram event loop не должен блокироваться.
-- Добавлен single-flight guard для `/deep_direct`: повторный запуск отклоняется, пока текущая глубокая проверка идёт.
-- Добавлены timeout/fallback/finalization: live result, cached deep Direct result, timeout message или clear error — пользователь всегда получает финальный ответ.
-- Длинные сообщения deep diagnostics режутся на безопасные части перед отправкой в Telegram.
-- Добавлен sync-wrapper `force_refresh_deep_diagnostics_sync_with_timeout()` в `scheduler.py`.
-- Build marker обновлён: `growth-agent-deepdirectfix-2026-06-25`.
+**Tested:**
+- `test_user_journeys.py` (8 тестов): требует токен, не отдаёт PII, содержит source attribution, корректные stuck_at для tariff_screen/payment_path/paid, статическая проверка отсутствия Post-импорта, регрессия payment-path-diagnostics.
+- Полный регрессионный прогон: 8 + 9 + 9 + 8 = **34/34 теста прошли** через реальный HTTP-сервер.
+- Ручная проверка: регистрация + onboarding_choice + pricing_viewed → корректный `last_step="pricing_viewed"`, `stuck_at="tariff_screen"`. Payment(status="pending") → `stuck_at="payment_path"`. Payment(status="paid") → `stuck_at="paid"`, `last_step="payment_success"`.
 
-**Проверки:**
-- `python -m compileall app` — passed.
-- `pytest -q` — 38 passed.
+**Какие события реально доступны сейчас:**
+registration, channel_created, onboarding_choice, first_post_feedback, first_post_feedback_reason, pricing_viewed, payment_cta_clicked, payment_started, payment_success, payment_failed -- все 10 из задачи присутствуют и подтверждены тестами.
 
-**Риск:** live Direct Reports API всё ещё может быть медленным; в этом случае команда должна показать кэш или понятную ошибку, а не молчать.
+**Каких событий нет (честно null, не выдумано):**
+Нет отдельного события "канал верифицирован/подключён бот" в journey (только дата создания канала, не дата `Channel.verified=True`) -- если понадобится отдельно отслеживать момент верификации, потребуется либо новое ProductEvent, либо чтение `Channel.verified` с историей (сейчас это просто boolean без timestamp смены). Это сознательно не добавлено в эту итерацию -- не было в списке 10 событий из задачи.
+
+**Do not touch:** Этот endpoint read-only, не модифицирует никакие данные пользователя.
+
+---
+
+## 4. Product Observer / QA Agent
+
+**Тесты:**
+- `test_quickstart_flow.py`, `test_topic_validation.py`
+- `test_payment_path_diagnostics.py` (8 тестов)
+- `test_onboarding_feedback.py` (9 тестов)
+- `test_attribution.py` (9 тестов)
+- **НОВОЕ:** `test_user_journeys.py` (8 тестов)
+
+**Команда полного прогона:**
+```bash
+DATABASE_URL=sqlite:///test_full.db TRUEPOST_INTERNAL_API_TOKEN=test-token SECRET_KEY=testsecret \
+    python3 -m uvicorn main:app --port 8400 --log-level error &
+sleep 3
+BASE_URL=http://localhost:8400 TRUEPOST_INTERNAL_API_TOKEN=test-token python3 test_payment_path_diagnostics.py
+BASE_URL=http://localhost:8400 TRUEPOST_INTERNAL_API_TOKEN=test-token python3 test_onboarding_feedback.py
+BASE_URL=http://localhost:8400 TRUEPOST_INTERNAL_API_TOKEN=test-token python3 test_attribution.py
+BASE_URL=http://localhost:8400 TRUEPOST_INTERNAL_API_TOKEN=test-token python3 test_user_journeys.py
+```
+
+---
+
+## 5. AI Office / Future Concept
+
+Не затрагивалось.
+
+---
+
+## 6. Shared Infrastructure
+
+**Done:**
+- `ProductEvent`, `IdempotencyKey`, `LandingEvent` — новые таблицы (старые).
+- **НОВОЕ (2026-06-30):** `TrafficAttribution` — новая таблица (та же безопасная схема: `create_all()`, без ALTER TABLE, `user_id` без FK constraint чтобы не ломать удаление аккаунта).
+- `App._onboardingSkipped` через localStorage.
+
+**Decisions (не пересматривать):**
+- Не использовать `ALTER TABLE` на существующих таблицах. Новая логика — только через новые таблицы. **Подтверждено снова в этой сессии** для `TrafficAttribution`.
+- Локальные тесты с FK: явно включать `PRAGMA foreign_keys=ON`.
+- Подключение канала и публикация — два явных разделённых шага.
+- Все backend-ошибки нормализуются на русский язык.
+- **НОВОЕ:** Классификация источника трафика — чистые функции в отдельном модуле `attribution.py`, без побочных эффектов, легко юнит-тестируются отдельно от HTTP-слоя.
+- **НОВОЕ:** `lp_session` (Telegram-путь) и `utm_source` (веб-путь) — разные механизмы привязки к `TrafficAttribution`, но сходятся в одной записи через `landing_session_id`, чтобы не плодить дубли при заходе и с лендинга, и из бота.
+
+---
+
+## 7. Open Bugs
+
+### BUG-001 / «Сессия истекла» при неверном пароле — P1, Open
+### BUG-002 / Auth state inconsistency после hard reload — P1, Open
+### BUG-003 / Landing → web app load 15-20 секунд — P1, Open
+### BUG-004 / Over-blocking сексологических/медицинских тем — P2, Open
+### BUG-005 / DELETE /api/me — финальное подтверждение — P0, Fix задеплоен, ожидает подтверждения
+
+---
+
+## 8. Recently Fixed
+
+**Date:** 2026-06-30 (сессия 2)
+**Area:** Growth Agent / Per-user journeys
+**Changed:**
+- Новый файл `internal_user_journeys.py` — endpoint `GET /api/internal/user-journeys`.
+- Подключён в `main.py` рядом с `payment_path_router`.
+- Анонимизация через `user_key = "u_" + sha256(token + user_id)[:8]`.
+- Явно не импортирует `Post` — структурная защита от использования raw post_generations как сигнала состояния воронки.
+**Retested:** 8 новых тестов (`test_user_journeys.py`) + полный регрессионный прогон 34/34 (все предыдущие наборы тестов) — все прошли через реальный HTTP-сервер.
+**Result:** Готово к деплою.
+
+---
+
+**Date:** 2026-06-30 (сессия 1)
+**Area:** Growth Agent / Attribution tracking перед Telegram Ads
+**Changed:**
+- Новая таблица `TrafficAttribution` (database.py).
+- Новый модуль `attribution.py` с `classify_utm()` и `classify_start_param()`.
+- `/api/register` — пишет/привязывает TrafficAttribution.
+- `/api/landing-event` — пишет TrafficAttribution на `landing_view` с UTM, добавлено поле `utm_content`.
+- `_process_main_bot_updates` (tasks.py) — парсит `/start tgads_*`, пишет TrafficAttribution, прокидывает `lp_session` в URL Mini App кнопки.
+- `internal_payment_path.py` — добавлена функция `_source_breakdown()`, поле `source_breakdown` в ответе diagnostics.
+- `schemas.py` (`AuthIn`) — добавлено поле `utm_content`.
+- `static/app.js` и `static/landing.html` — `utm_content` подхватывается и прокидывается по всей цепочке лендинг → SPA → register.
+**Retested:** 9 новых тестов (`test_attribution.py`) + полный регрессионный прогон 26/26 (включая `test_payment_path_diagnostics.py` и `test_onboarding_feedback.py`) — все прошли через реальный HTTP-сервер. Ручная end-to-end проверка обоих сценариев (UTM на лендинге, симуляция /start tgads_*) подтверждена через curl против живого сервера.
+**Result:** Готово к деплою. Финальная проверка на реальном проде — следующий шаг.
+
+---
+
+**Date:** 2026-06-29
+**Area:** Core Product / Onboarding UX + Growth Agent / payment-path diagnostics
+**Changed:** Onboarding choice screen, feedback-блок, post_generations_breakdown, payment_success fix (succeeded→paid), allowlist расширен.
+**Retested:** 9 тестов (test_onboarding_feedback.py).
+
+---
+
+**Date:** 2026-06-28
+**Area:** Growth Agent / Диагностика 401 на payment-path-diagnostics
+**Changed:** Код не менялся, проблема была в PowerShell-команде.
+
+---
+
+## 9. Decisions
+
+**Date:** 2026-06-30 (сессия 2)
+**Decision:** `user_key` для per-user journeys генерируется как `sha256(INTERNAL_API_TOKEN + ":" + user_id)[:8]`, не просто `sha256(user_id)`.
+**Reason:** Использование токена как соли защищает от того, что внешний наблюдатель сможет вычислить user_key зная только user_id (публично не вычислимый хэш). Побочный эффект: при ротации токена user_key всех пользователей меняется — это приемлемо, Growth Agent не хранит долгую историю по user_key между ротациями.
+
+**Date:** 2026-06-30 (сессия 2)
+**Decision:** `internal_user_journeys.py` физически не импортирует модель `Post` — не просто "не использует в формуле", а структурно не может прочитать тексты постов или количество генераций.
+**Reason:** Задача явно требовала не использовать raw post_generations как сигнал engagement. Структурный запрет (отсутствие импорта) надёжнее, чем "просто не написать код, который это делает" — тест #7 в test_user_journeys.py проверяет это статически.
+
+**Date:** 2026-06-30 (сессия 1)
+**Decision:** Источник трафика хранится в отдельной таблице `TrafficAttribution`, не добавляется как колонка в `User`.
+**Reason:** Не трогать существующую схему User (ALTER TABLE запрещён по существующему решению), плюс позволяет хранить несколько точек захвата атрибуции без конфликтов.
+
+**Date:** 2026-06-30
+**Decision:** `lp_session` и `utm_source` — разные пути привязки, но всегда сходятся через `landing_session_id`, чтобы не создавать дублирующие записи на одного пользователя.
+**Reason:** Telegram-путь (`/start`) не имеет доступа к UTM, только к start-параметру; веб-путь имеет полноценные UTM. Оба должны давать одинаковый результат в diagnostics.
+
+**Date:** 2026-06-30
+**Decision:** Старые пользователи (зарегистрированные до этой сессии) и пользователи без определённого источника — `unknown`, не `null`/ошибка.
+**Reason:** Явно зафиксировано в задаче как ожидаемое поведение, не баг.
+
+**Date:** 2026-06-29
+**Decision:** Новые product events используют существующее поле `package_id`, не создают новых колонок.
+**Date:** 2026-06-22
+**Decision:** Не использовать ALTER TABLE на существующих таблицах. Тесты с FK — явный PRAGMA foreign_keys=ON. Подключение канала и публикация — два явных шага. Backend-ошибки на русском.
