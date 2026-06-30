@@ -859,3 +859,196 @@ def build_deep_direct_status(
         lines.append("Попробуйте позже или проверьте доступ к Яндекс.Директу.")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /today — управленческий отчёт текущего дня
+# ---------------------------------------------------------------------------
+
+def build_today_report(
+    project_name: str,
+    metrics: "NormalizedMetrics | None",
+    *,
+    payment_path: dict | None = None,
+    direct_intelligence: "DirectIntelligenceResult | None" = None,
+) -> str:
+    """
+    Управленческий отчёт: что сейчас проверяем, на что смотрим,
+    какое решение будет принято, что не трогаем.
+
+    Логика адаптируется под текущую стадию воронки:
+    — если нет оплат и мало просмотров тарифов → режим проверки пути к тарифам
+    — если есть просмотры тарифов, но нет оплат → режим проверки тарифного экрана
+    — если есть оплаты → режим масштабирования
+    """
+    lines: list[str] = []
+    lines.append(f"📋 Сегодня — {project_name}")
+    lines.append(f"Данные: {_fmt_dt_msk(_now_msk())}")
+
+    signup = _n(metrics.signup) if metrics else 0
+    activation_1 = _n(metrics.activation_1) if metrics else 0
+    activation_2 = _n(metrics.activation_2) if metrics else 0
+    pp_started = _n(payment_path.get("payment_started")) if payment_path else 0
+    pp_success = _n(payment_path.get("payment_success")) if payment_path else 0
+    pricing_viewed_raw = payment_path.get("pricing_viewed") if payment_path else None
+    pricing_viewed = _n(pricing_viewed_raw) if pricing_viewed_raw is not None else 0
+    pricing_tracked = pricing_viewed_raw is not None
+
+    # Новые сигналы из onboarding/feedback
+    choice_counts = payment_path.get("onboarding_choice_counts") if payment_path else None
+    fb_good = _n(payment_path.get("first_post_feedback_good")) if payment_path else 0
+    fb_bad = _n(payment_path.get("first_post_feedback_bad")) if payment_path else 0
+    has_new_signals = bool(choice_counts) or fb_good > 0 or fb_bad > 0
+
+    MIN_PRICING = 5
+    MIN_SIGNUP_FOR_CONCLUSIONS = 10
+
+    # ── Определяем стадию ────────────────────────────────────────────────
+    if pp_success > 0:
+        stage = "scale"
+    elif pp_started > 0:
+        stage = "payment_flow"
+    elif pricing_tracked and pricing_viewed >= MIN_PRICING:
+        stage = "tariff_screen"
+    elif activation_1 > 0:
+        stage = "path_to_tariffs"
+    elif signup > 0:
+        stage = "activation"
+    else:
+        stage = "traffic"
+
+    # ── Что сегодня проверяем ────────────────────────────────────────────
+    lines.append("\n🔎 Что сейчас проверяем:")
+    if stage == "path_to_tariffs":
+        lines.append(
+            "Почему пользователи создают канал и генерируют посты, "
+            "но почти не открывают тарифы."
+        )
+    elif stage == "tariff_screen":
+        lines.append(
+            "Почему пользователи открывают тарифы, но не начинают оплату. "
+            "Проверяем тарифный экран: ценность, цена, момент предложения."
+        )
+    elif stage == "payment_flow":
+        lines.append(
+            "Есть попытки оплаты без успеха. "
+            "Проверяем платёжный шлюз: YooKassa логи, причины отказов."
+        )
+    elif stage == "scale":
+        lines.append("Есть оплаты. Смотрим на экономику: окупаемость и масштаб.")
+    elif stage == "activation":
+        lines.append(
+            "Пользователи регистрируются, но не создают канал. "
+            "Проверяем что происходит сразу после регистрации."
+        )
+    else:
+        lines.append("Смотрим на качество трафика и первые регистрации.")
+
+    # ── Цель на неделю ────────────────────────────────────────────────────
+    lines.append("\n🎯 Цель на неделю:")
+    if stage in ("path_to_tariffs", "activation"):
+        lines.append(
+            "Собрать данные после нового онбординга и фидбека первого поста. "
+            "Понять, какой выбор в онбординге делают пользователи "
+            "и помогает ли первый пост."
+        )
+    elif stage == "tariff_screen":
+        lines.append(
+            "Понять, почему пользователи видят тарифы, но не платят. "
+            "Проверить тарифный экран и момент предложения оплаты."
+        )
+    elif stage == "payment_flow":
+        lines.append("Найти и устранить причину неуспешных оплат.")
+    else:
+        lines.append("Получить первые стабильные оплаты и оценить экономику.")
+
+    # ── На что смотрим ────────────────────────────────────────────────────
+    lines.append("\n📊 На что смотрим:")
+    if has_new_signals or stage in ("path_to_tariffs", "activation"):
+        lines.append("— выбор «сгенерировать первый пост» в онбординге")
+        lines.append("— выбор «проанализировать канал»")
+        lines.append("— пропуск онбординга")
+        lines.append("— первый пост подошёл / не подошёл")
+        lines.append("— причины «не подошёл»")
+    if pricing_tracked:
+        lines.append(f"— открытия тарифов (сейчас: {pricing_viewed})")
+    else:
+        lines.append("— открытия тарифов (событие не настроено — данных нет)")
+    lines.append(f"— начало оплаты (сейчас: {pp_started})")
+
+    # Текущий прогресс
+    lines.append("\n📈 Прогресс:")
+    if has_new_signals:
+        total_feedback = fb_good + fb_bad
+        if total_feedback > 0:
+            good_pct = int(fb_good / total_feedback * 100)
+            lines.append(f"— отзывов о первом посте: {total_feedback} ({good_pct}% положительных)")
+        if choice_counts and isinstance(choice_counts, dict):
+            gen = _n(choice_counts.get("generate_post") or choice_counts.get("first_post", 0))
+            skip = _n(choice_counts.get("skip") or choice_counts.get("skipped", 0))
+            if gen or skip:
+                lines.append(f"— выбирают генерацию поста: {gen}, пропускают: {skip}")
+    else:
+        lines.append("— новые сигналы после деплоя ещё не накопились")
+
+    if signup >= MIN_SIGNUP_FOR_CONCLUSIONS:
+        lines.append(f"— данных достаточно для предварительных выводов ({signup} регистраций)")
+    else:
+        lines.append(f"— данных пока мало ({signup} регистраций из ~{MIN_SIGNUP_FOR_CONCLUSIONS} нужных для выводов)")
+
+    # ── Следующее решение ─────────────────────────────────────────────────
+    lines.append("\n⚡ Следующее решение:")
+    if stage == "path_to_tariffs":
+        if has_new_signals and fb_good > fb_bad:
+            lines.append(
+                "Если первый пост подходит, но тарифы не открывают — "
+                "следующий эксперимент: «очередь постов на неделю»."
+            )
+        else:
+            lines.append(
+                "Дождаться данных по онбордингу и фидбеку первого поста. "
+                "Если пост не подходит — эксперимент с промптом/тематикой. "
+                "Если подходит, но тарифы не открывают — "
+                "эксперимент «очередь постов на неделю»."
+            )
+    elif stage == "tariff_screen":
+        lines.append(
+            "Проверить тарифный экран вручную с нового аккаунта. "
+            "Если ценность неочевидна — эксперимент с подачей тарифов."
+        )
+    elif stage == "payment_flow":
+        lines.append("Проверить YooKassa логи и починить платёжный шлюз.")
+    elif stage == "scale":
+        lines.append("Оценить CPA и принять решение о масштабировании бюджета.")
+    else:
+        lines.append("Ждать накопления данных по текущей стадии.")
+
+    # ── Что не трогаем ────────────────────────────────────────────────────
+    lines.append("\n🚫 Что сейчас не трогаем:")
+    lines.append("— бюджет и ставки рекламы")
+    lines.append("— лендинг")
+    lines.append("— цены и тарифы")
+    lines.append("— дизайн и картинки")
+    lines.append("— бесплатная квота")
+    lines.append("— генератор постов")
+
+    # ── Главный кандидат ─────────────────────────────────────────────────
+    lines.append("\n💡 Главный кандидат на следующий шаг:")
+    if stage in ("path_to_tariffs", "activation"):
+        lines.append(
+            "«Очередь постов на неделю» — показать пользователю, "
+            "что продукт делает за него работу на неделю вперёд, "
+            "и только тогда предложить тариф.\n"
+            "Статус: кандидат, не задача в работу."
+        )
+    elif stage == "tariff_screen":
+        lines.append(
+            "Улучшение тарифного экрана — добавить конкретные примеры ценности "
+            "до показа цены.\n"
+            "Статус: кандидат, не задача в работу."
+        )
+    else:
+        lines.append("Кандидат определится после накопления данных.")
+
+    lines.append("\nПодробности: /funnel  /pay  /ads")
+    return "\n".join(lines)

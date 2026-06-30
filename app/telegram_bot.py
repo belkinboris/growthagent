@@ -2132,6 +2132,41 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(update, "\n".join(lines))
 
 
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Управленческий отчёт текущего дня: что проверяем, что решаем, что не трогаем."""
+    try:
+        from app.commercial_report import build_today_report
+
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
+
+            snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
+            metrics_obj = _normalized_metrics_from_snapshot(snapshot) if snapshot else None
+
+            pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+            di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
+            di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
+            di = _deserialize_direct_intelligence(di_dict)
+
+            project_name = project.name
+
+        text = build_today_report(
+            project_name,
+            metrics_obj,
+            payment_path=pp_dict,
+            direct_intelligence=di,
+        )
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/today failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
+
+
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Manual /run is isolated from Telegram update processing.
@@ -2324,6 +2359,15 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             snapshot_dt=snap_created_at,
             prev_metrics=prev_metrics,
         )
+
+        # Source breakdown — если AutoPost отдаёт utm_source breakdown
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        breakdown = parse_source_breakdown(pp_dict)
+        if breakdown or True:  # показываем всегда — либо данные, либо рекомендацию
+            source_block = format_source_breakdown(breakdown, pp_dict)
+            if source_block:
+                text = text + source_block
+
         await safe_reply(update, text)
 
     except Exception as exc:
@@ -3020,6 +3064,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("ads", cmd_ads))
     app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
