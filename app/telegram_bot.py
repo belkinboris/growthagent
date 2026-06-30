@@ -42,6 +42,7 @@ from app.service import (
     CycleResult,
     DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
     PAYMENT_PATH_CACHE_PERIOD_KEY,
+    USER_JOURNEYS_CACHE_PERIOD_KEY,
     extract_normalized_metrics_from_snapshot,
     get_cached_diagnostics,
 )
@@ -2220,6 +2221,11 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
             di = _deserialize_direct_intelligence(di_dict)
 
+            journeys_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
+            recent_journeys = None
+            if journeys_cached and journeys_cached.ok:
+                recent_journeys = (journeys_cached.result_json or {}).get("journeys")
+
             project_name = project.name
 
         text = build_today_report(
@@ -2227,6 +2233,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             metrics_obj,
             payment_path=pp_dict,
             direct_intelligence=di,
+            recent_journeys=recent_journeys,
         )
         await safe_reply(update, text)
     except Exception as exc:
@@ -2248,9 +2255,14 @@ async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
             pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
+            journeys_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
+            recent_journeys = None
+            if journeys_cached and journeys_cached.ok:
+                recent_journeys = (journeys_cached.result_json or {}).get("journeys")
+
             project_name = project.name
 
-        text = build_experiments_report(project_name, payment_path=pp_dict)
+        text = build_experiments_report(project_name, payment_path=pp_dict, recent_journeys=recent_journeys)
         await safe_reply(update, text)
     except Exception as exc:
         logger.exception("/experiments failed: %s: %s", type(exc).__name__, exc)

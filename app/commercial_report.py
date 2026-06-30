@@ -929,10 +929,15 @@ def build_today_report(
     new_registrations_since_deploy: int | None = None,
     new_registrations_target: int = 30,
     feedback_target: int = 10,
+    recent_journeys: list[dict] | None = None,
 ) -> str:
     """
     /today — рабочая доска текущей проверки. Не просто отчёт, а ответ на
     вопрос "что сейчас происходит и что делать дальше".
+
+    recent_journeys: если передан (per-user journeys endpoint доступен) --
+    добавляется блок "Последний коммерческий путь" или "Последний застрявший
+    путь", без PII, только user_key.
 
     Использует только осознанные пользовательские действия:
     регистрации, созданные каналы, feedback первого поста, открытия тарифов,
@@ -1067,6 +1072,19 @@ def build_today_report(
     for item in ["бюджет", "ставки", "лендинг", "цены", "тарифы", "дизайн", "картинки", "free quota"]:
         lines.append(f"— {item}")
 
+    # ── Последний путь пользователя (если journeys доступны) ─────────────
+    if recent_journeys:
+        from app.notifications import pick_recent_commercial_journey, pick_recent_stuck_journey, _short_path_summary
+        stuck = pick_recent_stuck_journey(recent_journeys)
+        if stuck:
+            journey, minutes = stuck
+            lines.append(f"\nПоследний застрявший путь:\n{_short_path_summary(journey)}, "
+                        f"оплату не начал {minutes} мин.")
+        else:
+            commercial = pick_recent_commercial_journey(recent_journeys)
+            if commercial:
+                lines.append(f"\nПоследний коммерческий путь:\n{_short_path_summary(commercial)}")
+
     lines.append("\nПодробности: /run  /funnel  /pay  /ads")
     lines.append("Подробности проверки: /experiments")
     return "\n".join(lines)
@@ -1083,6 +1101,7 @@ def build_experiments_report(
     new_registrations_target: int = 30,
     payment_path: dict | None = None,
     feedback_target: int = 10,
+    recent_journeys: list[dict] | None = None,
 ) -> str:
     """
     Owner-facing список активных проверок/гипотез.
@@ -1181,6 +1200,13 @@ def build_experiments_report(
     ]
     for item, reason in deferred:
         lines.append(f"— {item} ({reason})")
+
+    # ── Последние пользовательские пути (если journeys доступны) ─────────
+    if recent_journeys:
+        from app.notifications import format_recent_journeys_block
+        journeys_block = format_recent_journeys_block(recent_journeys, max_lines=5)
+        if journeys_block:
+            lines.append(journeys_block)
 
     lines.append("\nПодробности: /today  /funnel  /pay")
     return "\n".join(lines)

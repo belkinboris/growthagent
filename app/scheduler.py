@@ -43,7 +43,7 @@ from app.connectors import yookassa as yookassa_connector
 from app.db import get_session
 from app.diagnostics import run_diagnostics, get_query_clusters, analyze_onboarding, analyze_landing_funnel, finding_fingerprint
 from app.query_classifier import classify_search_queries, DirectIntelligenceResult
-from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, MetricSnapshot, Project
+from app.models import AttributionStatus, Integration, IntegrationStatus, IntegrationType, MetricSnapshot, NotificationLog, Project
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
 from app.service import (
@@ -52,6 +52,7 @@ from app.service import (
     LANDING_FUNNEL_CACHE_PERIOD_KEY,
     ONBOARDING_CACHE_PERIOD_KEY,
     PAYMENT_PATH_CACHE_PERIOD_KEY,
+    USER_JOURNEYS_CACHE_PERIOD_KEY,
     check_integration_freshness,
     collect_milestone_notifications,
     extract_normalized_metrics_from_snapshot,
@@ -1296,22 +1297,171 @@ async def run_landing_funnel_diagnostics_for_project(
     return {"status": "ok", "result": diag_result.to_dict(), "error": None}
 
 
+async def _send_telegram_notification(settings, text: str) -> bool:
+    """Общий helper отправки уведомления всем admin chat_ids. Не кидает исключений."""
+    import httpx
+    api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
+    ok_any = False
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for chat_id in settings.admin_chat_ids_list:
+            try:
+                resp = await client.post(api_url, json={"chat_id": chat_id, "text": text})
+                if resp.status_code == 200:
+                    ok_any = True
+                else:
+                    logger.warning("Notification send failed (chat_id=%s): HTTP %s", chat_id, resp.status_code)
+            except Exception as exc:
+                logger.warning("Notification send error (chat_id=%s): %s", chat_id, exc)
+    return ok_any
+
+
 async def notify_product_signal_deltas(project: Project, settings, current_payment_path: dict) -> None:
     """
-    Live notifications о ключевых шагах пути пользователя (см. notifications.py).
+    Live notifications о ключевых шагах пути пользователя.
 
-    Вызывается из run_cycle_once ПОСЛЕ получения свежих payment_path данных,
-    НО ДО перезаписи кэша PAYMENT_PATH_CACHE_PERIOD_KEY новым значением --
-    благодаря этому здесь ещё доступен предыдущий снимок для сравнения.
+    Главная точка входа, вызывается из run_cycle_once ПОСЛЕ получения свежих
+    payment_path данных, НО ДО перезаписи кэша PAYMENT_PATH_CACHE_PERIOD_KEY.
+
+    Стратегия (v1):
+    1. Пробуем per-user journeys endpoint (fetch_user_journeys). Если он
+       доступен (ok=True) -- уведомления идут по конкретным анонимным
+       user_key, с путём и местом застревания. Это основной режим.
+    2. Если journeys endpoint недоступен (404/500/timeout/not_configured) --
+       ПОЛНОСТЬЮ откатываемся на старую delta-логику (compute_deltas по
+       агрегатам). Это гарантирует, что отключение/неготовность нового
+       endpoint на стороне TruePost не оставит владельца без уведомлений.
 
     Не кидает исключений наружу -- сбой live notifications не должен
-    останавливать /run. Дедупликация через NotificationLog (event_key)
-    защищает от повторной отправки, если функция вызовется дважды для
-    одного и того же прироста.
+    останавливать /run. Дедупликация через NotificationLog (event_key).
     """
     if not settings.bot_token or not settings.admin_chat_ids_list:
         return  # некому отправлять
 
+    journeys_result = None
+    if project.base_url and settings.project_internal_api_token:
+        try:
+            from app.connectors.user_journeys import fetch_user_journeys
+            journeys_result = await fetch_user_journeys(
+                base_url=project.base_url,
+                api_token=settings.project_internal_api_token,
+                period_hours=24,
+                limit=100,
+            )
+        except Exception as exc:
+            logger.warning("user_journeys fetch failed unexpectedly (falling back to deltas): %s", exc)
+            journeys_result = None
+
+    if journeys_result is not None and journeys_result.get("ok"):
+        journeys = journeys_result.get("journeys") or []
+        logger.info(
+            "user_journeys fetched ok (project_id=%s, count=%s)",
+            project.id, len(journeys),
+        )
+        try:
+            with get_session() as session:
+                save_diagnostics_cache(
+                    session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY,
+                    "live_run", {"journeys": journeys, "as_of": journeys_result.get("as_of")},
+                    ok=True,
+                )
+        except Exception as cache_exc:
+            logger.warning("Failed to cache user_journeys: %s", cache_exc)
+        await _notify_from_journeys(project, settings, journeys)
+        return
+
+    if journeys_result is not None and not journeys_result.get("ok"):
+        logger.info(
+            "user_journeys unavailable (project_id=%s, status=%s, error=%s) -- falling back to delta notifications",
+            project.id, journeys_result.get("status"), journeys_result.get("error"),
+        )
+
+    await _notify_from_deltas(project, settings, current_payment_path)
+
+
+async def _notify_from_journeys(project: Project, settings, journeys: list[dict]) -> None:
+    """
+    Per-user journey notifications (v1, основной режим).
+    Anti-spam: если journeys > 20 за цикл -- дайджест вместо потока.
+    """
+    from app.notifications import build_journey_event_key, build_journey_notifications
+    from app.service import was_notified, mark_notified
+
+    if not journeys:
+        return
+
+    DIGEST_THRESHOLD_JOURNEYS = 20
+
+    if len(journeys) > DIGEST_THRESHOLD_JOURNEYS:
+        # Дайджест по journeys -- не шлём поток отдельных уведомлений
+        progressed = sum(1 for j in journeys if j.get("channel_created_at"))
+        priced = sum(1 for j in journeys if j.get("pricing_viewed_at"))
+        paid = sum(1 for j in journeys if j.get("payment_success_at"))
+        digest_text = (
+            f"Активность пользователей — TruePost\n\n"
+            f"За последний цикл: {len(journeys)} путей пользователей, "
+            f"{progressed} с созданным каналом, {priced} дошли до тарифов, "
+            f"{paid} оплатили."
+        )
+        digest_signature = "-".join(sorted(j.get("user_key", "") for j in journeys))[:200]
+        event_key = f"journey_digest:{project.id}:{hash(digest_signature)}"
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                return
+            sent_ok = await _send_telegram_notification(settings, digest_text)
+            if sent_ok:
+                mark_notified(session, project.id, event_key, "journey_digest")
+                logger.info("Live notification sent: journey digest (project_id=%s, count=%s)", project.id, len(journeys))
+        return
+
+    # Не дайджест -- проверяем какие event_key уже отправлены, одним запросом
+    with get_session() as session:
+        candidate_keys: set[str] = set()
+        for journey in journeys:
+            user_key = journey.get("user_key")
+            if not user_key:
+                continue
+            if journey.get("pricing_viewed_at"):
+                candidate_keys.add(build_journey_event_key(user_key, "pricing_viewed", journey.get("pricing_viewed_at")))
+            if journey.get("payment_started_at"):
+                candidate_keys.add(build_journey_event_key(user_key, "payment_started", journey.get("payment_started_at")))
+            if journey.get("payment_success_at"):
+                candidate_keys.add(build_journey_event_key(user_key, "payment_success", journey.get("payment_success_at")))
+            if journey.get("payment_failed_at"):
+                candidate_keys.add(build_journey_event_key(user_key, "payment_failed", journey.get("payment_failed_at")))
+            candidate_keys.add(build_journey_event_key(user_key, "stuck_tariff_screen", journey.get("pricing_viewed_at")))
+
+        already_notified: set[str] = set()
+        if candidate_keys:
+            existing = session.exec(
+                select(NotificationLog.event_key).where(
+                    NotificationLog.project_id == project.id,
+                    NotificationLog.event_key.in_(candidate_keys),
+                )
+            ).all()
+            already_notified = set(existing)
+
+    pending = build_journey_notifications(journeys, already_notified)
+
+    for event_key, text in pending:
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                continue  # на случай гонки между чтением candidate_keys и отправкой
+            sent_ok = await _send_telegram_notification(settings, text)
+            if sent_ok:
+                # event_type для NotificationLog -- извлекаем из event_key
+                # (формат journey:<user_key>:<step>:<ts>), без user_id PII в event_type поле
+                parts = event_key.split(":")
+                step = parts[2] if len(parts) > 2 else "journey"
+                user_key = parts[1] if len(parts) > 1 else None
+                mark_notified(session, project.id, event_key, f"journey_{step}", user_id=user_key)
+                logger.info("Live notification sent: journey_%s (project_id=%s)", step, project.id)
+
+
+async def _notify_from_deltas(project: Project, settings, current_payment_path: dict) -> None:
+    """
+    Fallback: старая delta-логика по агрегатам (когда journeys endpoint
+    недоступен). Полностью сохранена для обратной совместимости.
+    """
     from app.notifications import (
         compute_deltas, build_notification_batch, build_event_key, format_notification,
     )
@@ -1327,30 +1477,13 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
 
     batch = build_notification_batch(deltas)
 
-    import httpx
-    api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
-
-    async def _send(text: str) -> bool:
-        ok_any = False
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for chat_id in settings.admin_chat_ids_list:
-                try:
-                    resp = await client.post(api_url, json={"chat_id": chat_id, "text": text})
-                    if resp.status_code == 200:
-                        ok_any = True
-                    else:
-                        logger.warning("Notification send failed (chat_id=%s): HTTP %s", chat_id, resp.status_code)
-                except Exception as exc:
-                    logger.warning("Notification send error (chat_id=%s): %s", chat_id, exc)
-        return ok_any
-
     if batch.is_digest:
         digest_signature = ":".join(f"{d.event_type}={d.current_value}" for d in sorted(deltas, key=lambda x: x.event_type))
         event_key = f"digest:{project.id}:{digest_signature}"
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 return
-            sent_ok = await _send(batch.digest_text)
+            sent_ok = await _send_telegram_notification(settings, batch.digest_text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, "digest")
                 logger.info("Live notification sent: digest (project_id=%s)", project.id)
@@ -1362,7 +1495,7 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
             if was_notified(session, project.id, event_key):
                 continue
             text = format_notification(delta)
-            sent_ok = await _send(text)
+            sent_ok = await _send_telegram_notification(settings, text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, delta.event_type)
                 logger.info(
