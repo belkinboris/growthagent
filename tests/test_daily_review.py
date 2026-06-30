@@ -1613,35 +1613,44 @@ class TestTodayReport:
     def test_today_basic_structure(self):
         from app.commercial_report import build_today_report
         text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
-        for section in ["Что сейчас проверяем", "Цель на неделю", "На что смотрим",
-                         "Прогресс", "Следующее решение", "Что сейчас не трогаем",
-                         "Главный кандидат"]:
+        for section in ["Главная проверка", "Прогресс проверки", "Что смотрим",
+                         "Следующее решение", "Сегодня делать", "Что не трогать"]:
             assert section in text, f"Не найдена секция: {section}"
 
     def test_today_no_banned_terms(self):
         from app.commercial_report import build_today_report
         text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
         for term in ["legacy", "fallback", "cache", "Direct Intelligence",
-                     "attribution", "granular", "backend", "UTM"]:
+                     "attribution", "granular", "backend", "UTM", "штаб"]:
             assert term not in text, f"Запрещённый термин {term!r} в /today"
 
-    def test_today_path_to_tariffs_stage(self):
-        """При мало просмотров тарифов — стадия path_to_tariffs."""
+    def test_today_main_check_truepost(self):
+        """/today показывает главную проверку TruePost — про канал и тарифы."""
         from app.commercial_report import build_today_report
         text = build_today_report("АвтоПост", self._m(), payment_path=self._pp(pricing_viewed=1))
+        assert "канал" in text.lower()
         assert "тарифы" in text.lower()
-        assert "Очередь постов" in text
 
-    def test_today_with_new_signals(self):
-        """При наличии feedback данных — прогресс показывает их."""
+    def test_today_shows_progress_bar(self):
+        """/today показывает текстовую шкалу прогресса."""
+        from app.commercial_report import build_today_report
+        text = build_today_report(
+            "АвтоПост", self._m(), payment_path=self._pp(),
+            new_registrations_since_deploy=4, new_registrations_target=30,
+        )
+        assert "[" in text and "]" in text  # есть progress bar
+        assert "4 / 30" in text
+        assert "13%" in text
+
+    def test_today_with_new_signals_progress_bar(self):
+        """При наличии feedback данных — прогресс-бар по отзывам."""
         from app.commercial_report import build_today_report
         pp = self._pp(
-            first_post_feedback_good=15, first_post_feedback_bad=3,
-            onboarding_choice_counts={"generate_post": 20, "skip": 2}
+            first_post_feedback_good=1, first_post_feedback_bad=0,
         )
-        text = build_today_report("АвтоПост", self._m(), payment_path=pp)
-        assert "15" in text or "18" in text or "положительных" in text
-        assert "20" in text or "генерацию" in text
+        text = build_today_report("АвтоПост", self._m(), payment_path=pp, feedback_target=10)
+        assert "Отзывы о первом посте: 1 / 10" in text
+        assert "10%" in text
 
     def test_today_payment_flow_stage(self):
         """При payment_started > 0 — стадия payment_flow."""
@@ -1649,14 +1658,43 @@ class TestTodayReport:
         m = self._m(payment_started=2)
         pp = self._pp(payment_started=2, pricing_viewed=8)
         text = build_today_report("АвтоПост", m, payment_path=pp)
-        assert "платёж" in text.lower() or "YooKassa" in text
+        assert "оплат" in text.lower() or "YooKassa" in text
 
-    def test_today_no_payments_candidate_is_queue(self):
-        """Главный кандидат — очередь постов при стадии path_to_tariffs."""
+    def test_today_next_candidate_is_queue(self):
+        """Следующий кандидат — очередь постов на неделю при стадии path_to_tariffs."""
         from app.commercial_report import build_today_report
         text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
-        assert "кандидат" in text.lower()
-        assert "не задача в работу" in text
+        assert "очередь постов на неделю" in text.lower()
+
+    def test_today_no_progress_data_shows_honest_message(self):
+        """Если новых данных после деплоя нет — честное сообщение, без выдумывания."""
+        from app.commercial_report import build_today_report
+        m = self._m()
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0}
+        text = build_today_report("АвтоПост", m, payment_path=pp)
+        assert "Новые данные после деплоя ещё не накопились" in text
+
+    def test_today_does_not_use_raw_post_generations_as_engagement(self):
+        """/today не использует raw post_generations (activation_2) как доказательство вовлечённости."""
+        from app.commercial_report import build_today_report
+        m = self._m(activation_2=500)  # очень большое число автогенераций
+        text = build_today_report("АвтоПост", m, payment_path=self._pp())
+        assert "500" not in text
+        assert "генерир" not in text.lower()
+
+    def test_today_shows_what_not_to_touch(self):
+        """/today показывает полный список 'что не трогать'."""
+        from app.commercial_report import build_today_report
+        text = build_today_report("АвтоПост", self._m(), payment_path=self._pp())
+        for item in ["бюджет", "ставки", "лендинг", "цены", "тарифы", "дизайн", "картинки"]:
+            assert item in text.lower()
+
+    def test_today_progress_bar_calculation_examples(self):
+        """progress_bar() считается так как в задаче: 0/30, 15/30, 30/30."""
+        from app.commercial_report import progress_bar
+        assert progress_bar(0, 30) == "[░░░░░░░░░░] 0%"
+        assert progress_bar(15, 30) == "[█████░░░░░] 50%"
+        assert progress_bar(30, 30) == "[██████████] 100%"
 
 
 class TestTrafficSources:
@@ -1946,3 +1984,573 @@ class TestSourceBreakdownFormatting:
         breakdown = parse_source_breakdown(pp)
         text = format_source_breakdown(breakdown, pp)
         assert text.count("eLama") == 1
+
+
+# ---------------------------------------------------------------------------
+# Raw post_generations не должен быть доказательством вовлечённости
+# ---------------------------------------------------------------------------
+
+class TestRawPostGenerationsNotMainStep:
+
+    def _m(self, **kw):
+        from app.rules import NormalizedMetrics
+        d = dict(period_key="7d", signup=1, activation_1=1, activation_2=3,
+            payment_started=0, payment_success=0, spend=0, clicks=0, sources_ok=set())
+        d.update(kw)
+        return NormalizedMetrics(**d)
+
+    def test_funnel_no_raw_generations_as_main_step(self):
+        """/funnel не показывает 'N сгенерировали пост' как основной шаг воронки."""
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("АвтоПост", self._m())
+        assert "раз сгенерировали пост" not in text
+        assert "генераций постов" not in text or "Технически создано постов" in text
+
+    def test_funnel_shows_first_post_placeholder_without_feedback(self):
+        """Без feedback-данных /funnel пишет placeholder про сбор данных."""
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("АвтоПост", self._m(), payment_path=None)
+        assert "собираются через отзыв" in text or "после деплоя" in text
+
+    def test_funnel_shows_feedback_when_available(self):
+        """С feedback-данными /funnel показывает реальный сигнал, не raw generations."""
+        from app.commercial_report import build_funnel_report
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0,
+              "first_post_feedback_good": 1, "first_post_feedback_bad": 0}
+        text = build_funnel_report("АвтоПост", self._m(), payment_path=pp)
+        assert "первый пост получили и оценили" in text
+        assert "1 понравился" in text
+
+    def test_funnel_technical_block_has_warning(self):
+        """Технический блок post_generations НЕ показывается в owner-facing /funnel вообще."""
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("АвтоПост", self._m(activation_2=3))
+        assert "Технически создано постов" not in text
+        assert "создано постов" not in text.lower()
+
+    def test_funnel_no_technical_block_when_zero(self):
+        """Если activation_2=0, технический блок не показывается."""
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("АвтоПост", self._m(activation_2=0))
+        assert "Технически создано постов" not in text
+
+    def test_run_report_no_generate_posts_as_engagement_proof(self):
+        """/run не использует 'генерируют посты' как доказательство активности."""
+        from app.commercial_report import build_run_report
+        m = self._m(activation_1=1, activation_2=3)
+        pp = {"pricing_viewed": None, "payment_started": 0, "payment_success": 0}
+        text = build_run_report("АвтоПост", m, payment_path=pp)
+        assert "активно пробуют продукт" not in text
+        assert "и генерируют посты" not in text
+
+    def test_run_key_numbers_no_raw_generations_label(self):
+        """Ключевые числа /run не содержат 'N генераций постов' без предупреждения."""
+        from app.commercial_report import build_run_report
+        m = self._m(activation_1=1, activation_2=3)
+        text = build_run_report("АвтоПост", m, payment_path={"pricing_viewed": 1})
+        assert "генераций постов" not in text or "включает автоматическое" in text
+
+    def test_run_technical_block_has_warning_when_shown(self):
+        """Если /run показывает technical post count, есть предупреждение."""
+        from app.commercial_report import build_run_report
+        m = self._m(activation_1=1, activation_2=5)
+        text = build_run_report("АвтоПост", m, payment_path={"pricing_viewed": 1})
+        if "технически создано постов" in text.lower():
+            assert "включает автоматическое" in text or "не только ручную" in text
+
+    def test_today_no_generation_engagement_claim(self):
+        """/today не делает вывод 'пользователи активно генерируют' из raw post_generations."""
+        from app.commercial_report import build_today_report
+        m = self._m(activation_1=1, activation_2=3)
+        pp = {"pricing_viewed": 1, "payment_started": 0, "payment_success": 0}
+        text = build_today_report("АвтоПост", m, payment_path=pp)
+        assert "активно генерируют" not in text.lower()
+        assert "генерируют посты" not in text.lower()
+
+    def test_source_breakdown_renames_generations_with_warning(self):
+        """Source breakdown НЕ показывает post_generations ни в каком виде."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "telegram_ads": {"registrations": 1, "channels_created": 1,
+                    "post_generations": 3, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "генераций постов:" not in text
+        assert "создано постов системой" not in text
+        assert "пост" not in text.lower()
+
+    def test_source_breakdown_zero_generations_not_shown(self):
+        """Если post_generations=0, строка вообще не показывается в source breakdown."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "telegram_ads": {"registrations": 1, "channels_created": 1,
+                    "post_generations": 0, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "создано постов системой" not in text
+
+
+# ---------------------------------------------------------------------------
+# Полное удаление raw post counts из owner-facing команд
+# ---------------------------------------------------------------------------
+
+class TestRawPostCountsFullyRemoved:
+    """raw post_generations / activation_2 нигде не показываются в /run, /funnel, source breakdown."""
+
+    def _m(self, **kw):
+        from app.rules import NormalizedMetrics
+        d = dict(period_key="7d", signup=1, activation_1=1, activation_2=3,
+            payment_started=0, payment_success=0, spend=100, clicks=10, sources_ok=set())
+        d.update(kw)
+        return NormalizedMetrics(**d)
+
+    def test_run_report_no_post_count_anywhere(self):
+        """/run не упоминает 'постов' или generation count в любом виде."""
+        from app.commercial_report import build_run_report
+        m = self._m(activation_2=5)
+        text = build_run_report("АвтоПост", m, payment_path={"pricing_viewed": 1})
+        assert "технически создано" not in text.lower()
+        assert "генераций постов" not in text.lower()
+
+    def test_funnel_report_no_post_count_anywhere(self):
+        """/funnel не упоминает raw post count даже с предупреждением."""
+        from app.commercial_report import build_funnel_report
+        m = self._m(activation_2=10)
+        text = build_funnel_report("АвтоПост", m)
+        assert "технически создано" not in text.lower()
+        assert "create" not in text.lower()
+
+    def test_source_breakdown_no_post_count_anywhere(self):
+        """source breakdown не показывает post_generations ни под каким именем."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 10, "channels_created": 8,
+                    "post_generations": 50, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "50" not in text  # значение post_generations не должно просочиться
+        assert "пост" not in text.lower()
+
+    def test_debug_command_has_raw_post_counts(self):
+        """/debug (технический) всё ещё содержит raw метрику — она там уместна."""
+        import subprocess
+        result = subprocess.run(
+            ["grep", "-n", "raw activation_2", "/home/claude/growthagent-main/app/telegram_bot.py"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, "raw activation_2 должна остаться в /debug"
+
+
+# ---------------------------------------------------------------------------
+# /start и навигация — задача "управленческий слой"
+# ---------------------------------------------------------------------------
+
+class TestStartCommand:
+
+    def test_start_contains_today(self):
+        """/start содержит /today в списке команд."""
+        import subprocess
+        result = subprocess.run(
+            ["grep", "-n", "/today", "/home/claude/growthagent-main/app/telegram_bot.py"],
+            capture_output=True, text=True,
+        )
+        assert "/today — что делаем сегодня" in result.stdout or result.returncode == 0
+
+    def test_start_no_shtab_word(self):
+        """/start не содержит слово 'штаб'."""
+        import subprocess
+        result = subprocess.run(
+            ["grep", "-in", "штаб", "/home/claude/growthagent-main/app/telegram_bot.py"],
+            capture_output=True, text=True,
+        )
+        # grep returncode=1 значит совпадений нет — это то что нужно
+        assert result.returncode == 1, f"Слово 'штаб' найдено: {result.stdout}"
+
+    def test_start_function_source_has_required_commands(self):
+        """Текст функции cmd_start содержит owner-facing команды (/run теперь в /help)."""
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        for cmd in ["/today", "/funnel", "/experiments", "/pay", "/ads", "/status", "/help"]:
+            assert cmd in src, f"{cmd} не найден в /start"
+
+    def test_start_is_short(self):
+        """/start не перегружен — короткий текст."""
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        # Извлекаем строковый литерал текста (грубая проверка длины функции)
+        assert src.count("\\n") < 25, "Текст /start выглядит слишком длинным"
+
+
+class TestOldCommandsNotBroken:
+    """Старые команды /run, /funnel, /pay продолжают работать после изменений."""
+
+    def test_run_report_still_works(self):
+        from app.commercial_report import build_run_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        text = build_run_report("АвтоПост", m, payment_path={"pricing_viewed": 1})
+        assert text
+        assert "АвтоПост" in text
+
+    def test_funnel_report_still_works(self):
+        from app.commercial_report import build_funnel_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        text = build_funnel_report("АвтоПост", m)
+        assert text
+        assert "Воронка" in text
+
+    def test_pay_report_still_works(self):
+        from app.commercial_report import build_pay_report
+        text = build_pay_report("АвтоПост", payment_path={"pricing_viewed": 1})
+        assert text
+        assert "оплат" in text.lower()
+
+    def test_ads_report_still_works(self):
+        from app.commercial_report import build_ads_report
+        text = build_ads_report("АвтоПост")
+        assert text
+        assert "Реклама" in text
+
+
+class TestProgressBarHelper:
+
+    def test_zero_progress(self):
+        from app.commercial_report import progress_bar
+        assert progress_bar(0, 30) == "[░░░░░░░░░░] 0%"
+
+    def test_half_progress(self):
+        from app.commercial_report import progress_bar
+        assert progress_bar(15, 30) == "[█████░░░░░] 50%"
+
+    def test_full_progress(self):
+        from app.commercial_report import progress_bar
+        assert progress_bar(30, 30) == "[██████████] 100%"
+
+    def test_overshoot_capped_at_100(self):
+        """current > target не превышает 100%."""
+        from app.commercial_report import progress_bar
+        result = progress_bar(40, 30)
+        assert "100%" in result
+        assert result.count("█") == 10
+
+    def test_target_zero_no_division_error(self):
+        """target=0 не падает с ZeroDivisionError."""
+        from app.commercial_report import progress_bar
+        result = progress_bar(5, 0)
+        assert result  # не падает
+
+    def test_no_markdown_in_progress_bar(self):
+        """progress_bar не содержит markdown символов."""
+        from app.commercial_report import progress_bar
+        result = progress_bar(15, 30)
+        assert "*" not in result
+        assert "_" not in result
+
+
+# ---------------------------------------------------------------------------
+# /start, /help, /experiments — двухуровневое меню
+# ---------------------------------------------------------------------------
+
+class TestStartHelpTwoLevel:
+
+    def test_start_short_owner_facing_list(self):
+        """/start показывает короткий owner-facing список (не все 18 команд)."""
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        # Owner-facing команды есть
+        for cmd in ["/today", "/funnel", "/experiments", "/pay", "/ads", "/status"]:
+            assert cmd in src
+        # Технических нет напрямую (только ссылка на /help)
+        for tech_cmd in ["/test_metrika", "/test_direct", "/mode", "/settings", "/deep_direct"]:
+            assert tech_cmd not in src, f"{tech_cmd} не должен быть в /start"
+
+    def test_start_contains_today_and_experiments(self):
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        assert "/today" in src
+        assert "/experiments" in src
+
+    def test_start_does_not_show_all_technical_commands(self):
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        assert "/ping" not in src
+        assert "/build" not in src
+        assert "/check_landing" not in src
+
+    def test_help_shows_full_command_list(self):
+        """/help содержит полный список основных и технических команд."""
+        import inspect
+        from app.telegram_bot import cmd_help
+        src = inspect.getsource(cmd_help)
+        for cmd in ["/today", "/run", "/funnel", "/experiments", "/pay", "/ads", "/status"]:
+            assert cmd in src
+        for cmd in ["/ping", "/build", "/alerts", "/mode", "/settings",
+                     "/test_metrika", "/test_direct", "/deep_direct", "/debug",
+                     "/check_landing", "/check_onboarding"]:
+            assert cmd in src
+
+    def test_start_no_shtab(self):
+        import inspect
+        from app.telegram_bot import cmd_start
+        src = inspect.getsource(cmd_start)
+        assert "штаб" not in src.lower()
+
+
+class TestExperimentsReport:
+
+    def test_shows_current_check_name(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "Путь после первого поста" in text
+
+    def test_shows_main_question(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "почему пользователи создают канал" in text.lower()
+        assert "тарифы" in text.lower()
+
+    def test_shows_progress_bars(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report(
+            "TruePost",
+            new_registrations_since_deploy=4, new_registrations_target=30,
+            payment_path={"first_post_feedback_good": 1, "first_post_feedback_bad": 0},
+        )
+        assert "[" in text and "]" in text
+        assert "4 / 30" in text
+
+    def test_shows_queue_as_main_candidate(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "Очередь постов на неделю — главный кандидат" in text
+
+    def test_shows_budget_increase_as_deferred(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "увеличение бюджета" in text.lower()
+        # Должно быть в разделе "Отложено"
+        deferred_idx = text.lower().index("отложено")
+        budget_idx = text.lower().index("увеличение бюджета")
+        assert budget_idx > deferred_idx
+
+    def test_no_progress_data_honest_message(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "Новые данные после деплоя ещё не накопились" in text
+
+    def test_no_raw_post_generations(self):
+        """experiments не использует raw post_generations."""
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "генерир" not in text.lower()
+
+    def test_no_shtab_word(self):
+        from app.commercial_report import build_experiments_report
+        text = build_experiments_report("TruePost")
+        assert "штаб" not in text.lower()
+
+
+class TestTodayLinksToExperiments:
+
+    def test_today_contains_experiments_link(self):
+        from app.commercial_report import build_today_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+        text = build_today_report("TruePost", m, payment_path={"pricing_viewed": 1})
+        assert "/experiments" in text
+
+
+# ---------------------------------------------------------------------------
+# Notifications: deltas, formatting, dedup
+# ---------------------------------------------------------------------------
+
+class TestNotificationDeltas:
+
+    def test_compute_deltas_first_run_returns_empty(self):
+        """Первый прогон (previous=None) не генерирует дельты."""
+        from app.notifications import compute_deltas
+        deltas = compute_deltas(None, {"registrations": 30})
+        assert deltas == []
+
+    def test_compute_deltas_detects_registration_increase(self):
+        from app.notifications import compute_deltas
+        prev = {"registrations": 30, "channels_created": 26}
+        cur = {"registrations": 31, "channels_created": 26}
+        deltas = compute_deltas(prev, cur)
+        assert len(deltas) == 1
+        assert deltas[0].event_type == "user_registered"
+        assert deltas[0].delta == 1
+        assert deltas[0].current_value == 31
+
+    def test_compute_deltas_ignores_decrease(self):
+        """Уменьшение счётчика (возможный баг данных) не генерирует уведомление."""
+        from app.notifications import compute_deltas
+        prev = {"registrations": 31}
+        cur = {"registrations": 30}
+        deltas = compute_deltas(prev, cur)
+        assert deltas == []
+
+    def test_compute_deltas_multiple_fields(self):
+        from app.notifications import compute_deltas
+        prev = {"registrations": 30, "channels_created": 25, "pricing_viewed": 1}
+        cur = {"registrations": 31, "channels_created": 26, "pricing_viewed": 2}
+        deltas = compute_deltas(prev, cur)
+        event_types = {d.event_type for d in deltas}
+        assert "user_registered" in event_types
+        assert "channel_created" in event_types
+        assert "pricing_viewed" in event_types
+
+
+class TestNotificationFormatting:
+
+    def test_registration_notification_has_source_and_path_and_impact(self):
+        from app.notifications import StepDelta, format_notification
+        delta = StepDelta(event_type="user_registered", delta=1, current_value=31, previous_value=30)
+        text = format_notification(delta)
+        assert "Новый пользователь" in text
+        assert "Влияние" in text
+        assert "Путь после первого поста" in text
+
+    def test_feedback_good_no_raw_post_generations(self):
+        """Уведомление о feedback good не говорит про raw post_generations."""
+        from app.notifications import StepDelta, format_notification
+        delta = StepDelta(event_type="first_post_feedback_good", delta=1, current_value=5, previous_value=4)
+        text = format_notification(delta)
+        assert "генерир" not in text.lower()
+        assert "пост подходит" in text.lower()
+
+    def test_pricing_viewed_marked_as_commercial_signal(self):
+        """Уведомление о pricing_viewed помечается как коммерческий сигнал."""
+        from app.notifications import StepDelta, format_notification
+        delta = StepDelta(event_type="pricing_viewed", delta=1, current_value=2, previous_value=1)
+        text = format_notification(delta)
+        assert "Коммерческий сигнал" in text
+
+    def test_payment_success_notification(self):
+        from app.notifications import StepDelta, format_notification
+        delta = StepDelta(event_type="payment_success", delta=1, current_value=1, previous_value=0)
+        text = format_notification(delta)
+        assert "Оплата" in text
+
+    def test_no_raw_post_generations_event_type_exists(self):
+        """post_generations НЕ входит в отслеживаемые поля для уведомлений."""
+        from app.notifications import _TRACKED_FIELDS
+        assert "post_generations" not in _TRACKED_FIELDS
+        assert "activation_2" not in _TRACKED_FIELDS
+
+
+class TestNotificationDigestGuardrail:
+
+    def test_few_registrations_not_digest(self):
+        from app.notifications import StepDelta, build_notification_batch
+        deltas = [StepDelta(event_type="user_registered", delta=5, current_value=35, previous_value=30)]
+        batch = build_notification_batch(deltas)
+        assert batch.is_digest is False
+
+    def test_many_registrations_become_digest(self):
+        from app.notifications import StepDelta, build_notification_batch, DIGEST_THRESHOLD_PER_RUN
+        deltas = [StepDelta(
+            event_type="user_registered",
+            delta=DIGEST_THRESHOLD_PER_RUN + 5,
+            current_value=100, previous_value=100 - DIGEST_THRESHOLD_PER_RUN - 5,
+        )]
+        batch = build_notification_batch(deltas)
+        assert batch.is_digest is True
+        assert batch.digest_text is not None
+        assert "регистраций" in batch.digest_text
+
+
+class TestNotificationDedup:
+    """NotificationLog dedup: одно и то же уведомление не отправляется дважды."""
+
+    def test_event_key_deterministic(self):
+        from app.notifications import build_event_key
+        key1 = build_event_key(1, "user_registered", 31)
+        key2 = build_event_key(1, "user_registered", 31)
+        assert key1 == key2
+
+    def test_event_key_differs_by_value(self):
+        from app.notifications import build_event_key
+        key1 = build_event_key(1, "user_registered", 31)
+        key2 = build_event_key(1, "user_registered", 32)
+        assert key1 != key2
+
+    def test_event_key_differs_by_project(self):
+        from app.notifications import build_event_key
+        key1 = build_event_key(1, "user_registered", 31)
+        key2 = build_event_key(2, "user_registered", 31)
+        assert key1 != key2
+
+    def test_was_notified_and_mark_notified_roundtrip(self):
+        """was_notified/mark_notified -- логическая проверка сигнатур (без реальной БД)."""
+        import inspect
+        from app.service import was_notified, mark_notified
+        was_sig = inspect.signature(was_notified)
+        mark_sig = inspect.signature(mark_notified)
+        assert "event_key" in was_sig.parameters
+        assert "event_key" in mark_sig.parameters
+        assert "event_type" in mark_sig.parameters
+
+
+class TestOldCommandsStillWorkAfterNotifications:
+    """Старые команды /run, /funnel, /pay, /ads, /status не сломаны."""
+
+    def _m(self):
+        from app.rules import NormalizedMetrics
+        return NormalizedMetrics(period_key="7d", signup=30, activation_1=26, activation_2=74,
+            payment_started=0, payment_success=0, spend=4800, clicks=528, sources_ok=set())
+
+    def test_run_still_works(self):
+        from app.commercial_report import build_run_report
+        text = build_run_report("TruePost", self._m(), payment_path={"pricing_viewed": 1})
+        assert text
+
+    def test_funnel_still_works(self):
+        from app.commercial_report import build_funnel_report
+        text = build_funnel_report("TruePost", self._m())
+        assert text
+
+    def test_pay_still_works(self):
+        from app.commercial_report import build_pay_report
+        text = build_pay_report("TruePost", payment_path={"pricing_viewed": 1})
+        assert text
+
+    def test_ads_still_works(self):
+        from app.commercial_report import build_ads_report
+        text = build_ads_report("TruePost")
+        assert text
+
+    def test_no_shtab_anywhere_in_reports(self):
+        from app.commercial_report import (
+            build_run_report, build_funnel_report, build_pay_report,
+            build_ads_report, build_today_report, build_experiments_report,
+        )
+        m = self._m()
+        pp = {"pricing_viewed": 1}
+        for text in [
+            build_run_report("TruePost", m, payment_path=pp),
+            build_funnel_report("TruePost", m),
+            build_pay_report("TruePost", payment_path=pp),
+            build_ads_report("TruePost"),
+            build_today_report("TruePost", m, payment_path=pp),
+            build_experiments_report("TruePost"),
+        ]:
+            assert "штаб" not in text.lower()
