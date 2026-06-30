@@ -68,6 +68,8 @@ _EXPECTED_FIELDS = [
     # Breakdown по верификации канала (новые, 2026-06-28)
     "post_generations_verified",    # int — генерации у подключённых каналов
     "post_generations_unverified",  # int — генерации у неподключённых каналов
+    # Source breakdown (новые, 2026-06-29) — разбивка по traffic source
+    "source_breakdown",   # dict: {"yandex_direct": {...}, "telegram_ads": {...}, "unknown": {...}}
 ]
 
 _FIELD_ALIASES: dict[str, list[str]] = {
@@ -85,6 +87,7 @@ _FIELD_ALIASES: dict[str, list[str]] = {
     "first_post_feedback_reasons":  ["feedback_reasons", "bad_feedback_reasons"],
     "post_generations_verified":    ["generations_verified", "verified_channel_generations"],
     "post_generations_unverified":  ["generations_unverified", "unverified_channel_generations"],
+    "source_breakdown":             ["traffic_sources", "by_source", "source_stats"],
 }
 
 
