@@ -1801,3 +1801,148 @@ class TestPaymentPathConnectorSourceBreakdown:
         assert "не сохраняет utm_source" not in text.lower()
         assert "Яндекс.Директ" in text
         assert "Telegram Ads" in text
+
+
+# ---------------------------------------------------------------------------
+# Source breakdown formatting polish
+# ---------------------------------------------------------------------------
+
+class TestSourceBreakdownFormatting:
+
+    def test_yandex_direct_not_duplicated(self):
+        """yandex_direct и direct объединяются в один блок 'Яндекс.Директ'."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 10, "channels_created": 8,
+                    "post_generations": 20, "pricing_viewed": 1,
+                    "payment_started": 0, "payment_success": 0},
+                "direct": {"registrations": 5, "channels_created": 4,
+                    "post_generations": 10, "pricing_viewed": 0,
+                    "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert text.count("Яндекс.Директ:") == 1, \
+            f"Яндекс.Директ должен встречаться один раз, текст: {text}"
+        # Метрики должны суммироваться: 10+5=15 регистраций
+        assert "регистраций: 15" in text
+
+    def test_ya_direct_alias_also_merged(self):
+        """ya_direct тоже мёрджится в Яндекс.Директ."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 10, "channels_created": 8,
+                    "post_generations": 20, "payment_started": 0, "payment_success": 0},
+                "ya_direct": {"registrations": 3, "channels_created": 2,
+                    "post_generations": 5, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert text.count("Яндекс.Директ:") == 1
+        assert "регистраций: 13" in text
+
+    def test_empty_other_bucket_hidden(self):
+        """Пустой 'other' (все нули) не показывается."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "telegram_ads": {"registrations": 1, "channels_created": 1,
+                    "post_generations": 3, "payment_started": 0, "payment_success": 0},
+                "other": {"registrations": 0, "channels_created": 0,
+                    "post_generations": 0, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "other" not in text.lower()
+
+    def test_other_with_real_data_still_shown(self):
+        """'other' с реальными данными (не все нули) показывается."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "other": {"registrations": 7, "channels_created": 5,
+                    "post_generations": 15, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "регистраций: 7" in text
+
+    def test_unknown_always_shown_even_with_zeros(self):
+        """'unknown' (Неизвестный источник) показывается даже если все нули."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "unknown": {"registrations": 0, "channels_created": 0,
+                    "post_generations": 0, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "Неизвестный источник:" in text
+
+    def test_unknown_with_data_shown_correctly(self):
+        """'unknown' с реальными данными показывает правильные числа."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "unknown": {"registrations": 26, "channels_created": 24,
+                    "post_generations": 50, "pricing_viewed": 2,
+                    "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert "Неизвестный источник:" in text
+        assert "регистраций: 26" in text
+        assert "открытий тарифов: 2" in text
+
+    def test_full_scenario_matches_expected_format(self):
+        """Полный сценарий из задачи: TG Ads + Директ (без дублей) + Unknown, без other."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "telegram_ads": {"registrations": 1, "channels_created": 1, "post_generations": 3,
+                    "pricing_viewed": 0, "payment_started": 0, "payment_success": 0},
+                "yandex_direct": {"registrations": 0, "channels_created": 0, "post_generations": 0,
+                    "pricing_viewed": 0, "payment_started": 0, "payment_success": 0},
+                "direct": {"registrations": 0, "channels_created": 0, "post_generations": 0,
+                    "pricing_viewed": None, "payment_started": 0, "payment_success": 0},
+                "other": {"registrations": 0, "channels_created": 0, "post_generations": 0,
+                    "pricing_viewed": 0, "payment_started": 0, "payment_success": 0},
+                "unknown": {"registrations": 26, "channels_created": 24, "post_generations": 50,
+                    "pricing_viewed": 2, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+
+        assert text.count("Яндекс.Директ:") == 1
+        assert "other" not in text.lower()
+        assert "Telegram Ads:" in text
+        assert "Неизвестный источник:" in text
+        # Порядок: Telegram Ads перед Яндекс.Директ перед Неизвестным
+        tg_pos = text.index("Telegram Ads:")
+        ya_pos = text.index("Яндекс.Директ:")
+        unk_pos = text.index("Неизвестный источник:")
+        assert tg_pos < ya_pos < unk_pos
+
+    def test_telegram_ads_note_only_on_telegram_ads_block(self):
+        """Пометка про eLama стоит только у блока Telegram Ads, не у других."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+        pp = {
+            "source_breakdown": {
+                "telegram_ads": {"registrations": 1, "channels_created": 1,
+                    "post_generations": 3, "payment_started": 0, "payment_success": 0},
+                "unknown": {"registrations": 5, "channels_created": 4,
+                    "post_generations": 10, "payment_started": 0, "payment_success": 0},
+            }
+        }
+        breakdown = parse_source_breakdown(pp)
+        text = format_source_breakdown(breakdown, pp)
+        assert text.count("eLama") == 1
