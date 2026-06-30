@@ -1700,3 +1700,104 @@ class TestTrafficSources:
         from app.connectors.traffic_sources import KNOWN_SOURCES
         assert KNOWN_SOURCES["yandex_direct"] == "Яндекс.Директ"
         assert KNOWN_SOURCES["telegram_ads"] == "Telegram Ads"
+
+
+# ---------------------------------------------------------------------------
+# Regression: connector не должен терять source_breakdown
+# ---------------------------------------------------------------------------
+
+class TestPaymentPathConnectorSourceBreakdown:
+    """source_breakdown должен проходить через connector без потерь."""
+
+    def test_source_breakdown_in_expected_fields(self):
+        from app.connectors.payment_path import _EXPECTED_FIELDS
+        assert "source_breakdown" in _EXPECTED_FIELDS
+
+    def test_resolve_field_returns_source_breakdown(self):
+        from app.connectors.payment_path import _resolve_field
+        raw = {
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 25},
+                "telegram_ads": {"registrations": 5},
+            }
+        }
+        result = _resolve_field(raw, "source_breakdown")
+        assert result is not None
+        assert "yandex_direct" in result
+        assert "telegram_ads" in result
+
+    @pytest.mark.asyncio
+    async def test_fetch_payment_path_diagnostics_preserves_source_breakdown(self):
+        """Полный путь connector: source_breakdown не теряется в итоговом dict."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.payment_path import fetch_payment_path_diagnostics
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "as_of": "2026-06-29T12:00:00Z",
+            "registrations": 30,
+            "channels_created": 26,
+            "post_generations": 75,
+            "pricing_viewed": 1,
+            "payment_started": 0,
+            "payment_success": 0,
+            "source_breakdown": {
+                "yandex_direct": {
+                    "registrations": 25, "channels_created": 20,
+                    "post_generations": 60, "pricing_viewed": 1,
+                    "payment_started": 0, "payment_success": 0,
+                },
+                "telegram_ads": {
+                    "registrations": 5, "channels_created": 4,
+                    "post_generations": 12, "pricing_viewed": 0,
+                    "payment_started": 0, "payment_success": 0,
+                },
+            },
+        }
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_payment_path_diagnostics(
+                base_url="https://example.com",
+                api_token="test-token",
+                period_hours=168,
+            )
+
+        assert "source_breakdown" in result, \
+            "connector потерял source_breakdown — проверь _EXPECTED_FIELDS"
+        assert result["source_breakdown"] is not None
+        assert "yandex_direct" in result["source_breakdown"]
+        assert "telegram_ads" in result["source_breakdown"]
+        assert result["source_breakdown"]["telegram_ads"]["registrations"] == 5
+
+    def test_funnel_shows_breakdown_when_connector_result_has_it(self):
+        """Полный путь: connector result -> parse -> format -> текст с источниками."""
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
+
+        # Симулируем то, что теперь возвращает connector после фикса
+        connector_result = {
+            "registrations": 30, "channels_created": 26,
+            "pricing_viewed": 1, "payment_started": 0,
+            "source_breakdown": {
+                "yandex_direct": {"registrations": 25, "channels_created": 20,
+                    "post_generations": 60, "pricing_viewed": 1,
+                    "payment_started": 0, "payment_success": 0},
+                "telegram_ads": {"registrations": 5, "channels_created": 4,
+                    "post_generations": 12, "pricing_viewed": 0,
+                    "payment_started": 0, "payment_success": 0},
+            },
+        }
+
+        breakdown = parse_source_breakdown(connector_result)
+        assert breakdown is not None
+
+        text = format_source_breakdown(breakdown, connector_result)
+        assert "разбивка по источникам пока недоступна" not in text.lower()
+        assert "не сохраняет utm_source" not in text.lower()
+        assert "Яндекс.Директ" in text
+        assert "Telegram Ads" in text
