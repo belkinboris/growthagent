@@ -15,8 +15,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from sqlmodel import select
 
 from app.analyzer import AlertCandidate
@@ -1482,23 +1482,76 @@ def _get_active_project(session) -> Project | None:
     return session.exec(select(Project).where(Project.is_active == True)).first()
 
 
+_KEYBOARD_BUTTON_TO_COMMAND = {
+    "Сегодня": "today",
+    "Воронка": "funnel",
+    "Проверки": "experiments",
+    "Оплата": "pay",
+    "Реклама": "ads",
+    "Статус": "status",
+}
+_COMMAND_DISPATCH: dict = {}  # заполняется в register_handlers() ниже
+
+
+async def on_keyboard_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply keyboard шлёт обычный текст — роутим кнопки на нужные команды."""
+    text = (update.message.text or "").strip() if update.message else ""
+    command = _KEYBOARD_BUTTON_TO_COMMAND.get(text)
+    if command is None:
+        return  # не наша кнопка — игнорируем молча
+    handler = _COMMAND_DISPATCH.get(command)
+    if handler:
+        await handler(update, context)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Аналитик Воронки — режим наблюдения.\n"
-        f"Версия: {BUILD_MARKER}\n\n"
-        "Команды:\n"
-        "/ping — быстрая проверка, что бот отвечает\n"
-        "/build — версия и время запуска\n"
-        "/status — состояние проекта\n"
-        "/run — запустить проверку вручную\n"
-        "/alerts — последние сигналы\n"
-        "/funnel — воронка\n"
-        "/mode — текущий режим\n"
-        "/settings — основные настройки\n"
-        "/test_metrika — проверить подключение к Яндекс.Метрике\n"
-        "/test_direct — проверить подключение к Яндекс.Директу\n"
-        "/deep_direct — глубокая диагностика Директа (группы, поисковые запросы)\n"
-        "/check_landing — диагностика воронки лендинга (Яндекс.Директ → лендинг → кнопка → бот → регистрация → активация)"
+    keyboard = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Сегодня"), KeyboardButton("Воронка")],
+            [KeyboardButton("Проверки"), KeyboardButton("Оплата")],
+            [KeyboardButton("Реклама"), KeyboardButton("Статус")],
+        ],
+        resize_keyboard=True,
+    )
+    await safe_reply(
+        update,
+        "Аналитик Воронки помогает вести TruePost к первым оплатам: "
+        "показывает, что происходит, какая проверка идёт и что делать дальше.\n\n"
+        "/today — что делаем сегодня\n"
+        "/funnel — где ломается путь пользователя\n"
+        "/experiments — какие проверки идут\n"
+        "/pay — путь к оплате\n"
+        "/ads — реклама\n"
+        "/status — работает ли система\n\n"
+        "Технические команды: /help",
+        reply_markup=keyboard,
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_reply(
+        update,
+        "Команды Аналитика Воронки\n\n"
+        "Основные:\n"
+        "— /today\n"
+        "— /run\n"
+        "— /funnel\n"
+        "— /experiments\n"
+        "— /pay\n"
+        "— /ads\n"
+        "— /status\n\n"
+        "Технические:\n"
+        "— /ping\n"
+        "— /build\n"
+        "— /alerts\n"
+        "— /mode\n"
+        "— /settings\n"
+        "— /test_metrika\n"
+        "— /test_direct\n"
+        "— /deep_direct\n"
+        "— /debug\n"
+        "— /check_landing\n"
+        "— /check_onboarding",
     )
 
 
@@ -2125,6 +2178,20 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     lines.append("DI cache: miss")
                 pp_cache = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
                 lines.append(f"payment_path cache: {'ok' if pp_cache and pp_cache.ok else 'miss'}")
+
+                # Raw technical metrics — не показываются в owner-facing командах,
+                # потому что post_generations смешивает ручную активность пользователя
+                # и автоматическое создание постов системой.
+                snapshot = _get_latest_combined_snapshot(session, project.id, "7d")
+                if snapshot:
+                    m = _normalized_metrics_from_snapshot(snapshot)
+                    lines.append(f"\nraw activation_2 (post_generations, technical): {int(m.activation_2 or 0)}")
+                if pp_cache and pp_cache.ok:
+                    pp_raw = pp_cache.result_json or {}
+                    gv = pp_raw.get("post_generations_verified")
+                    gu = pp_raw.get("post_generations_unverified")
+                    if gv is not None or gu is not None:
+                        lines.append(f"generations_verified: {gv}, generations_unverified: {gu}")
     except Exception as exc:
         lines.append(f"DB error: {type(exc).__name__}: {exc}")
 
@@ -2164,6 +2231,29 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_reply(update, text)
     except Exception as exc:
         logger.exception("/today failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
+
+
+async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-facing список активных проверок/гипотез ('Проверки')."""
+    try:
+        from app.commercial_report import build_experiments_report
+
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
+
+            pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+            project_name = project.name
+
+        text = build_experiments_report(project_name, payment_path=pp_dict)
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/experiments failed: %s: %s", type(exc).__name__, exc)
         await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
 
 
@@ -3058,13 +3148,26 @@ def build_application() -> Application:
 
     app = Application.builder().token(settings.bot_token).build()
 
+    # Заполняем dispatch для reply-keyboard кнопок (объявлен раньше функций,
+    # заполняем здесь когда все cmd_* уже определены)
+    _COMMAND_DISPATCH.update({
+        "today": cmd_today,
+        "funnel": cmd_funnel,
+        "experiments": cmd_experiments,
+        "pay": cmd_pay,
+        "ads": cmd_ads,
+        "status": cmd_status,
+    })
+
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("experiments", cmd_experiments))
     app.add_handler(CommandHandler("ads", cmd_ads))
     app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
@@ -3078,5 +3181,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("check_onboarding", cmd_check_onboarding))
     app.add_handler(CommandHandler("check_landing", cmd_check_landing))
     app.add_handler(CallbackQueryHandler(on_button_press))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_keyboard_button_text))
 
     return app

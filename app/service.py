@@ -34,6 +34,7 @@ from app.models import (
     IntegrationStatus,
     IntegrationType,
     MetricSnapshot,
+    NotificationLog,
     Project,
     ProjectChangeEvent,
 )
@@ -775,6 +776,50 @@ def save_diagnostics_cache(
     session.commit()
     session.refresh(cache_entry)
     return cache_entry
+
+
+# ---------------------------------------------------------------------------
+# Live notifications -- дедупликация (NotificationLog)
+# ---------------------------------------------------------------------------
+
+def was_notified(session: Session, project_id: int, event_key: str) -> bool:
+    """
+    True если уведомление с этим event_key уже было отправлено для проекта.
+    Используется ПЕРЕД отправкой -- предотвращает дубликаты.
+    """
+    existing = session.exec(
+        select(NotificationLog).where(
+            NotificationLog.project_id == project_id,
+            NotificationLog.event_key == event_key,
+        )
+    ).first()
+    return existing is not None
+
+
+def mark_notified(
+    session: Session,
+    project_id: int,
+    event_key: str,
+    event_type: str,
+    user_id: str | None = None,
+    payload: dict | None = None,
+) -> NotificationLog:
+    """
+    Записывает факт отправки уведомления. Вызывается СРАЗУ после успешной
+    отправки в Telegram (не до) -- если отправка упадёт, запись не появится
+    и следующий цикл сможет повторить попытку для этого же event_key.
+    """
+    entry = NotificationLog(
+        project_id=project_id,
+        event_key=event_key,
+        event_type=event_type,
+        user_id=user_id,
+        payload_json=payload or {},
+    )
+    session.add(entry)
+    session.commit()
+    session.refresh(entry)
+    return entry
 
 
 # ---------------------------------------------------------------------------

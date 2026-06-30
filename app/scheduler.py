@@ -705,6 +705,17 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
             if payment_path_outcome["status"] == "ok":
                 result.payment_path_diagnostics = payment_path_outcome["result"]
                 result.payment_path_diagnostics["_from_cache"] = False
+
+                # Live notifications: сравниваем с ПРЕДЫДУЩИМ сохранённым
+                # снимком payment_path ДО того как перезапишем кэш новым.
+                # Если сравнивать нечего (первый прогон) -- notify_outcome
+                # будет пустым, ничего не отправится.
+                try:
+                    from app.scheduler import notify_product_signal_deltas
+                    await notify_product_signal_deltas(project, settings, result.payment_path_diagnostics)
+                except Exception as notif_exc:
+                    logger.warning("Live notifications failed (non-fatal): %s", notif_exc)
+
                 # Сохраняем в кэш — чтобы fallback /run тоже мог показать payment-path блок.
                 # Очищаем datetime объекты — JSON column не принимает нативные datetime.
                 try:
@@ -1283,6 +1294,81 @@ async def run_landing_funnel_diagnostics_for_project(
 
     diag_result = analyze_landing_funnel(connector_result, direct_clicks=direct_clicks, period_hours=period_hours)
     return {"status": "ok", "result": diag_result.to_dict(), "error": None}
+
+
+async def notify_product_signal_deltas(project: Project, settings, current_payment_path: dict) -> None:
+    """
+    Live notifications о ключевых шагах пути пользователя (см. notifications.py).
+
+    Вызывается из run_cycle_once ПОСЛЕ получения свежих payment_path данных,
+    НО ДО перезаписи кэша PAYMENT_PATH_CACHE_PERIOD_KEY новым значением --
+    благодаря этому здесь ещё доступен предыдущий снимок для сравнения.
+
+    Не кидает исключений наружу -- сбой live notifications не должен
+    останавливать /run. Дедупликация через NotificationLog (event_key)
+    защищает от повторной отправки, если функция вызовется дважды для
+    одного и того же прироста.
+    """
+    if not settings.bot_token or not settings.admin_chat_ids_list:
+        return  # некому отправлять
+
+    from app.notifications import (
+        compute_deltas, build_notification_batch, build_event_key, format_notification,
+    )
+    from app.service import was_notified, mark_notified
+
+    with get_session() as session:
+        previous_cache = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        previous_payload = dict(previous_cache.result_json or {}) if (previous_cache and previous_cache.ok) else None
+
+    deltas = compute_deltas(previous_payload, current_payment_path)
+    if not deltas:
+        return
+
+    batch = build_notification_batch(deltas)
+
+    import httpx
+    api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
+
+    async def _send(text: str) -> bool:
+        ok_any = False
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for chat_id in settings.admin_chat_ids_list:
+                try:
+                    resp = await client.post(api_url, json={"chat_id": chat_id, "text": text})
+                    if resp.status_code == 200:
+                        ok_any = True
+                    else:
+                        logger.warning("Notification send failed (chat_id=%s): HTTP %s", chat_id, resp.status_code)
+                except Exception as exc:
+                    logger.warning("Notification send error (chat_id=%s): %s", chat_id, exc)
+        return ok_any
+
+    if batch.is_digest:
+        digest_signature = ":".join(f"{d.event_type}={d.current_value}" for d in sorted(deltas, key=lambda x: x.event_type))
+        event_key = f"digest:{project.id}:{digest_signature}"
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                return
+            sent_ok = await _send(batch.digest_text)
+            if sent_ok:
+                mark_notified(session, project.id, event_key, "digest")
+                logger.info("Live notification sent: digest (project_id=%s)", project.id)
+        return
+
+    for delta in deltas:
+        event_key = build_event_key(project.id, delta.event_type, delta.current_value)
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                continue
+            text = format_notification(delta)
+            sent_ok = await _send(text)
+            if sent_ok:
+                mark_notified(session, project.id, event_key, delta.event_type)
+                logger.info(
+                    "Live notification sent: %s (project_id=%s, value=%s)",
+                    delta.event_type, project.id, delta.current_value,
+                )
 
 
 async def run_payment_path_diagnostics_for_project(

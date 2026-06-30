@@ -84,6 +84,31 @@ def _pct(a, b) -> str:
     return f"{int(a / b * 100)}%"
 
 
+def progress_bar(current: int, target: int, width: int = 10) -> str:
+    """
+    Текстовая шкала прогресса, plain text (без markdown).
+
+    progress_bar(0, 30)  -> "[░░░░░░░░░░] 0%"
+    progress_bar(15, 30) -> "[█████░░░░░] 50%"
+    progress_bar(30, 30) -> "[██████████] 100%"
+    progress_bar(40, 30) -> "[██████████] 100%" (не превышает 100%, даже если current > target)
+
+    target <= 0 трактуется как "цель не задана" — возвращает пустую шкалу 0%
+    без деления на ноль.
+    """
+    current = max(0, int(current or 0))
+    target = int(target or 0)
+    if target <= 0:
+        filled = 0
+        percent = 0
+    else:
+        ratio = min(current / target, 1.0)
+        filled = round(ratio * width)
+        percent = int(ratio * 100)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent}%"
+
+
 # ---------------------------------------------------------------------------
 # /run — главный владельческий отчёт
 # ---------------------------------------------------------------------------
@@ -154,12 +179,12 @@ def build_run_report(
         )
     elif not pricing_viewed_tracked and pp_payment_started == 0:
         lines.append(
-            "Реклама начала приводить пользователей, и они активно пробуют продукт. "
+            "Реклама начала приводить пользователей, и они активно создают каналы. "
             "Пока неизвестно, доходят ли они до тарифов — это событие не отслеживается."
         )
     elif pricing_viewed_tracked and pricing_viewed < MIN_PRICING_FOR_CONCLUSION and pp_payment_started == 0:
         lines.append(
-            "Реклама начала приводить пользователей, и они активно пробуют продукт. "
+            "Реклама начала приводить пользователей, и они активно создают каналы. "
             "Главная проблема сейчас ниже по воронке: пользователи почти не доходят до тарифов и оплаты."
         )
     elif pricing_viewed >= MIN_PRICING_FOR_CONCLUSION and pp_payment_started == 0:
@@ -193,12 +218,12 @@ def build_run_report(
     if activation_1 > 0:
         if not pricing_viewed_tracked:
             issues.append(
-                "Пользователи создают каналы и генерируют посты. "
+                "Пользователи создают каналы. "
                 "Пока неизвестно, доходят ли они до тарифов — просмотр тарифов не отслеживается."
             )
         elif pricing_viewed < MIN_PRICING_FOR_CONCLUSION:
             issues.append(
-                "Пользователи создают каналы и генерируют посты, но почти не открывают тарифы."
+                "Пользователи создают каналы, но почти не открывают тарифы."
             )
         elif pricing_viewed >= MIN_PRICING_FOR_CONCLUSION and pp_payment_started == 0:
             issues.append(
@@ -250,7 +275,7 @@ def build_run_report(
         )
     elif activation_1 > 0 and pricing_viewed_tracked and pricing_viewed < MIN_PRICING_FOR_CONCLUSION:
         product_action = (
-            "Пройти путь от первой генерации поста до тарифов. "
+            "Пройти путь от создания канала до тарифов самому. "
             "Проверить, где пользователь видит предложение оплатить и понимает ли, зачем платить сейчас."
         )
     elif pricing_viewed >= MIN_PRICING_FOR_CONCLUSION and pp_payment_started == 0:
@@ -297,7 +322,6 @@ def build_run_report(
     reg_word = _plural(signup, "регистрация", "регистрации", "регистраций")
     lines.append(f"— {signup} {reg_word}")
     lines.append(f"— {activation_1} создали канал")
-    lines.append(f"— {activation_2} генераций постов")
     if payment_path and pricing_viewed_tracked:
         pv_word = _plural(pricing_viewed, "открытие тарифов", "открытия тарифов", "открытий тарифов")
         lines.append(f"— {pricing_viewed} {pv_word}")
@@ -470,7 +494,7 @@ def build_ads_report(
 # /funnel — продуктовая воронка
 # ---------------------------------------------------------------------------
 
-def _format_new_product_signals(payment_path: dict | None) -> str:
+def _format_new_product_signals(payment_path: dict | None, skip_feedback_summary: bool = False) -> str:
     """
     Форматирует блок новых ProductEvent сигналов: onboarding choice,
     first post feedback, breakdown генераций.
@@ -481,6 +505,10 @@ def _format_new_product_signals(payment_path: dict | None) -> str:
     - Без технических названий событий (нет onboarding_choice_selected и т.д.)
     - Причины "не подошёл" показываем только если first_post_feedback_bad > 0
     - Breakdown verified/unverified — только если хотя бы одно поле не None
+
+    skip_feedback_summary: если True, не дублирует "Первый пост подошёл/не подошёл" —
+    используется когда /funnel уже показал эти числа в "Шаги воронки".
+    Причины "не подошёл" показываются в любом случае, если есть.
     """
     if payment_path is None:
         return ""
@@ -515,15 +543,17 @@ def _format_new_product_signals(payment_path: dict | None) -> str:
 
     # First post feedback
     if has_feedback:
-        if fb_good is not None:
-            lines.append(f"— Первый пост подошёл: {_n(fb_good)}")
-        if fb_bad is not None:
-            lines.append(f"— Первый пост не подошёл: {_n(fb_bad)}")
+        if not skip_feedback_summary:
+            if fb_good is not None:
+                lines.append(f"— Первый пост подошёл: {_n(fb_good)}")
+            if fb_bad is not None:
+                lines.append(f"— Первый пост не подошёл: {_n(fb_bad)}")
 
         # Причины — только если есть отрицательные отзывы
         if fb_bad and _n(fb_bad) > 0 and fb_reasons and isinstance(fb_reasons, dict):
             # Человекочитаемые названия причин
             reason_labels = {
+
                 "too_generic":      "Слишком общий",
                 "wrong_style":      "Не тот стиль",
                 "wrong_topic":      "Не про тему",
@@ -600,9 +630,29 @@ def build_funnel_report(
     lines.append("\nШаги воронки:")
     if clicks:
         lines.append(f"— {clicks} человек пришли из рекламы")
-    lines.append(f"— {signup} зарегистрировались ({_pct(signup, clicks)} из кликов)")
+    if clicks:
+        lines.append(f"— {signup} зарегистрировались ({_pct(signup, clicks)} из кликов)")
+    else:
+        lines.append(f"— {signup} зарегистрировались")
     lines.append(f"— {activation_1} создали канал ({_pct(activation_1, signup)} из регистраций)")
-    lines.append(f"— {activation_2} раз сгенерировали пост")
+
+    # Первый пост: показываем feedback (good+bad), если он есть, как осознанный сигнал.
+    # Raw post_generations НЕ используется здесь — это техническая метрика,
+    # смешивающая ручные действия пользователя и автогенерацию системой.
+    fb_good = _n(payment_path.get("first_post_feedback_good")) if payment_path else 0
+    fb_bad = _n(payment_path.get("first_post_feedback_bad")) if payment_path else 0
+    has_feedback_data = bool(payment_path) and (
+        payment_path.get("first_post_feedback_good") is not None
+        or payment_path.get("first_post_feedback_bad") is not None
+    )
+    if has_feedback_data and (fb_good + fb_bad) > 0:
+        total_fb = fb_good + fb_bad
+        times_word = _plural(total_fb, "раз", "раза", "раз")
+        lines.append(f"— первый пост получили и оценили: {total_fb} {times_word} "
+                     f"({fb_good} понравился, {fb_bad} не понравился)")
+    else:
+        lines.append("— Данные по первому посту собираются через отзыв пользователя после деплоя.")
+
     if pricing_viewed is not None:
         pv_word = _plural(pricing_viewed, "раз открыли тарифы", "раза открыли тарифы", "раз открыли тарифы")
         lines.append(f"— {pricing_viewed} {pv_word}")
@@ -622,13 +672,13 @@ def build_funnel_report(
         )
     elif pricing_viewed is None and pp_started == 0:
         lines.append(
-            f"Ранняя активация хорошая: люди регистрируются, создают каналы и генерируют посты. "
+            f"Ранняя активация хорошая: люди регистрируются и создают каналы. "
             "Переход к тарифам пока нельзя оценить: просмотр тарифов не отслеживается."
         )
     elif pricing_viewed is not None and pricing_viewed < MIN_PRICING_FOR_CONCLUSION:
         lines.append(
             f"Ранняя активация сильная ({_pct(activation_1, signup)} создали канал). "
-            "Главный провал — между генерацией поста и открытием тарифов. "
+            "Главный провал — между созданием канала и открытием тарифов. "
             "Непонятно, когда и где пользователь видит предложение оплатить."
         )
     elif pricing_viewed is not None and pricing_viewed >= MIN_PRICING_FOR_CONCLUSION and pp_started == 0:
@@ -648,7 +698,7 @@ def build_funnel_report(
         )
     else:
         lines.append(
-            "Ранняя воронка работает: люди регистрируются, создают каналы и генерируют посты. "
+            "Ранняя воронка работает: люди регистрируются и создают каналы. "
             "Главный вопрос — доходят ли они до тарифов и оплаты."
         )
 
@@ -658,7 +708,6 @@ def build_funnel_report(
         pairs = [
             (signup, _n(prev_metrics.signup), "регистраций"),
             (activation_1, _n(prev_metrics.activation_1), "каналов"),
-            (activation_2, _n(prev_metrics.activation_2), "генераций"),
             (pp_success, _n(prev_metrics.payment_success), "оплат"),
         ]
         for cur, prv, label in pairs:
@@ -671,10 +720,16 @@ def build_funnel_report(
         else:
             lines.append("\nДинамика: без изменений.")
 
-    # ── Новые сигналы (onboarding choice + first post feedback) ─────────
-    new_signals_block = _format_new_product_signals(payment_path)
+    # ── Новые сигналы (onboarding choice + причины + breakdown) ─────────
+    # skip_feedback_summary=True: первый пост good/bad уже показан выше
+    # в "Шаги воронки" — не дублируем.
+    new_signals_block = _format_new_product_signals(payment_path, skip_feedback_summary=True)
     if new_signals_block:
         lines.append(new_signals_block)
+
+    # Технический raw post_generations НЕ показывается в owner-facing /funnel.
+    # Метрика смешивает ручные действия и автогенерацию системой и не помогает
+    # принять бизнес-решение. Доступна только в /debug.
 
     lines.append("\n← /run  /ads →  /pay →")
     return "\n".join(lines)
@@ -871,39 +926,51 @@ def build_today_report(
     *,
     payment_path: dict | None = None,
     direct_intelligence: "DirectIntelligenceResult | None" = None,
+    new_registrations_since_deploy: int | None = None,
+    new_registrations_target: int = 30,
+    feedback_target: int = 10,
 ) -> str:
     """
-    Управленческий отчёт: что сейчас проверяем, на что смотрим,
-    какое решение будет принято, что не трогаем.
+    /today — рабочая доска текущей проверки. Не просто отчёт, а ответ на
+    вопрос "что сейчас происходит и что делать дальше".
 
-    Логика адаптируется под текущую стадию воронки:
-    — если нет оплат и мало просмотров тарифов → режим проверки пути к тарифам
-    — если есть просмотры тарифов, но нет оплат → режим проверки тарифного экрана
-    — если есть оплаты → режим масштабирования
+    Использует только осознанные пользовательские действия:
+    регистрации, созданные каналы, feedback первого поста, открытия тарифов,
+    старты и успехи оплаты. НЕ использует raw post_generations как
+    доказательство вовлечённости.
+
+    new_registrations_since_deploy: если переданo явно — используется для
+    прогресс-бара "новые регистрации после деплоя". Если None, считаем что
+    эта метрика недоступна и честно об этом пишем.
     """
     lines: list[str] = []
-    lines.append(f"📋 Сегодня — {project_name}")
+    lines.append(f"Сегодня — {project_name}")
     lines.append(f"Данные: {_fmt_dt_msk(_now_msk())}")
 
     signup = _n(metrics.signup) if metrics else 0
     activation_1 = _n(metrics.activation_1) if metrics else 0
-    activation_2 = _n(metrics.activation_2) if metrics else 0
     pp_started = _n(payment_path.get("payment_started")) if payment_path else 0
     pp_success = _n(payment_path.get("payment_success")) if payment_path else 0
     pricing_viewed_raw = payment_path.get("pricing_viewed") if payment_path else None
     pricing_viewed = _n(pricing_viewed_raw) if pricing_viewed_raw is not None else 0
     pricing_tracked = pricing_viewed_raw is not None
 
-    # Новые сигналы из onboarding/feedback
+    # Новые сигналы из onboarding/feedback — единственный источник правды
+    # о вовлечённости. Raw post_generations (activation_2) НЕ используется
+    # здесь и нигде в /today.
     choice_counts = payment_path.get("onboarding_choice_counts") if payment_path else None
-    fb_good = _n(payment_path.get("first_post_feedback_good")) if payment_path else 0
-    fb_bad = _n(payment_path.get("first_post_feedback_bad")) if payment_path else 0
-    has_new_signals = bool(choice_counts) or fb_good > 0 or fb_bad > 0
+    fb_good_raw = payment_path.get("first_post_feedback_good") if payment_path else None
+    fb_bad_raw = payment_path.get("first_post_feedback_bad") if payment_path else None
+    fb_good = _n(fb_good_raw)
+    fb_bad = _n(fb_bad_raw)
+    has_feedback_data = fb_good_raw is not None or fb_bad_raw is not None
+    total_feedback = fb_good + fb_bad
+    has_new_signals = bool(choice_counts) or has_feedback_data
 
     MIN_PRICING = 5
     MIN_SIGNUP_FOR_CONCLUSIONS = 10
 
-    # ── Определяем стадию ────────────────────────────────────────────────
+    # ── Определяем стадию (для следующего решения/кандидата) ─────────────
     if pp_success > 0:
         stage = "scale"
     elif pp_started > 0:
@@ -917,99 +984,65 @@ def build_today_report(
     else:
         stage = "traffic"
 
-    # ── Что сегодня проверяем ────────────────────────────────────────────
-    lines.append("\n🔎 Что сейчас проверяем:")
+    # ── Главная проверка ─────────────────────────────────────────────────
+    lines.append("\nГлавная проверка:")
     if stage == "path_to_tariffs":
-        lines.append(
-            "Почему пользователи создают канал и генерируют посты, "
-            "но почти не открывают тарифы."
-        )
+        lines.append("Почему пользователи создают канал, но почти не открывают тарифы?")
     elif stage == "tariff_screen":
-        lines.append(
-            "Почему пользователи открывают тарифы, но не начинают оплату. "
-            "Проверяем тарифный экран: ценность, цена, момент предложения."
-        )
+        lines.append("Почему пользователи открывают тарифы, но не начинают оплату?")
     elif stage == "payment_flow":
-        lines.append(
-            "Есть попытки оплаты без успеха. "
-            "Проверяем платёжный шлюз: YooKassa логи, причины отказов."
-        )
+        lines.append("Почему попытки оплаты не доходят до успеха?")
     elif stage == "scale":
-        lines.append("Есть оплаты. Смотрим на экономику: окупаемость и масштаб.")
+        lines.append("Какая экономика привлечения и можно ли масштабировать рекламу?")
     elif stage == "activation":
+        lines.append("Почему пользователи регистрируются, но не создают канал?")
+    else:
+        lines.append("Достаточно ли качественный трафик приходит из рекламы?")
+
+    # ── Прогресс проверки (текстовые шкалы) ──────────────────────────────
+    lines.append("\nПрогресс проверки:")
+    has_progress_data = False
+
+    if new_registrations_since_deploy is not None:
+        has_progress_data = True
+        bar = progress_bar(new_registrations_since_deploy, new_registrations_target)
         lines.append(
-            "Пользователи регистрируются, но не создают канал. "
-            "Проверяем что происходит сразу после регистрации."
+            f"Новые регистрации после деплоя: "
+            f"{new_registrations_since_deploy} / {new_registrations_target}"
         )
-    else:
-        lines.append("Смотрим на качество трафика и первые регистрации.")
+        lines.append(bar)
 
-    # ── Цель на неделю ────────────────────────────────────────────────────
-    lines.append("\n🎯 Цель на неделю:")
-    if stage in ("path_to_tariffs", "activation"):
-        lines.append(
-            "Собрать данные после нового онбординга и фидбека первого поста. "
-            "Понять, какой выбор в онбординге делают пользователи "
-            "и помогает ли первый пост."
-        )
-    elif stage == "tariff_screen":
-        lines.append(
-            "Понять, почему пользователи видят тарифы, но не платят. "
-            "Проверить тарифный экран и момент предложения оплаты."
-        )
-    elif stage == "payment_flow":
-        lines.append("Найти и устранить причину неуспешных оплат.")
-    else:
-        lines.append("Получить первые стабильные оплаты и оценить экономику.")
+    if has_feedback_data:
+        has_progress_data = True
+        bar = progress_bar(total_feedback, feedback_target)
+        lines.append(f"\nОтзывы о первом посте: {total_feedback} / {feedback_target}")
+        lines.append(bar)
 
-    # ── На что смотрим ────────────────────────────────────────────────────
-    lines.append("\n📊 На что смотрим:")
-    if has_new_signals or stage in ("path_to_tariffs", "activation"):
-        lines.append("— выбор «сгенерировать первый пост» в онбординге")
-        lines.append("— выбор «проанализировать канал»")
-        lines.append("— пропуск онбординга")
-        lines.append("— первый пост подошёл / не подошёл")
-        lines.append("— причины «не подошёл»")
-    if pricing_tracked:
-        lines.append(f"— открытия тарифов (сейчас: {pricing_viewed})")
-    else:
-        lines.append("— открытия тарифов (событие не настроено — данных нет)")
-    lines.append(f"— начало оплаты (сейчас: {pp_started})")
+    if not has_progress_data:
+        lines.append("Новые данные после деплоя ещё не накопились.")
 
-    # Текущий прогресс
-    lines.append("\n📈 Прогресс:")
-    if has_new_signals:
-        total_feedback = fb_good + fb_bad
-        if total_feedback > 0:
-            good_pct = int(fb_good / total_feedback * 100)
-            lines.append(f"— отзывов о первом посте: {total_feedback} ({good_pct}% положительных)")
-        if choice_counts and isinstance(choice_counts, dict):
-            gen = _n(choice_counts.get("generate_post") or choice_counts.get("first_post", 0))
-            skip = _n(choice_counts.get("skip") or choice_counts.get("skipped", 0))
-            if gen or skip:
-                lines.append(f"— выбирают генерацию поста: {gen}, пропускают: {skip}")
-    else:
-        lines.append("— новые сигналы после деплоя ещё не накопились")
-
-    if signup >= MIN_SIGNUP_FOR_CONCLUSIONS:
-        lines.append(f"— данных достаточно для предварительных выводов ({signup} регистраций)")
-    else:
-        lines.append(f"— данных пока мало ({signup} регистраций из ~{MIN_SIGNUP_FOR_CONCLUSIONS} нужных для выводов)")
+    # ── Что смотрим ───────────────────────────────────────────────────────
+    lines.append("\nЧто смотрим:")
+    lines.append("— выбор сценария онбординга")
+    lines.append("— оценка первого поста")
+    lines.append("— причины «не подходит»")
+    lines.append("— открытия тарифов")
+    lines.append("— старты оплаты")
 
     # ── Следующее решение ─────────────────────────────────────────────────
-    lines.append("\n⚡ Следующее решение:")
+    lines.append("\nСледующее решение:")
     if stage == "path_to_tariffs":
-        if has_new_signals and fb_good > fb_bad:
+        if has_feedback_data and fb_good > fb_bad:
             lines.append(
-                "Если первый пост подходит, но тарифы не открывают — "
-                "следующий эксперимент: «очередь постов на неделю»."
+                "Если первый пост нравится, но тарифы не открывают — "
+                "следующий кандидат: очередь постов на неделю."
             )
         else:
             lines.append(
-                "Дождаться данных по онбордингу и фидбеку первого поста. "
-                "Если пост не подходит — эксперимент с промптом/тематикой. "
-                "Если подходит, но тарифы не открывают — "
-                "эксперимент «очередь постов на неделю»."
+                "Дождаться отзывов о первом посте. Если пост не нравится — "
+                "эксперимент с промптом или тематикой. "
+                "Если нравится, но тарифы не открывают — "
+                "следующий кандидат: очередь постов на неделю."
             )
     elif stage == "tariff_screen":
         lines.append(
@@ -1017,38 +1050,137 @@ def build_today_report(
             "Если ценность неочевидна — эксперимент с подачей тарифов."
         )
     elif stage == "payment_flow":
-        lines.append("Проверить YooKassa логи и починить платёжный шлюз.")
+        lines.append("Проверить YooKassa логи и устранить причину неуспешных оплат.")
     elif stage == "scale":
-        lines.append("Оценить CPA и принять решение о масштабировании бюджета.")
+        lines.append("Оценить стоимость привлечения и принять решение о масштабировании бюджета.")
     else:
         lines.append("Ждать накопления данных по текущей стадии.")
 
-    # ── Что не трогаем ────────────────────────────────────────────────────
-    lines.append("\n🚫 Что сейчас не трогаем:")
-    lines.append("— бюджет и ставки рекламы")
-    lines.append("— лендинг")
-    lines.append("— цены и тарифы")
-    lines.append("— дизайн и картинки")
-    lines.append("— бесплатная квота")
-    lines.append("— генератор постов")
+    # ── Сегодня делать ───────────────────────────────────────────────────
+    lines.append("\nСегодня делать:")
+    lines.append("— смотреть новых пользователей")
+    lines.append("— проверять, что Telegram Ads размечается отдельно")
+    lines.append("— ждать данные текущей проверки")
 
-    # ── Главный кандидат ─────────────────────────────────────────────────
-    lines.append("\n💡 Главный кандидат на следующий шаг:")
-    if stage in ("path_to_tariffs", "activation"):
+    # ── Что не трогать ───────────────────────────────────────────────────
+    lines.append("\nЧто не трогать:")
+    for item in ["бюджет", "ставки", "лендинг", "цены", "тарифы", "дизайн", "картинки", "free quota"]:
+        lines.append(f"— {item}")
+
+    lines.append("\nПодробности: /run  /funnel  /pay  /ads")
+    lines.append("Подробности проверки: /experiments")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /experiments — текущие проверки/гипотезы
+# ---------------------------------------------------------------------------
+
+def build_experiments_report(
+    project_name: str,
+    *,
+    new_registrations_since_deploy: int | None = None,
+    new_registrations_target: int = 30,
+    payment_path: dict | None = None,
+    feedback_target: int = 10,
+) -> str:
+    """
+    Owner-facing список активных проверок/гипотез.
+    Owner-facing название — "Проверки", без сложной методологии (нет слов
+    "эксперимент", "гипотеза" как заголовков — только внутри текста где уместно).
+    """
+    lines: list[str] = []
+    lines.append(f"Проверки — {project_name}")
+    lines.append(f"Данные: {_fmt_dt_msk(_now_msk())}")
+
+    fb_good_raw = payment_path.get("first_post_feedback_good") if payment_path else None
+    fb_bad_raw = payment_path.get("first_post_feedback_bad") if payment_path else None
+    fb_good = _n(fb_good_raw)
+    fb_bad = _n(fb_bad_raw)
+    has_feedback_data = fb_good_raw is not None or fb_bad_raw is not None
+    total_feedback = fb_good + fb_bad
+
+    # ── Текущая активная проверка ────────────────────────────────────────
+    lines.append("\nТекущая активная проверка:")
+    lines.append("\nНазвание: Путь после первого поста")
+    lines.append(
+        "\nГлавный вопрос: "
+        "Почему пользователи создают канал, но почти не открывают тарифы?"
+    )
+    lines.append(
+        "\nГипотеза: "
+        "Люди получают первый результат, но не понимают следующий платный шаг."
+    )
+
+    lines.append("\nЧто собираем:")
+    lines.append("— новые регистрации после деплоя")
+    lines.append("— выбор сценария онбординга")
+    lines.append("— feedback первого поста")
+    lines.append("— причины «не подходит»")
+    lines.append("— открытия тарифов")
+    lines.append("— старты оплаты")
+
+    # ── Прогресс ──────────────────────────────────────────────────────────
+    lines.append("\nПрогресс:")
+    has_progress_data = False
+    if new_registrations_since_deploy is not None:
+        has_progress_data = True
         lines.append(
-            "«Очередь постов на неделю» — показать пользователю, "
-            "что продукт делает за него работу на неделю вперёд, "
-            "и только тогда предложить тариф.\n"
-            "Статус: кандидат, не задача в работу."
+            f"Новые регистрации после деплоя: "
+            f"{new_registrations_since_deploy} / {new_registrations_target}"
         )
-    elif stage == "tariff_screen":
-        lines.append(
-            "Улучшение тарифного экрана — добавить конкретные примеры ценности "
-            "до показа цены.\n"
-            "Статус: кандидат, не задача в работу."
-        )
+        lines.append(progress_bar(new_registrations_since_deploy, new_registrations_target))
+    if has_feedback_data:
+        has_progress_data = True
+        lines.append(f"\nОтзывы о первом посте: {total_feedback} / {feedback_target}")
+        lines.append(progress_bar(total_feedback, feedback_target))
+    if not has_progress_data:
+        lines.append("Новые данные после деплоя ещё не накопились.")
+
+    # ── Следующее решение ─────────────────────────────────────────────────
+    lines.append(
+        "\nСледующее решение: "
+        "Если первый пост нравится, но тарифы не открывают — "
+        "тестируем «очередь постов на неделю»."
+    )
+
+    # ── Статус ────────────────────────────────────────────────────────────
+    lines.append("\nСтатус:")
+    reg_count = new_registrations_since_deploy or 0
+    if not has_progress_data:
+        status = "идёт сбор данных"
+    elif reg_count < new_registrations_target * 0.3 and total_feedback < feedback_target * 0.3:
+        status = "идёт сбор данных"
+    elif reg_count < new_registrations_target or total_feedback < feedback_target:
+        status = "данных недостаточно"
     else:
-        lines.append("Кандидат определится после накопления данных.")
+        status = "можно принимать решение"
+    lines.append(status)
 
-    lines.append("\nПодробности: /funnel  /pay  /ads")
+    # ── Следующие кандидаты ──────────────────────────────────────────────
+    lines.append("\nСледующие кандидаты:")
+    lines.append(
+        "\n1. Очередь постов на неделю — главный кандидат.\n"
+        "Причина: платная ценность должна быть не в одном посте, "
+        "а в регулярном ведении канала."
+    )
+    lines.append(
+        "\n2. Анализ существующего канала — наблюдаем.\n"
+        "Причина: если много пользователей выбирают анализ канала, "
+        "это может стать отдельным сценарием."
+    )
+
+    # ── Отложено ──────────────────────────────────────────────────────────
+    lines.append("\nОтложено:")
+    deferred = [
+        ("картинки в постах", "не главный блокер пути к тарифам"),
+        ("зумерский дизайн", "не главный блокер пути к тарифам"),
+        ("новая группа «Контент-завод»", "сначала нужно подтвердить текущую гипотезу"),
+        ("увеличение бюджета", "монетизация ещё не доказана"),
+        ("изменение лендинга", "узкое место сейчас не в трафике"),
+    ]
+    for item, reason in deferred:
+        lines.append(f"— {item} ({reason})")
+
+    lines.append("\nПодробности: /today  /funnel  /pay")
     return "\n".join(lines)

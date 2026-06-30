@@ -390,3 +390,41 @@ class AlertRepeatTracker(SQLModel, table=True):
     shown_at: datetime = Field(default_factory=utcnow)
     key_metric_value: Optional[float] = None  # значение ключевой метрики находки на момент показа
     payload_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+class NotificationLog(SQLModel, table=True):
+    """
+    Журнал отправленных live-уведомлений о пути пользователя.
+
+    Нужна дедупликация: один и тот же шаг пути (регистрация, создание
+    канала, feedback, открытие тарифов, начало оплаты) не должен
+    уведомляться дважды, даже если /run обнаруживает прирост метрики
+    несколько раз подряд (например, до накопления следующего изменения).
+
+    event_key -- стабильный детерминированный ключ, НЕ инкрементальный id.
+    Примеры (см. задачу):
+      user_registered:<user_id>
+      channel_created:<user_id>:<channel_id>
+      first_post_feedback:<event_id>
+      pricing_viewed:<event_id>
+      payment_started:<payment_id>
+      payment_success:<payment_id>
+
+    Поскольку TruePost сейчас отдаёт только агрегаты (payment-path-diagnostics),
+    а не individual ProductEvent id, event_key в v0 строится из агрегатных
+    счётчиков на момент обнаружения прироста -- см. notifications.py
+    build_event_key_from_delta(). Это временное решение до появления
+    per-event API на стороне TruePost.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+
+    event_key: str = Field(index=True)
+    event_type: str  # "user_registered" | "channel_created" | "onboarding_choice" |
+                      # "first_post_feedback" | "pricing_viewed" | "payment_started" |
+                      # "payment_success" | "payment_failed"
+    user_id: Optional[str] = None  # nullable -- не всегда доступен из агрегатов
+
+    sent_at: datetime = Field(default_factory=utcnow)
+    payload_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
