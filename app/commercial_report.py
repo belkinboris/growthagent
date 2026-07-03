@@ -1293,8 +1293,12 @@ def build_board_report(
 
     reg_count = new_registrations_since_deploy if new_registrations_since_deploy is not None else signup
 
+    # Решение считаем по тем же регистрациям, что показываем в блоке НЕДЕЛЯ
+    # (reg_count), а не по сырому metrics.signup -- иначе при metrics=None
+    # (утренняя сводка берёт регистрации из payment_path) доска показывала бы
+    # "18/20", а решение говорило бы "набрать 10 регистраций".
     decision, missing = _determine_board_decision(
-        signup, activation_1, pricing_tracked, pricing_viewed,
+        reg_count, activation_1, pricing_tracked, pricing_viewed,
         pp_started, pp_success, has_feedback_data, fb_good, fb_bad,
     )
 
@@ -1499,4 +1503,199 @@ def build_journeys_report(project_name: str, journeys: list[dict] | None, limit:
         lines.append(f"  → {action}")
 
     lines.append("\nДоска: /board")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Ежедневная утренняя сводка: /board + ДИНАМИКА по дням (спарклайны)
+# ---------------------------------------------------------------------------
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[int | float | None]) -> str:
+    """
+    Текстовый мини-график для Telegram. None -> пробел (день без данных).
+    Все значения равны -> средний символ (линия без наклона), не пустота.
+    """
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return ""
+    lo, hi = min(nums), max(nums)
+    chars = []
+    for v in values:
+        if v is None:
+            chars.append(" ")
+        elif hi == lo:
+            chars.append(_SPARK_CHARS[3])
+        else:
+            idx = int((v - lo) / (hi - lo) * (len(_SPARK_CHARS) - 1))
+            chars.append(_SPARK_CHARS[idx])
+    return "".join(chars)
+
+
+# Метрики динамики: (ключ в daily_counters, подпись). Подписи выровнены
+# по ширине как в блоке НЕДЕЛЯ на доске -- цифры не смешиваются.
+_DYNAMICS_METRICS = [
+    ("registrations", "Регистрации"),
+    ("feedback_total", "Отзывы     "),
+    ("pricing_viewed", "Тарифы     "),
+    ("payment_success", "Оплаты     "),
+]
+
+
+def build_dynamics_block(history: list[dict]) -> str:
+    """
+    Блок ДИНАМИКА для утренней сводки. history -- список дневных снимков
+    (от старых к новым), каждый: {"date": "MM-DD", "registrations": int|None,
+    "feedback_total": ..., "pricing_viewed": ..., "payment_success": ...}.
+
+    Значения -- НЕДЕЛЬНОЕ ОКНО на момент дня (payment_path_7d), не «за день»:
+    так видно, растёт неделя или падает, без пересчёта дневных дельт.
+
+    Меньше 2 точек -- честно говорим, что динамика копится, не рисуем
+    график из одной точки.
+    """
+    lines = ["ДИНАМИКА (неделя, по дням)"]
+    if len(history) < 2:
+        lines.append("Появится после 2 дней наблюдений.")
+        return "\n".join(lines)
+
+    for key, label in _DYNAMICS_METRICS:
+        values = [h.get(key) for h in history]
+        nums = [v for v in values if v is not None]
+        if not nums:
+            continue
+        first, last = nums[0], nums[-1]
+        delta = last - first
+        arrow = "↗" if delta > 0 else ("↘" if delta < 0 else "→")
+        lines.append(f"{label} {sparkline(values)}  {first}→{last} {arrow}")
+
+    if len(lines) == 1:
+        lines.append("Появится после 2 дней наблюдений.")
+    return "\n".join(lines)
+
+
+def build_daily_board_message(board_text: str, history: list[dict]) -> str:
+    """
+    Полный текст ежедневного утреннего push: доска + динамика.
+    Отправляется раз в день независимо от наличия изменений -- владелец
+    видит, что система работает и сколько данных осталось до решения.
+    """
+    parts = ["Ежедневная сводка", "", board_text, "", build_dynamics_block(history)]
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Growth Loop на доске: рекомендация (сост. 2), эксперимент (3), вердикт (4)
+# ---------------------------------------------------------------------------
+
+def build_recommendation_block(rec) -> str:
+    """
+    Состояние 2: ПРЕДЛАГАЮ ЭКСПЕРИМЕНТ. Коротко: действие, почему, эксперимент,
+    не менять. Детали (полный change set) -- по кнопке «Данные».
+    """
+    lines = [
+        "РЕШЕНИЕ",
+        "ПРЕДЛАГАЮ ЭКСПЕРИМЕНТ",
+        "",
+        rec.title,
+        "",
+        "Действие:",
+        rec.action,
+        "",
+        "Почему:",
+    ]
+    for ev in (rec.evidence_json or [])[:4]:
+        lines.append(f"— {ev}")
+    if rec.expected_effect:
+        lines.append("")
+        lines.append(f"Ожидаем: {rec.expected_effect}")
+    lines.append("")
+    lines.append(f"Эксперимент: {rec.target_sample} новых ({_metric_ru(rec.sample_metric)}) или {rec.max_runtime_days} дней")
+    locked = rec.locked_variables_json or []
+    if locked:
+        lines.append(f"Не менять: {', '.join(locked[:5])}")
+    return "\n".join(lines)
+
+
+_METRIC_RU = {
+    "registrations": "регистраций",
+    "pricing_viewed": "открытий тарифов",
+    "payment_started": "стартов оплаты",
+    "payment_success": "оплат",
+    "channels_created": "созданных каналов",
+    "first_post_feedback_good": "хороших отзывов",
+}
+
+
+def _metric_ru(metric: str) -> str:
+    return _METRIC_RU.get(metric, metric)
+
+
+def _fmt_rate(rate) -> str:
+    return f"{rate:.0%}" if rate is not None else "—"
+
+
+def build_experiment_block(exp, progress: dict) -> str:
+    """Состояние 3: ЭКСПЕРИМЕНТ ИДЁТ. Прогресс + текущий результат + не менять."""
+    lines = [
+        "ЭКСПЕРИМЕНТ ИДЁТ",
+        "",
+        exp.title,
+        "",
+        f"Прогресс: {progress['current_sample']} / {exp.target_sample} ({_metric_ru(exp.sample_metric)})   "
+        f"{progress_bar(progress['current_sample'], exp.target_sample)}",
+    ]
+    base_rate = progress.get("baseline_rate")
+    cur_rate = progress.get("current_rate")
+    if base_rate is not None or cur_rate is not None:
+        lines.append(
+            f"Результат сейчас: {_metric_ru(exp.primary_metric)} {_fmt_rate(base_rate)} → {_fmt_rate(cur_rate)}"
+        )
+    locked = exp.locked_variables_json or []
+    if locked:
+        lines.append("")
+        lines.append(f"Не менять: {', '.join(locked[:5])}")
+    return "\n".join(lines)
+
+
+def build_verdict_block(exp) -> str:
+    """Состояние 4: ВЕРДИКТ завершённого эксперимента."""
+    lines = [
+        "ВЕРДИКТ",
+        exp.verdict or "—",
+        "",
+        exp.title,
+    ]
+    if exp.result_summary:
+        lines.append("")
+        lines.append(exp.result_summary)
+    return "\n".join(lines)
+
+
+def build_recommendation_details(rec) -> str:
+    """Кнопка «Данные»: полный change set, критерии, риск, гипотеза."""
+    lines = [f"Данные рекомендации — {rec.title}", ""]
+    if rec.hypothesis:
+        lines += ["Гипотеза:", rec.hypothesis, ""]
+    lines.append("Change set:")
+    for item in (rec.change_set_json or []):
+        lines.append(f"— {item}")
+    lines.append("")
+    lines.append(f"Измеряем: {rec.measure or rec.primary_metric}")
+    lines.append(f"Успех: {rec.success_criterion or '—'}")
+    lines.append(f"Провал: {rec.failure_criterion or '—'}")
+    lines.append(f"Риск: {rec.risk or '—'}")
+    lines.append(f"Достоверность: {rec.confidence}")
+    return "\n".join(lines)
+
+
+def build_recommendation_why(rec) -> str:
+    """Кнопка «Почему»: доказательства целиком."""
+    lines = [f"Почему — {rec.title}", ""]
+    for ev in (rec.evidence_json or []):
+        lines.append(f"— {ev}")
+    if not (rec.evidence_json or []):
+        lines.append("Доказательства не заполнены.")
     return "\n".join(lines)

@@ -1312,6 +1312,135 @@ def build_negative_keywords_keyboard(alert_id: int, deep_diagnostics: dict) -> I
     return InlineKeyboardMarkup(rows)
 
 
+def _growth_loop_board_state(payment_path: dict | None):
+    """
+    Возвращает (текстовый блок Growth Loop или None, InlineKeyboardMarkup или None)
+    для доски. Приоритет: идущий эксперимент > предложенная рекомендация >
+    свежий вердикт (3 дня) > ничего (обычная доска, состояние 1).
+    """
+    from app import growth_loop
+    from app.commercial_report import (
+        build_experiment_block,
+        build_recommendation_block,
+        build_verdict_block,
+    )
+
+    try:
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                return None, None
+
+            running = growth_loop.get_running_experiment(session, project.id)
+            if running is not None:
+                progress = growth_loop.experiment_progress(running, payment_path)
+                markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Отменить эксперимент", callback_data=f"gl_cancel:{running.id}"),
+                ]])
+                return build_experiment_block(running, progress), markup
+
+            rec = growth_loop.get_active_recommendation(session, project.id)
+            if rec is not None:
+                markup = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Принять", callback_data=f"gl_accept:{rec.id}"),
+                        InlineKeyboardButton("Отложить", callback_data=f"gl_defer:{rec.id}"),
+                        InlineKeyboardButton("Отклонить", callback_data=f"gl_reject:{rec.id}"),
+                    ],
+                    [
+                        InlineKeyboardButton("Почему", callback_data=f"gl_why:{rec.id}"),
+                        InlineKeyboardButton("Данные", callback_data=f"gl_data:{rec.id}"),
+                    ],
+                ])
+                return build_recommendation_block(rec), markup
+
+            last = growth_loop.get_last_finished_experiment(session, project.id)
+            if last is not None and last.ended_at is not None:
+                ended = last.ended_at
+                if ended.tzinfo is not None:
+                    ended = ended.replace(tzinfo=None)
+                age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - ended).total_seconds() / 86400
+                if age_days <= 3:
+                    return build_verdict_block(last), None
+    except Exception:
+        logger.exception("growth loop board state failed (non-fatal)")
+    return None, None
+
+
+async def _handle_growth_loop_button(query, action: str, rec_or_exp_id: int) -> bool:
+    """
+    Обрабатывает gl_* кнопки Growth Loop. Возвращает True если действие
+    относилось к Growth Loop (обработано), False -- пусть обрабатывают
+    легаси-ветки on_button_press.
+    """
+    if not action.startswith("gl_"):
+        return False
+
+    from app import growth_loop
+    from app.commercial_report import (
+        build_recommendation_details,
+        build_recommendation_why,
+    )
+    from app.models import GrowthRecommendation, GrowthRecommendationStatus
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        if action == "gl_cancel":
+            from app.models import GrowthExperiment
+            exp = session.get(GrowthExperiment, rec_or_exp_id)
+            if exp is None:
+                await query.edit_message_text("Эксперимент не найден.")
+                return True
+            growth_loop.cancel_experiment(session, exp, reason="отменён владельцем с доски")
+            await query.edit_message_text(
+                f"{query.message.text}\n\n✕ Эксперимент отменён. Изменение можно откатить. Доска: /board"
+            )
+            return True
+
+        rec = session.get(GrowthRecommendation, rec_or_exp_id)
+        if rec is None:
+            await query.edit_message_text("Рекомендация не найдена (возможно, уже обработана).")
+            return True
+
+        if action in ("gl_why", "gl_data"):
+            # Не редактируем доску -- отвечаем отдельным сообщением.
+            text = build_recommendation_why(rec) if action == "gl_why" else build_recommendation_details(rec)
+            await query.message.reply_text(text)
+            return True
+
+        if rec.status != GrowthRecommendationStatus.proposed:
+            await query.edit_message_text("Эта рекомендация уже обработана. Доска: /board")
+            return True
+
+        if action == "gl_accept":
+            pp_cached = get_cached_diagnostics(session, rec.project_id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else {}
+            exp = growth_loop.accept_recommendation(session, rec, pp_dict)
+            await query.edit_message_text(
+                f"{query.message.text}\n\n"
+                f"✓ Принято. Эксперимент «{exp.title}» запущен.\n"
+                f"Цель: {exp.target_sample} новых, максимум {exp.max_runtime_days} дней.\n"
+                f"Baseline зафиксирован. Прогресс: /board"
+            )
+            return True
+
+        if action == "gl_defer":
+            growth_loop.defer_recommendation(session, rec, days=7)
+            await query.edit_message_text(
+                f"{query.message.text}\n\n⏸ Отложено на 7 дней. Вернусь к этому решению сам."
+            )
+            return True
+
+        if action == "gl_reject":
+            growth_loop.reject_recommendation(session, rec, reason="отклонено владельцем с доски")
+            await query.edit_message_text(
+                f"{query.message.text}\n\n✕ Отклонено. Это же предложение на тех же данных больше не покажу."
+            )
+            return True
+
+    return True
+
+
 async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1321,6 +1450,15 @@ async def on_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         alert_id = int(alert_id_str)
     except (ValueError, AttributeError):
         await query.edit_message_text("Не удалось обработать кнопку.")
+        return
+
+    # Growth Loop кнопки (gl_accept/gl_defer/gl_reject/gl_why/gl_data/gl_cancel)
+    if action.startswith("gl_"):
+        try:
+            await _handle_growth_loop_button(query, action, alert_id)
+        except Exception:
+            logger.exception("growth loop button failed")
+            await query.message.reply_text("Не удалось обработать действие. Доска: /board")
         return
 
     with get_session() as session:
@@ -1548,6 +1686,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "— /pay\n"
         "— /ads\n"
         "— /alerts\n"
+        "— /daily — утренняя сводка сейчас\n"
         "— /status\n\n"
         "Aliases:\n"
         "— /today = /board\n"
@@ -1567,6 +1706,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "— /check_landing\n"
         "— /check_onboarding",
     )
+
+
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Отправляет утреннюю сводку (доска + ДИНАМИКА) прямо сейчас, не дожидаясь
+    планового часа. force=True: ручной запрос владельца всегда отвечает,
+    но точку динамики за день не дублирует.
+    """
+    try:
+        from app.scheduler import send_daily_board
+
+        sent = await send_daily_board(force=True)
+        if not sent:
+            await safe_reply(
+                update,
+                "Сводка не отправлена: проверь, что daily_board_enabled=true, "
+                "заданы bot_token и bot_admin_chat_ids, и есть активный проект. "
+                "Детали: /status",
+            )
+    except Exception as exc:
+        logger.exception("/daily failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось отправить сводку. Технические детали: /status")
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2247,8 +2408,13 @@ async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             project_name = project.name
 
+        # Growth Loop: активная рекомендация / идущий эксперимент / свежий вердикт
+        gl_block, gl_markup = _growth_loop_board_state(pp_dict)
+
         text = build_board_report(project_name, metrics_obj, payment_path=pp_dict)
-        await safe_reply(update, text)
+        if gl_block:
+            text = gl_block + "\n\n————————————\n\n" + text
+        await safe_reply(update, text, reply_markup=gl_markup)
     except Exception as exc:
         logger.exception("/board failed: %s: %s", type(exc).__name__, exc)
         await safe_reply(update, "Не удалось сформировать доску. Технические детали: /status")
@@ -3304,6 +3470,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("board", cmd_board))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("run_full", cmd_run_full))
     app.add_handler(CommandHandler("journeys", cmd_journeys))

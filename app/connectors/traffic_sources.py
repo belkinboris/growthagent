@@ -89,11 +89,13 @@ def _normalize_source_label(source_key: str) -> str:
 
 
 def _is_empty_bucket(data: dict) -> bool:
-    """True если у источника все ключевые метрики нулевые/None."""
+    """True если у источника все ключевые метрики нулевые/None.
+    post_generations НЕ учитывается — это техническая метрика
+    (может включать автогенерацию системой), не пользовательская активность.
+    """
     metrics = [
         data.get("registrations"), data.get("channels_created"),
-        data.get("post_generations"), data.get("payment_started"),
-        data.get("payment_success"),
+        data.get("payment_started"), data.get("payment_success"),
     ]
     return all((m is None or m == 0) for m in metrics)
 
@@ -217,7 +219,6 @@ def format_source_breakdown(breakdown: dict[str, dict] | None, total_pp: dict | 
         data = aggregated[label]
         regs = data.get("registrations", 0) or 0
         channels = data.get("channels_created", 0) or 0
-        gens = data.get("post_generations", 0) or 0
         pricing = data.get("pricing_viewed")
         started = data.get("payment_started", 0) or 0
         success = data.get("payment_success", 0) or 0
@@ -225,7 +226,6 @@ def format_source_breakdown(breakdown: dict[str, dict] | None, total_pp: dict | 
         lines.append(f"\n{label}:")
         lines.append(f"— регистраций: {regs}")
         lines.append(f"— создали канал: {channels}")
-        lines.append(f"— генераций постов: {gens}")
         if pricing is not None:
             lines.append(f"— открытий тарифов: {pricing}")
         lines.append(f"— попыток оплаты: {started}")

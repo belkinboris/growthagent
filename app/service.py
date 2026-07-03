@@ -687,6 +687,7 @@ DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY = "direct_intelligence_24h"
 PAYMENT_PATH_CACHE_PERIOD_KEY = "payment_path_7d"
 USER_JOURNEYS_CACHE_PERIOD_KEY = "user_journeys_24h"
 ALERT_MODE_CACHE_KEY = "alert_mode_v1"
+DAILY_COUNTERS_KEY_PREFIX = "daily_counters:"  # + YYYY-MM-DD, для блока ДИНАМИКА
 
 # Режимы live-уведомлений (Founder Live Feed):
 #   "off"     -- не отправлять live-уведомления вообще
@@ -1187,3 +1188,72 @@ def extract_normalized_metrics_from_snapshot(snapshot: MetricSnapshot) -> dict:
         "spend": direct.get("spend"),
         "clicks": direct.get("clicks"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Дневные счётчики для блока ДИНАМИКА (утренняя сводка)
+# ---------------------------------------------------------------------------
+
+def save_daily_counters(
+    session: Session,
+    project_id: int,
+    payment_path: dict | None,
+    day: str,
+) -> None:
+    """
+    Сохраняет снимок ключевых счётчиков на день (значения недельного окна
+    payment_path_7d на этот момент). Идемпотентно на день: если запись за
+    этот day уже есть -- не пишем вторую (утренняя сводка вызывается раз в
+    день; повторный /daily не должен плодить точки).
+
+    Хранение через DeepDiagnosticsCache (period_key = "daily_counters:{day}"),
+    без миграции схемы -- та же практика что alert_mode_v1.
+    """
+    period_key = f"{DAILY_COUNTERS_KEY_PREFIX}{day}"
+    if get_cached_diagnostics(session, project_id, period_key) is not None:
+        return
+    pp = payment_path or {}
+    fb_good = pp.get("first_post_feedback_good")
+    fb_bad = pp.get("first_post_feedback_bad")
+    feedback_total = None
+    if fb_good is not None or fb_bad is not None:
+        feedback_total = int(fb_good or 0) + int(fb_bad or 0)
+    counters = {
+        "date": day[5:],  # MM-DD для компактной подписи
+        "registrations": pp.get("registrations"),
+        "feedback_total": feedback_total,
+        "pricing_viewed": pp.get("pricing_viewed"),
+        "payment_success": pp.get("payment_success"),
+    }
+    save_diagnostics_cache(
+        session, project_id, period_key,
+        "daily_board", counters, ok=True,
+        # Точки динамики должны жить дольше обычного кэша диагностик:
+        # 30 дней достаточно для месячного взгляда, потом чистятся TTL.
+        ttl_hours=24 * 30,
+    )
+
+
+def load_daily_counters_history(
+    session: Session,
+    project_id: int,
+    days: int = 7,
+    today: "date | None" = None,
+) -> list[dict]:
+    """
+    Последние `days` дневных снимков (от старых к новым) для блока ДИНАМИКА.
+    Дни без снимка пропускаются (None-точек не выдумываем -- sparkline сам
+    честно покажет разрыв, если передать None, но здесь проще их не включать,
+    чтобы first→last считались по реальным данным).
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    if today is None:
+        today = utcnow().date()
+    history: list[dict] = []
+    for offset in range(days - 1, -1, -1):
+        day = (today - _timedelta(days=offset)).isoformat()
+        cached = get_cached_diagnostics(session, project_id, f"{DAILY_COUNTERS_KEY_PREFIX}{day}")
+        if cached is not None and cached.ok and cached.result_json:
+            history.append(dict(cached.result_json))
+    return history

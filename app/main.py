@@ -97,6 +97,20 @@ async def on_startup() -> None:
         id="watch_cycle",
     )
 
+    # Ежедневная утренняя сводка владельцу (доска + динамика) -- push раз в
+    # день в фиксированный час, даже если изменений нет. Дедуп по дню внутри
+    # send_daily_board, так что рестарты процесса дубль не создают.
+    if settings.daily_board_enabled:
+        from app.scheduler import send_daily_board
+
+        scheduler.add_job(
+            send_daily_board,
+            "cron",
+            hour=settings.daily_board_hour_utc,
+            minute=5,
+            id="daily_board",
+        )
+
     logger.info("Growth Agent started. Build: %s. Watch interval: %s sec", BUILD_MARKER, settings.watch_interval_seconds)
 
 

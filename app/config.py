@@ -192,6 +192,12 @@ class Settings(BaseSettings):
     watch_interval_seconds: int = 10800  # 3 часа
     default_mode: str = "watch_only"
 
+    # --- Ежедневная утренняя сводка (/board + динамика, push владельцу) ---
+    # Отправляется раз в день даже если изменений нет -- владелец должен
+    # видеть, что система работает и сколько данных осталось до решения.
+    daily_board_enabled: bool = True
+    daily_board_hour_utc: int = 6  # 06:00 UTC = 09:00 МСК
+
     # --- Пороги для свежести данных интеграций ---
     integration_stale_minutes: int = 180  # если as_of старше -- алерт integration_down
 
@@ -258,4 +264,4 @@ STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-v2-clean-2026-06-29"
+BUILD_MARKER = "growth-agent-growth-loop-v1-2026-07-03"

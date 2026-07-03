@@ -226,6 +226,100 @@ class Recommendation(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+# ---------------------------------------------------------------------------
+# Growth Loop v1: рекомендация -> подтверждение владельца -> эксперимент -> вердикт
+# ---------------------------------------------------------------------------
+
+
+class GrowthRecommendationStatus(str, Enum):
+    proposed = "proposed"      # предложена владельцу, ждёт решения
+    accepted = "accepted"      # принята -> создан GrowthExperiment
+    deferred = "deferred"      # отложена до даты/объёма данных
+    rejected = "rejected"      # отклонена (с причиной), не предлагать без новых данных
+    superseded = "superseded"  # заменена новой рекомендацией (данные изменились)
+
+
+class GrowthExperimentStatus(str, Enum):
+    running = "running"
+    enough_data = "enough_data"   # порог достигнут, вердикт формируется
+    won = "won"
+    lost = "lost"
+    inconclusive = "inconclusive"
+    cancelled = "cancelled"
+
+
+class GrowthRecommendation(SQLModel, table=True):
+    """
+    ЕДИНАЯ главная рекомендация Growth Loop. В каждый момент у проекта
+    максимум одна со статусом proposed. Не путать с legacy Recommendation
+    (та зарезервирована под LLM-тексты и не имеет цикла жизни).
+
+    Новая таблица через create_all(), без ALTER TABLE существующих.
+    Универсальное ядро: контент (title/action/evidence/change_set) приходит
+    из project-specific playbook, сама модель проекта не знает.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    status: GrowthRecommendationStatus = GrowthRecommendationStatus.proposed
+    area: str  # ads / onboarding / first_post / commercial_bridge / pricing_screen / payment_path / tracking / scale
+    title: str
+    action: str                      # конкретное действие, простой русский
+    hypothesis: str = ""
+    evidence_json: list = Field(default_factory=list, sa_column=Column(JSON))   # строки-доказательства
+    confidence: str = "предварительный сигнал"  # честные слова, не проценты
+    expected_effect: str = ""
+    risk: str = ""
+    change_set_json: list = Field(default_factory=list, sa_column=Column(JSON))  # список конкретных изменений
+    measure: str = ""                # что измеряем после изменения
+    primary_metric: str = ""         # ключ метрики в payment_path (например pricing_viewed)
+    sample_metric: str = "registrations"  # по какой метрике считаем выборку эксперимента
+    target_sample: int = 14
+    min_runtime_days: int = 3
+    max_runtime_days: int = 14
+    success_criterion: str = ""
+    failure_criterion: str = ""
+    locked_variables_json: list = Field(default_factory=list, sa_column=Column(JSON))
+    fingerprint: str = Field(default="", index=True)  # area+данные: не предлагать отклонённое повторно без новых данных
+    defer_until: Optional[datetime] = None
+    reject_reason: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+    decided_at: Optional[datetime] = None
+
+
+class GrowthExperiment(SQLModel, table=True):
+    """
+    Активная проверка, созданная из принятой рекомендации. Baseline
+    фиксируется В МОМЕНТ принятия (snapshot payment_path), прогресс --
+    прирост sample_metric относительно baseline, вердикт -- автоматически
+    при достижении target_sample или max_runtime.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    recommendation_id: int = Field(foreign_key="growthrecommendation.id")
+    title: str
+    area: str
+    hypothesis: str = ""
+    status: GrowthExperimentStatus = GrowthExperimentStatus.running
+    baseline_json: dict = Field(default_factory=dict, sa_column=Column(JSON))  # snapshot payment_path при старте
+    primary_metric: str = ""
+    sample_metric: str = "registrations"
+    guardrail_json: list = Field(default_factory=list, sa_column=Column(JSON))
+    target_sample: int = 14
+    current_sample: int = 0
+    min_runtime_days: int = 3
+    max_runtime_days: int = 14
+    success_criterion: str = ""
+    failure_criterion: str = ""
+    locked_variables_json: list = Field(default_factory=list, sa_column=Column(JSON))
+    approved_by_owner: bool = True
+    verdict: str = ""            # текст вердикта (честные формулировки малой выборки)
+    result_summary: str = ""
+    started_at: datetime = Field(default_factory=utcnow)
+    ended_at: Optional[datetime] = None
+
+
 class AgentRun(SQLModel, table=True):
     """
     Журнал одного прогона цикла наблюдения. ok=False с заполненным

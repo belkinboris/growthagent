@@ -717,6 +717,14 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                 except Exception as notif_exc:
                     logger.warning("Live notifications failed (non-fatal): %s", notif_exc)
 
+                # Growth Loop: обновить прогресс эксперимента / вынести вердикт /
+                # предложить новую рекомендацию. Детерминированно, без LLM.
+                try:
+                    from app.scheduler import growth_loop_tick_and_notify
+                    await growth_loop_tick_and_notify(project, settings, result.payment_path_diagnostics)
+                except Exception as gl_exc:
+                    logger.warning("Growth loop tick failed (non-fatal): %s", gl_exc)
+
                 # Сохраняем в кэш — чтобы fallback /run тоже мог показать payment-path блок.
                 # Очищаем datetime объекты — JSON column не принимает нативные datetime.
                 try:
@@ -1759,3 +1767,199 @@ def stop_scheduler() -> None:
     if _scheduler is not None:
         _scheduler.shutdown()
         _scheduler = None
+
+
+# ---------------------------------------------------------------------------
+# Ежедневная утренняя сводка владельцу: /board + ДИНАМИКА, push раз в день
+# ---------------------------------------------------------------------------
+
+DAILY_BOARD_EVENT_TYPE = "daily_board"
+
+
+async def send_daily_board(
+    force: bool = False,
+    *,
+    _send=None,
+    _session_factory=None,
+    _settings=None,
+) -> bool:
+    """
+    Отправляет владельцу утреннюю сводку: доска (/board) + блок ДИНАМИКА
+    по дням. Отправляется РАЗ В ДЕНЬ даже если изменений нет -- владелец
+    должен видеть, что система работает и сколько данных осталось до
+    решения, не дергая /board руками.
+
+    Дедупликация: NotificationLog, event_key = "daily_board:{YYYY-MM-DD}".
+    Рестарт процесса/повторный запуск cron в тот же день не шлёт дубль.
+    force=True (команда /daily) игнорирует дедуп -- ручной запрос владельца
+    всегда отвечает, но точку динамики за день всё равно не дублирует
+    (save_daily_counters идемпотентен на день).
+
+    Никогда не бросает исключения наружу -- утренняя сводка не должна
+    ронять процесс.
+
+    _send/_session_factory/_settings -- инъекция для тестов, в проде None.
+    """
+    from app.commercial_report import (
+        build_board_report,
+        build_daily_board_message,
+    )
+    from app.service import (
+        load_daily_counters_history,
+        mark_notified,
+        save_daily_counters,
+        was_notified,
+    )
+
+    send = _send or _send_telegram_notification
+    session_factory = _session_factory or get_session
+    settings = _settings or get_settings()
+
+    try:
+        if not settings.daily_board_enabled:
+            return False
+        if not settings.bot_token or not settings.admin_chat_ids_list:
+            logger.info("Daily board skipped: bot_token/admin_chat_ids not configured")
+            return False
+
+        day = datetime.now(timezone.utc).date().isoformat()
+        event_key = f"{DAILY_BOARD_EVENT_TYPE}:{day}"
+
+        with session_factory() as session:
+            project = session.exec(
+                select(Project).where(Project.is_active == True)  # noqa: E712
+            ).first()
+            if project is None:
+                logger.info("Daily board skipped: no active project")
+                return False
+
+            if not force and was_notified(session, project.id, event_key):
+                return False
+
+            pp_cached = get_cached_diagnostics(
+                session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY
+            )
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+            # Точка динамики за сегодня -- ДО чтения истории, чтобы сводка
+            # включала сегодняшний день. Идемпотентно на день.
+            save_daily_counters(session, project.id, pp_dict, day)
+            history = load_daily_counters_history(session, project.id, days=7)
+
+            board_text = build_board_report(
+                project.name,
+                None,  # NormalizedMetrics не обязателен: регистрации берём из payment_path
+                payment_path=pp_dict,
+                new_registrations_since_deploy=(pp_dict or {}).get("registrations"),
+            )
+            text = build_daily_board_message(board_text, history)
+            project_id = project.id
+
+        sent_ok = await send(settings, text)
+        if sent_ok and not force:
+            with session_factory() as session:
+                mark_notified(
+                    session, project_id, event_key, DAILY_BOARD_EVENT_TYPE,
+                    payload={"day": day},
+                )
+        return bool(sent_ok)
+    except Exception:
+        logger.exception("Daily board failed")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Growth Loop: тик после каждого обновления payment_path + уведомления
+# ---------------------------------------------------------------------------
+
+async def growth_loop_tick_and_notify(
+    project: "Project",
+    settings,
+    payment_path: dict | None,
+    *,
+    _send=None,
+    _session_factory=None,
+) -> dict:
+    """
+    Один шаг Growth Loop после обновления payment_path:
+    1) обновить прогресс идущего эксперимента; если порог достигнут --
+       автоматический вердикт + уведомление владельцу;
+    2) если нет ни эксперимента, ни активной рекомендации -- предложить
+       новую рекомендацию + уведомление с призывом открыть /board.
+
+    Дедупликация уведомлений через NotificationLog:
+    - вердикт: "gl_verdict:{experiment_id}"
+    - предложение: "gl_proposed:{recommendation_id}"
+    Никогда не бросает исключения наружу.
+    """
+    from app import growth_loop
+    from app.truepost_playbook import truepost_playbook
+    from app.service import mark_notified, was_notified
+
+    send = _send or _send_telegram_notification
+    session_factory = _session_factory or get_session
+
+    outcome = {"verdict_sent": False, "proposal_sent": False}
+    try:
+        with session_factory() as session:
+            db_project = session.get(Project, project.id)
+            if db_project is None:
+                return outcome
+            result = growth_loop.tick(
+                session, db_project.id, payment_path,
+                truepost_playbook, db_project.settings_json,
+            )
+            finished = result["finished_experiment"]
+            new_rec = result["new_recommendation"]
+
+            finished_payload = None
+            if finished is not None:
+                finished_payload = {
+                    "id": finished.id,
+                    "title": finished.title,
+                    "verdict": finished.verdict,
+                    "summary": finished.result_summary,
+                }
+            rec_payload = None
+            if new_rec is not None:
+                rec_payload = {
+                    "id": new_rec.id,
+                    "title": new_rec.title,
+                    "action": new_rec.action,
+                }
+            project_id = db_project.id
+
+        if finished_payload is not None:
+            key = f"gl_verdict:{finished_payload['id']}"
+            with session_factory() as session:
+                already = was_notified(session, project_id, key)
+            if not already:
+                text = (
+                    f"ВЕРДИКТ — {finished_payload['verdict']}\n\n"
+                    f"{finished_payload['title']}\n\n"
+                    f"{finished_payload['summary']}\n\n"
+                    f"Следующий шаг: /board"
+                )
+                if await send(settings, text):
+                    with session_factory() as session:
+                        mark_notified(session, project_id, key, "gl_verdict")
+                    outcome["verdict_sent"] = True
+
+        if rec_payload is not None:
+            key = f"gl_proposed:{rec_payload['id']}"
+            with session_factory() as session:
+                already = was_notified(session, project_id, key)
+            if not already:
+                text = (
+                    f"НОВОЕ ПРЕДЛОЖЕНИЕ\n\n"
+                    f"{rec_payload['title']}\n\n"
+                    f"{rec_payload['action']}\n\n"
+                    f"Принять/отклонить: /board"
+                )
+                if await send(settings, text):
+                    with session_factory() as session:
+                        mark_notified(session, project_id, key, "gl_proposed")
+                    outcome["proposal_sent"] = True
+    except Exception:
+        logger.exception("growth_loop_tick_and_notify failed")
+    return outcome
