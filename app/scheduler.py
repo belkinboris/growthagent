@@ -1322,20 +1322,54 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
     Главная точка входа, вызывается из run_cycle_once ПОСЛЕ получения свежих
     payment_path данных, НО ДО перезаписи кэша PAYMENT_PATH_CACHE_PERIOD_KEY.
 
-    Стратегия (v1):
-    1. Пробуем per-user journeys endpoint (fetch_user_journeys). Если он
-       доступен (ok=True) -- уведомления идут по конкретным анонимным
-       user_key, с путём и местом застревания. Это основной режим.
-    2. Если journeys endpoint недоступен (404/500/timeout/not_configured) --
-       ПОЛНОСТЬЮ откатываемся на старую delta-логику (compute_deltas по
-       агрегатам). Это гарантирует, что отключение/неготовность нового
-       endpoint на стороне TruePost не оставит владельца без уведомлений.
+    Стратегия (v2, приоритет сверху вниз):
+    0. Проверяем alert_mode проекта -- если "off", ничего не отправляем.
+    1. Пробуем discrete user-events endpoint (Founder Live Feed, fetch_user_events).
+       Если доступен -- per-event уведомления с dedup по event_id, с учётом
+       smart/founder режима.
+    2. Если user-events недоступен -- пробуем per-user journeys endpoint
+       (fetch_user_journeys, snapshot diffing). Более грубый, но per-user.
+    3. Если journeys тоже недоступен -- откатываемся на старую delta-логику
+       (compute_deltas по агрегатам). Гарантирует, что владелец не останется
+       без уведомлений, даже если TruePost ничего из нового не задеплоил.
 
     Не кидает исключений наружу -- сбой live notifications не должен
     останавливать /run. Дедупликация через NotificationLog (event_key).
     """
     if not settings.bot_token or not settings.admin_chat_ids_list:
         return  # некому отправлять
+
+    from app.service import get_alert_mode
+    with get_session() as session:
+        alert_mode = get_alert_mode(session, project.id)
+    if alert_mode == "off":
+        return
+
+    # Уровень 1: discrete user-events (Founder Live Feed)
+    if project.base_url and settings.project_internal_api_token:
+        try:
+            from app.connectors.user_events import fetch_user_events
+            events_result = await fetch_user_events(
+                base_url=project.base_url,
+                api_token=settings.project_internal_api_token,
+                period_minutes=120,
+                limit=200,
+            )
+        except Exception as exc:
+            logger.warning("user_events fetch failed unexpectedly (falling back to journeys): %s", exc)
+            events_result = None
+
+        if events_result is not None and events_result.get("ok"):
+            events = events_result.get("events") or []
+            logger.info("user_events fetched ok (project_id=%s, count=%s, mode=%s)", project.id, len(events), alert_mode)
+            await _notify_from_events(project, settings, events, alert_mode)
+            return
+
+        if events_result is not None and not events_result.get("ok"):
+            logger.info(
+                "user_events unavailable (project_id=%s, status=%s, error=%s) -- falling back to journeys",
+                project.id, events_result.get("status"), events_result.get("error"),
+            )
 
     journeys_result = None
     if project.base_url and settings.project_internal_api_token:
@@ -1376,6 +1410,78 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
         )
 
     await _notify_from_deltas(project, settings, current_payment_path)
+
+
+async def _notify_from_events(project: Project, settings, events: list[dict], alert_mode: str) -> None:
+    """
+    Founder Live Feed (v2): дискретные события с dedup по event_id.
+
+    Фильтрует события по alert_mode (smart/founder), затем по anti-spam
+    guardrail (>FOUNDER_FEED_DIGEST_THRESHOLD событий за цикл -> дайджест),
+    затем шлёт оставшиеся по одному с проверкой NotificationLog.
+
+    Отдельно детектирует stuck_tariff_screen из journey_snapshot каждого
+    события (не отдельный API-запрос) -- если snapshot показывает
+    pricing_viewed=True и payment_started=False, и в событии есть
+    достаточно давний pricing_viewed_at, шлём synthetic stuck-уведомление.
+    Т.к. discrete events endpoint не даёt minutes_since_last_step напрямую
+    в этом контракте, stuck здесь остаётся приблизительным -- полноценный
+    stuck detection остаётся на _notify_from_journeys (snapshot diffing).
+    """
+    from app.notifications import (
+        should_notify_event, build_user_event_key, format_feed_event,
+        format_feed_digest, FOUNDER_FEED_DIGEST_THRESHOLD,
+    )
+    from app.service import was_notified, mark_notified
+
+    if not events:
+        return
+
+    relevant = [e for e in events if should_notify_event(e.get("event_type", ""), alert_mode)]
+    if not relevant:
+        return
+
+    if len(relevant) > FOUNDER_FEED_DIGEST_THRESHOLD:
+        digest_text = format_feed_digest(relevant)
+        digest_signature = "-".join(sorted(e.get("event_id", "") for e in relevant))[:200]
+        event_key = f"feed_digest:{project.id}:{hash(digest_signature)}"
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                return
+            sent_ok = await _send_telegram_notification(settings, digest_text)
+            if sent_ok:
+                mark_notified(session, project.id, event_key, "feed_digest")
+                logger.info("Live notification sent: feed digest (project_id=%s, count=%s)", project.id, len(relevant))
+        return
+
+    # Батч-проверка dedup одним запросом
+    candidate_keys = {build_user_event_key(e["event_id"]) for e in relevant}
+    with get_session() as session:
+        existing = session.exec(
+            select(NotificationLog.event_key).where(
+                NotificationLog.project_id == project.id,
+                NotificationLog.event_key.in_(candidate_keys),
+            )
+        ).all()
+        already_notified = set(existing)
+
+    for event in relevant:
+        event_key = build_user_event_key(event["event_id"])
+        if event_key in already_notified:
+            continue
+        text = format_feed_event(event)
+        if text is None:
+            continue
+        with get_session() as session:
+            if was_notified(session, project.id, event_key):
+                continue  # защита от гонки
+            sent_ok = await _send_telegram_notification(settings, text)
+            if sent_ok:
+                mark_notified(session, project.id, event_key, event.get("event_type", "user_event"), user_id=event.get("user_key"))
+                logger.info(
+                    "Live notification sent: %s (project_id=%s, user_key=%s)",
+                    event.get("event_type"), project.id, event.get("user_key"),
+                )
 
 
 async def _notify_from_journeys(project: Project, settings, journeys: list[dict]) -> None:

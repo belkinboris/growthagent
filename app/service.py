@@ -686,6 +686,39 @@ LANDING_FUNNEL_CACHE_PERIOD_KEY = "landing_funnel_24h"
 DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY = "direct_intelligence_24h"
 PAYMENT_PATH_CACHE_PERIOD_KEY = "payment_path_7d"
 USER_JOURNEYS_CACHE_PERIOD_KEY = "user_journeys_24h"
+ALERT_MODE_CACHE_KEY = "alert_mode_v1"
+
+# Режимы live-уведомлений (Founder Live Feed):
+#   "off"     -- не отправлять live-уведомления вообще
+#   "smart"   -- только важные события (bad feedback, pricing_viewed, payment_*, stuck)
+#   "founder" -- почти все действия пользователя (+ user_registered, channel_created, good feedback)
+ALERT_MODE_DEFAULT = "smart"
+ALERT_MODES = ("off", "smart", "founder")
+
+
+def get_alert_mode(session: Session, project_id: int) -> str:
+    """
+    Текущий режим live-уведомлений для проекта. По умолчанию "smart".
+    Хранится через DeepDiagnosticsCache (без миграции схемы БД) --
+    последняя сохранённая запись с этим period_key считается активной.
+    """
+    cached = get_cached_diagnostics(session, project_id, ALERT_MODE_CACHE_KEY)
+    if cached is not None and cached.ok:
+        mode = (cached.result_json or {}).get("mode")
+        if mode in ALERT_MODES:
+            return mode
+    return ALERT_MODE_DEFAULT
+
+
+def set_alert_mode(session: Session, project_id: int, mode: str) -> None:
+    """Сохраняет режим live-уведомлений. mode должен быть одним из ALERT_MODES."""
+    if mode not in ALERT_MODES:
+        raise ValueError(f"Unknown alert mode: {mode!r}. Expected one of {ALERT_MODES}.")
+    save_diagnostics_cache(
+        session, project_id, ALERT_MODE_CACHE_KEY,
+        "manual_set", {"mode": mode}, ok=True,
+    )
+
 
 
 def should_run_landing_funnel_diagnostics(primary_candidate: AlertCandidate | None) -> bool:

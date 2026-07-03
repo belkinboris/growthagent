@@ -486,7 +486,7 @@ def build_ads_report(
             f"за период."
         )
 
-    lines.append("\n← /run  ← /funnel  ← /pay")
+    lines.append("\nДоска: /board")
     return "\n".join(lines)
 
 
@@ -731,7 +731,7 @@ def build_funnel_report(
     # Метрика смешивает ручные действия и автогенерацию системой и не помогает
     # принять бизнес-решение. Доступна только в /debug.
 
-    lines.append("\n← /run  /ads →  /pay →")
+    lines.append("\nДоска: /board")
     return "\n".join(lines)
 
 
@@ -850,7 +850,7 @@ def build_pay_report(
             "стоит посмотреть причины отказов в YooKassa."
         )
 
-    lines.append("\n← /run  ← /funnel")
+    lines.append("\nДоска: /board")
     return "\n".join(lines)
 
 
@@ -1209,4 +1209,294 @@ def build_experiments_report(
             lines.append(journeys_block)
 
     lines.append("\nПодробности: /today  /funnel  /pay")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /board — главная компактная доска (единый builder для /board, /today, /run)
+# ---------------------------------------------------------------------------
+
+# Целевые объёмы для progress bars недели -- см. задачу "рефакторинг команд".
+BOARD_WEEK_REGISTRATIONS_TARGET = 20
+BOARD_WEEK_FEEDBACK_TARGET = 10
+BOARD_WEEK_PRICING_TARGET = 5
+
+
+def _determine_board_decision(
+    signup: int, activation_1: int,
+    pricing_tracked: bool, pricing_viewed: int,
+    pp_started: int, pp_success: int,
+    has_feedback_data: bool, fb_good: int, fb_bad: int,
+) -> tuple[str, str]:
+    """
+    Возвращает (decision_label, what_is_missing) -- главное решение доски
+    и краткое "до решения нужно добрать X".
+
+    decision_label -- одно из:
+      ЖДЁМ ДАННЫЕ / ЧИНИМ ПЕРВЫЙ ПОСТ / ЧИНИМ ПУТЬ К ТАРИФАМ /
+      ЧИНИМ ТАРИФНЫЙ ЭКРАН / ЧИНИМ ОПЛАТУ / МАСШТАБИРУЕМ
+    """
+    MIN_SIGNUP_FOR_ANY_DECISION = 10
+
+    if pp_success > 0:
+        return "МАСШТАБИРУЕМ", "оценить экономику привлечения на объёме"
+
+    if pp_started > 0:
+        return "ЧИНИМ ОПЛАТУ", "разобраться с неуспешными попытками оплаты"
+
+    if pricing_tracked and pricing_viewed >= BOARD_WEEK_PRICING_TARGET:
+        return "ЧИНИМ ТАРИФНЫЙ ЭКРАН", "понять, почему открывшие тарифы не платят"
+
+    if signup < MIN_SIGNUP_FOR_ANY_DECISION:
+        return "ЖДЁМ ДАННЫЕ", f"набрать {MIN_SIGNUP_FOR_ANY_DECISION - signup} регистраций для выводов"
+
+    if has_feedback_data and fb_bad > fb_good and (fb_good + fb_bad) >= 3:
+        return "ЧИНИМ ПЕРВЫЙ ПОСТ", "первый пост чаще не нравится — разобраться, почему"
+
+    if activation_1 > 0:
+        return "ЧИНИМ ПУТЬ К ТАРИФАМ", "понять, почему созданный канал не ведёт к тарифам"
+
+    return "ЖДЁМ ДАННЫЕ", "накопить больше данных по воронке"
+
+
+def build_board_report(
+    project_name: str,
+    metrics: "NormalizedMetrics | None",
+    *,
+    payment_path: dict | None = None,
+    new_registrations_since_deploy: int | None = None,
+    new_registrations_target: int = BOARD_WEEK_REGISTRATIONS_TARGET,
+    feedback_target: int = BOARD_WEEK_FEEDBACK_TARGET,
+    pricing_target: int = BOARD_WEEK_PRICING_TARGET,
+) -> str:
+    """
+    /board -- компактное табло, единый builder для /board, /today, /run.
+    НЕ отчёт: без длинных гипотез, без длинных критериев, без raw
+    post_generations, без технических команд в тексте.
+
+    Возвращает СТРОГО короткий текст (укладывается в один экран телефона).
+    """
+    signup = _n(metrics.signup) if metrics else 0
+    activation_1 = _n(metrics.activation_1) if metrics else 0
+    pp_started = _n(payment_path.get("payment_started")) if payment_path else 0
+    pp_success = _n(payment_path.get("payment_success")) if payment_path else 0
+    pricing_viewed_raw = payment_path.get("pricing_viewed") if payment_path else None
+    pricing_viewed = _n(pricing_viewed_raw) if pricing_viewed_raw is not None else 0
+    pricing_tracked = pricing_viewed_raw is not None
+
+    fb_good_raw = payment_path.get("first_post_feedback_good") if payment_path else None
+    fb_bad_raw = payment_path.get("first_post_feedback_bad") if payment_path else None
+    fb_good = _n(fb_good_raw)
+    fb_bad = _n(fb_bad_raw)
+    has_feedback_data = fb_good_raw is not None or fb_bad_raw is not None
+    total_feedback = fb_good + fb_bad
+
+    reg_count = new_registrations_since_deploy if new_registrations_since_deploy is not None else signup
+
+    decision, missing = _determine_board_decision(
+        signup, activation_1, pricing_tracked, pricing_viewed,
+        pp_started, pp_success, has_feedback_data, fb_good, fb_bad,
+    )
+
+    lines: list[str] = []
+    lines.append(f"Доска — {project_name}")
+
+    lines.append("\nРЕШЕНИЕ")
+    lines.append(decision)
+    lines.append(f"\nДо решения:\n{missing}")
+
+    lines.append("\nНЕДЕЛЯ")
+    lines.append(f"Регистрации   {reg_count} / {new_registrations_target}   {progress_bar(reg_count, new_registrations_target)}")
+    lines.append(f"Отзывы        {total_feedback} / {feedback_target}   {progress_bar(total_feedback, feedback_target)}")
+    lines.append(f"Тарифы        {pricing_viewed} / {pricing_target}   {progress_bar(pricing_viewed, pricing_target)}")
+    lines.append(f"Оплаты        {pp_success}")
+
+    lines.append("\nФОКУС")
+    if decision == "ЧИНИМ ПЕРВЫЙ ПОСТ":
+        focus = "первый пост → платный шаг"
+    elif decision == "ЧИНИМ ПУТЬ К ТАРИФАМ":
+        focus = "путь от канала к тарифному экрану"
+    elif decision == "ЧИНИМ ТАРИФНЫЙ ЭКРАН":
+        focus = "тарифный экран"
+    elif decision == "ЧИНИМ ОПЛАТУ":
+        focus = "оплата"
+    elif decision == "МАСШТАБИРУЕМ":
+        focus = "экономика привлечения"
+    else:
+        focus = "сбор данных"
+    lines.append(focus)
+
+    lines.append("\nСЕГОДНЯ")
+    if decision == "ЖДЁМ ДАННЫЕ":
+        today_action = "смотреть новых пользователей, ждать данные проверки"
+    elif decision == "ЧИНИМ ПЕРВЫЙ ПОСТ":
+        today_action = "разобрать причины «не подходит» в /journeys"
+    elif decision == "ЧИНИМ ПУТЬ К ТАРИФАМ":
+        today_action = "пройти путь от канала до тарифов самому"
+    elif decision == "ЧИНИМ ТАРИФНЫЙ ЭКРАН":
+        today_action = "проверить тарифный экран вручную"
+    elif decision == "ЧИНИМ ОПЛАТУ":
+        today_action = "проверить YooKassa логи"
+    else:
+        today_action = "оценить стоимость привлечения"
+    lines.append(today_action)
+
+    lines.append("\nНЕ МЕНЯТЬ")
+    lines.append("бюджет, ставки, тарифы, цены, лендинг")
+
+    lines.append("\nДетали: /journeys /checks /funnel /pay /ads")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /checks — проверки и правила принятия решения (alias: /experiments)
+# ---------------------------------------------------------------------------
+
+def build_checks_report(
+    project_name: str,
+    *,
+    payment_path: dict | None = None,
+) -> str:
+    """
+    /checks -- активная проверка, правила решения, следующий кандидат,
+    что отложено. НЕ дублирует /board (не показывает "СЕГОДНЯ",
+    не показывает progress bars недели).
+    """
+    lines: list[str] = []
+    lines.append(f"Проверки — {project_name}")
+
+    fb_good_raw = payment_path.get("first_post_feedback_good") if payment_path else None
+    fb_bad_raw = payment_path.get("first_post_feedback_bad") if payment_path else None
+    fb_good = _n(fb_good_raw)
+    fb_bad = _n(fb_bad_raw)
+    has_feedback_data = fb_good_raw is not None or fb_bad_raw is not None
+
+    lines.append("\nАктивная проверка: Путь после первого поста")
+    lines.append(
+        "Вопрос: почему пользователи создают канал, но почти не открывают тарифы?"
+    )
+
+    lines.append("\nПравило решения:")
+    lines.append(
+        "— если первый пост нравится, но тарифы не открывают → тестируем "
+        "«очередь постов на неделю»;"
+    )
+    lines.append(
+        "— если первый пост чаще не нравится → сначала чиним качество результата;"
+    )
+    lines.append(
+        "— если тарифы открывают, но не платят → смотрим тарифный экран."
+    )
+
+    lines.append("\nСледующий кандидат: Очередь постов на неделю")
+    lines.append(
+        "Причина: платная ценность должна быть не в одном посте, "
+        "а в регулярном ведении канала."
+    )
+
+    lines.append("\nОтложено:")
+    deferred = [
+        "картинки в постах",
+        "зумерский дизайн",
+        "новая группа «Контент-завод»",
+        "увеличение бюджета",
+        "изменение лендинга",
+    ]
+    for item in deferred:
+        lines.append(f"— {item}")
+
+    lines.append("\nДоска: /board")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /journeys — последние пути пользователей (компактный список, не агрегаты)
+# ---------------------------------------------------------------------------
+
+def _journey_step_summary(journey: dict) -> str:
+    """Короткая строка пути одного пользователя для /journeys."""
+    steps = []
+    steps.append("рег")
+    if journey.get("channel_created_at"):
+        steps.append("канал")
+    feedback = journey.get("first_post_feedback")
+    if feedback == "good" or feedback is True:
+        steps.append("отзыв+")
+    elif feedback == "bad" or feedback is False:
+        steps.append("отзыв-")
+    if journey.get("pricing_viewed_at"):
+        steps.append("тарифы")
+    if journey.get("payment_success_at"):
+        steps.append("оплата✓")
+    elif journey.get("payment_started_at"):
+        steps.append("оплата...")
+    return " → ".join(steps)
+
+
+def _journey_next_action(journey: dict) -> str:
+    """Короткое действие для пользователя."""
+    if journey.get("payment_success_at"):
+        return "оплатил — всё ок"
+    if journey.get("payment_started_at"):
+        return "ждём завершения оплаты"
+    if journey.get("pricing_viewed_at"):
+        minutes = journey.get("minutes_since_last_step") or 0
+        if minutes >= 45:
+            return f"застрял {minutes} мин — можно написать вручную"
+        return "недавно открыл тарифы, ждём"
+    feedback = journey.get("first_post_feedback")
+    if feedback == "bad" or feedback is False:
+        return "не понравился пост — смотреть причину"
+    if journey.get("channel_created_at"):
+        return "ждём первого отзыва"
+    return "ждём создания канала"
+
+
+def build_journeys_report(project_name: str, journeys: list[dict] | None, limit: int = 10) -> str:
+    """
+    /journeys -- последние N путей пользователей.
+    Не показывает агрегированные цифры, кроме мини-сводки сверху.
+    Не дублирует /funnel (там конверсия по шагам, тут конкретные пути).
+    """
+    lines: list[str] = []
+    lines.append(f"Пути пользователей — {project_name}")
+
+    if not journeys:
+        lines.append("\nДанные по путям пользователей пока недоступны.")
+        lines.append("\nДоска: /board")
+        return "\n".join(lines)
+
+    # Мини-сводка
+    total = len(journeys)
+    with_channel = sum(1 for j in journeys if j.get("channel_created_at"))
+    with_pricing = sum(1 for j in journeys if j.get("pricing_viewed_at"))
+    paid = sum(1 for j in journeys if j.get("payment_success_at"))
+    lines.append(f"\nВсего путей: {total} | с каналом: {with_channel} | у тарифов: {with_pricing} | оплатили: {paid}")
+
+    # Сортируем по продвинутости (дальше по воронке — выше)
+    def _progress_score(j: dict) -> int:
+        score = 0
+        for field in ["channel_created_at", "first_post_feedback_at",
+                       "pricing_viewed_at", "payment_started_at", "payment_success_at"]:
+            if j.get(field):
+                score += 1
+        return score
+
+    top = sorted(journeys, key=_progress_score, reverse=True)[:limit]
+
+    lines.append("\nПоследние пути:")
+    for j in top:
+        user_key = j.get("user_key", "unknown")
+        source = j.get("source") or j.get("utm_source") or "неизвестный источник"
+        source_label = {
+            "yandex_direct": "Яндекс.Директ", "direct": "Яндекс.Директ",
+            "telegram_ads": "Telegram Ads", "tgads": "Telegram Ads",
+        }.get((source or "").lower(), source)
+        path = _journey_step_summary(j)
+        action = _journey_next_action(j)
+        lines.append(f"\n{user_key} ({source_label})")
+        lines.append(f"  {path}")
+        lines.append(f"  → {action}")
+
+    lines.append("\nДоска: /board")
     return "\n".join(lines)

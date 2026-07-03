@@ -1484,9 +1484,10 @@ def _get_active_project(session) -> Project | None:
 
 
 _KEYBOARD_BUTTON_TO_COMMAND = {
-    "Сегодня": "today",
+    "Доска": "board",
+    "Пути": "journeys",
+    "Проверки": "checks",
     "Воронка": "funnel",
-    "Проверки": "experiments",
     "Оплата": "pay",
     "Реклама": "ads",
     "Статус": "status",
@@ -1508,8 +1509,9 @@ async def on_keyboard_button_text(update: Update, context: ContextTypes.DEFAULT_
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = ReplyKeyboardMarkup(
         [
-            [KeyboardButton("Сегодня"), KeyboardButton("Воронка")],
-            [KeyboardButton("Проверки"), KeyboardButton("Оплата")],
+            [KeyboardButton("Доска")],
+            [KeyboardButton("Пути"), KeyboardButton("Проверки")],
+            [KeyboardButton("Воронка"), KeyboardButton("Оплата")],
             [KeyboardButton("Реклама"), KeyboardButton("Статус")],
         ],
         resize_keyboard=True,
@@ -1518,12 +1520,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "Аналитик Воронки помогает вести TruePost к первым оплатам: "
         "показывает, что происходит, какая проверка идёт и что делать дальше.\n\n"
-        "/today — что делаем сегодня\n"
-        "/funnel — где ломается путь пользователя\n"
-        "/experiments — какие проверки идут\n"
-        "/pay — путь к оплате\n"
-        "/ads — реклама\n"
-        "/status — работает ли система\n\n"
+        "Главное:\n"
+        "/board — главная доска\n\n"
+        "Детали:\n"
+        "/journeys — пути пользователей\n"
+        "/checks — проверки\n"
+        "/funnel — воронка\n"
+        "/pay — оплата\n"
+        "/ads — реклама\n\n"
+        "Уведомления и система:\n"
+        "/alerts — live-уведомления\n"
+        "/status — состояние системы\n\n"
         "Технические команды: /help",
         reply_markup=keyboard,
     )
@@ -1534,23 +1541,29 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "Команды Аналитика Воронки\n\n"
         "Основные:\n"
-        "— /today\n"
-        "— /run\n"
+        "— /board\n"
+        "— /journeys\n"
+        "— /checks\n"
         "— /funnel\n"
-        "— /experiments\n"
         "— /pay\n"
         "— /ads\n"
+        "— /alerts\n"
         "— /status\n\n"
+        "Aliases:\n"
+        "— /today = /board\n"
+        "— /experiments = /checks\n"
+        "— /live = /alerts\n\n"
         "Технические:\n"
         "— /ping\n"
         "— /build\n"
-        "— /alerts\n"
+        "— /run\n"
+        "— /run_full\n"
         "— /mode\n"
         "— /settings\n"
+        "— /debug\n"
         "— /test_metrika\n"
         "— /test_direct\n"
         "— /deep_direct\n"
-        "— /debug\n"
         "— /check_landing\n"
         "— /check_onboarding",
     )
@@ -2010,14 +2023,26 @@ def _build_cached_cycle_response(reason: str) -> str | None:
         )
 
 
-def _build_cycle_response(result: CycleResult, started_at: datetime | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
+def _build_cycle_response(
+    result: CycleResult, started_at: datetime | None = None, compact: bool = True,
+) -> tuple[str, InlineKeyboardMarkup | None]:
     project_id = None
     with get_session() as session:
         project = _get_active_project(session)
         project_name = project.name if project else "Проект"
         project_id = project.id if project else None
 
-    text = format_cycle_message(result, project_name)
+    if compact:
+        # Новый короткий /run: "данные обновлены" + компактная доска.
+        # Длинный owner report (format_cycle_message) доступен через /run_full или /debug.
+        from app.commercial_report import build_board_report
+        metrics_7d = (result.metrics_by_window or {}).get("7d")
+        text = (
+            "Данные обновлены.\n\n"
+            + build_board_report(project_name, metrics_7d, payment_path=result.payment_path_diagnostics)
+        )
+    else:
+        text = format_cycle_message(result, project_name)
 
     # Source freshness is now part of the Owner Decision Layer report. Do not
     # append a second legacy freshness block here, otherwise /run becomes noisy
@@ -2045,7 +2070,7 @@ def _build_cycle_response(result: CycleResult, started_at: datetime | None = Non
     return text, keyboard
 
 
-async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> None:
+async def _manual_run_background(chat_id: int, bot, started_at: datetime, compact: bool = True) -> None:
     global _manual_run_task, _manual_run_started_at
 
     current_task = asyncio.current_task()
@@ -2061,7 +2086,7 @@ async def _manual_run_background(chat_id: int, bot, started_at: datetime) -> Non
             ),
             timeout=MANUAL_RUN_TIMEOUT_SECONDS + 5.0,
         )
-        text, keyboard = _build_cycle_response(result, started_at=started_at)
+        text, keyboard = _build_cycle_response(result, started_at=started_at, compact=compact)
         await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
         global _last_run_finished_at, _last_run_was_live
         _last_run_finished_at = datetime.now(timezone.utc)
@@ -2200,10 +2225,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(update, "\n".join(lines))
 
 
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Управленческий отчёт текущего дня: что проверяем, что решаем, что не трогаем."""
+async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Главная доска: компактный статус, решение, неделя, фокус, сегодня, не менять.
+    Единственный builder для /board и /today (alias) и финального шага /run.
+    """
     try:
-        from app.commercial_report import build_today_report
+        from app.commercial_report import build_board_report
 
         with get_session() as session:
             project = _get_active_project(session)
@@ -2217,34 +2245,27 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
             pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
-            di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
-            di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
-            di = _deserialize_direct_intelligence(di_dict)
-
-            journeys_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
-            recent_journeys = None
-            if journeys_cached and journeys_cached.ok:
-                recent_journeys = (journeys_cached.result_json or {}).get("journeys")
-
             project_name = project.name
 
-        text = build_today_report(
-            project_name,
-            metrics_obj,
-            payment_path=pp_dict,
-            direct_intelligence=di,
-            recent_journeys=recent_journeys,
-        )
+        text = build_board_report(project_name, metrics_obj, payment_path=pp_dict)
         await safe_reply(update, text)
     except Exception as exc:
-        logger.exception("/today failed: %s: %s", type(exc).__name__, exc)
-        await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
+        logger.exception("/board failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось сформировать доску. Технические детали: /status")
 
 
-async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-facing список активных проверок/гипотез ('Проверки')."""
+# /today — alias к /board (та же логика, тот же builder)
+cmd_today = cmd_board
+
+
+async def cmd_checks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /checks — активная проверка, правила решения, следующий кандидат,
+    что отложено. Не дублирует /board (нет progress bars недели, нет "сегодня").
+    /experiments — alias к этой же функции.
+    """
     try:
-        from app.commercial_report import build_experiments_report
+        from app.commercial_report import build_checks_report
 
         with get_session() as session:
             project = _get_active_project(session)
@@ -2255,6 +2276,30 @@ async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
             pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
 
+            project_name = project.name
+
+        text = build_checks_report(project_name, payment_path=pp_dict)
+        await safe_reply(update, text)
+    except Exception as exc:
+        logger.exception("/checks failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
+
+
+# /experiments — alias к /checks
+cmd_experiments = cmd_checks
+
+
+async def cmd_journeys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/journeys — последние 5-10 путей пользователей (не агрегаты, не /funnel)."""
+    try:
+        from app.commercial_report import build_journeys_report
+
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
+
             journeys_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
             recent_journeys = None
             if journeys_cached and journeys_cached.ok:
@@ -2262,21 +2307,18 @@ async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             project_name = project.name
 
-        text = build_experiments_report(project_name, payment_path=pp_dict, recent_journeys=recent_journeys)
+        text = build_journeys_report(project_name, recent_journeys)
         await safe_reply(update, text)
     except Exception as exc:
-        logger.exception("/experiments failed: %s: %s", type(exc).__name__, exc)
-        await safe_reply(update, "Не удалось сформировать отчёт. Технические детали: /status")
+        logger.exception("/journeys failed: %s: %s", type(exc).__name__, exc)
+        await safe_reply(update, "Не удалось получить пути пользователей. Технические детали: /status")
 
 
-async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _start_manual_run(update: Update, context: ContextTypes.DEFAULT_TYPE, compact: bool) -> None:
     """
-    Manual /run is isolated from Telegram update processing.
-
-    The handler only accepts/rejects the run and schedules a background task.
-    The heavy collection/analyzer cycle is executed in a separate thread, so a
-    slow Direct/Metrika/product endpoint cannot block /ping, /status, /start or
-    other Telegram commands in the dispatcher event loop.
+    Общая логика запуска ручной проверки для /run (compact=True, короткое
+    "данные обновлены" + /board) и /run_full (compact=False, длинный owner
+    report как раньше). Единственный владелец single-flight lock.
     """
     global _manual_run_task, _manual_run_started_at
 
@@ -2314,7 +2356,7 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
         try:
             task = context.application.create_task(
-                _manual_run_background(chat_id, context.application.bot, now)
+                _manual_run_background(chat_id, context.application.bot, now, compact=compact)
             )
         except Exception:
             _manual_run_started_at = None
@@ -2324,10 +2366,84 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         _manual_run_task = task
-        logger.info("Manual /run accepted (build=%s, chat_id=%s)", BUILD_MARKER, chat_id)
+        logger.info("Manual /run accepted (build=%s, chat_id=%s, compact=%s)", BUILD_MARKER, chat_id, compact)
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /run: обновляет данные, показывает короткое "данные обновлены" и /board.
+    Manual /run is isolated from Telegram update processing -- the heavy
+    collection/analyzer cycle runs in a separate thread, so a slow
+    Direct/Metrika/product endpoint cannot block other Telegram commands.
+    """
+    await _start_manual_run(update, context, compact=True)
+
+
+async def cmd_run_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/run_full: тот же live-сбор данных, но с длинным owner report (как раньше)."""
+    await _start_manual_run(update, context, compact=False)
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /alerts — статус и управление live-уведомлениями (Founder Live Feed).
+    /alerts on     -> smart (важные события)
+    /alerts off    -> выключить
+    /alerts smart  -> только важные события (bad feedback, pricing_viewed, payment_*, stuck)
+    /alerts founder -> почти все действия пользователя
+    /live — alias к этой же команде.
+    """
+    from app.service import get_alert_mode, set_alert_mode, ALERT_MODES
+
+    args = context.args or []
+    arg = args[0].lower() if args else None
+
+    with get_session() as session:
+        project = _get_active_project(session)
+        if project is None:
+            await safe_reply(update, "Активный проект не найден.")
+            return
+
+        if arg is None:
+            mode = get_alert_mode(session, project.id)
+            mode_labels = {
+                "off": "выключены",
+                "smart": "включены — только важные события",
+                "founder": "включены — почти все действия пользователя",
+            }
+            await safe_reply(
+                update,
+                f"Уведомления — {project.name}\n\n"
+                f"Режим: {mode_labels.get(mode, mode)}\n\n"
+                f"Изменить: /alerts on, /alerts off, /alerts smart, /alerts founder",
+            )
+            return
+
+        if arg == "on":
+            set_alert_mode(session, project.id, "smart")
+            await safe_reply(update, "Уведомления включены — режим «важные события».")
+            return
+        if arg == "off":
+            set_alert_mode(session, project.id, "off")
+            await safe_reply(update, "Уведомления выключены.")
+            return
+        if arg in ALERT_MODES:
+            set_alert_mode(session, project.id, arg)
+            mode_labels = {"off": "выключены", "smart": "важные события", "founder": "почти все действия"}
+            await safe_reply(update, f"Уведомления: режим «{mode_labels[arg]}».")
+            return
+
+        await safe_reply(
+            update,
+            "Не понял режим. Варианты: /alerts on, /alerts off, /alerts smart, /alerts founder",
+        )
+
+
+# /live — alias к /alerts
+cmd_live = cmd_alerts
+
+
+async def cmd_alerts_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Доводка по фидбэку архитектора (проблема "/alerts слишком шумный"):
     открытые/эскалированные алерты показываются первыми и полностью,
@@ -2461,14 +2577,6 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             snapshot_dt=snap_created_at,
             prev_metrics=prev_metrics,
         )
-
-        # Source breakdown — если AutoPost отдаёт utm_source breakdown
-        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
-        breakdown = parse_source_breakdown(pp_dict)
-        if breakdown or True:  # показываем всегда — либо данные, либо рекомендацию
-            source_block = format_source_breakdown(breakdown, pp_dict)
-            if source_block:
-                text = text + source_block
 
         await safe_reply(update, text)
 
@@ -2760,55 +2868,68 @@ async def _deep_direct_background(chat_id: int, bot, project_id: int | None, sta
 
 
 async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Рекламный вывод из кэша — без внешних API."""
+    """Рекламный вывод из кэша — без внешних API. Источники трафика: Direct/TG Ads/unknown."""
     try:
         from app.commercial_report import build_ads_report
         from app.service import extract_normalized_metrics_from_snapshot
+        from app.connectors.traffic_sources import parse_source_breakdown, format_source_breakdown
 
         with get_session() as session:
             project = _get_active_project(session)
-        if project is None:
-            await update.message.reply_text("Активный проект не найден.")
-            return
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
 
-        snapshot = session.exec(
-            select(MetricSnapshot)
-            .where(
-                MetricSnapshot.project_id == project.id,
-                MetricSnapshot.period_key == "7d",
-                MetricSnapshot.source == "combined",
-            )
-            .order_by(MetricSnapshot.created_at.desc())
-            .limit(1)
-        ).first()
+            snapshot = session.exec(
+                select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.project_id == project.id,
+                    MetricSnapshot.period_key == "7d",
+                    MetricSnapshot.source == "combined",
+                )
+                .order_by(MetricSnapshot.created_at.desc())
+                .limit(1)
+            ).first()
 
-        metrics_obj = None
-        if snapshot:
-            from app.rules import NormalizedMetrics
-            raw = extract_normalized_metrics_from_snapshot(snapshot)
-            metrics_obj = NormalizedMetrics(
-                period_key="7d",
-                signup=raw.get("signup"),
-                activation_1=raw.get("activation_1"),
-                activation_2=raw.get("activation_2"),
-                payment_started=raw.get("payment_started"),
-                payment_success=raw.get("payment_success"),
-                spend=raw.get("spend"),
-                clicks=raw.get("clicks"),
-                sources_ok=set(),
-            )
+            metrics_obj = None
+            if snapshot:
+                from app.rules import NormalizedMetrics
+                raw = extract_normalized_metrics_from_snapshot(snapshot)
+                metrics_obj = NormalizedMetrics(
+                    period_key="7d",
+                    signup=raw.get("signup"),
+                    activation_1=raw.get("activation_1"),
+                    activation_2=raw.get("activation_2"),
+                    payment_started=raw.get("payment_started"),
+                    payment_success=raw.get("payment_success"),
+                    spend=raw.get("spend"),
+                    clicks=raw.get("clicks"),
+                    sources_ok=set(),
+                )
 
-        di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
-        di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
-        di = _deserialize_direct_intelligence(di_dict)
-        project_name = project.name
+            di_cached = get_cached_diagnostics(session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY)
+            di_dict = dict(di_cached.result_json or {}) if (di_cached and di_cached.ok) else None
+            di = _deserialize_direct_intelligence(di_dict)
+
+            pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+            project_name = project.name
+            snapshot_dt = snapshot.created_at if snapshot else None
 
         text = build_ads_report(
             project_name,
             direct_intelligence=di,
             metrics=metrics_obj,
-            snapshot_dt=snapshot.created_at if snapshot else None,
+            snapshot_dt=snapshot_dt,
         )
+
+        # Источники трафика: Direct / Telegram Ads / unknown с downstream-качеством
+        breakdown = parse_source_breakdown(pp_dict)
+        source_block = format_source_breakdown(breakdown, pp_dict)
+        if source_block:
+            text = text + source_block
+
         await safe_reply(update, text)
     except Exception as exc:
         logger.exception("/ads failed: %s: %s", type(exc).__name__, exc)
@@ -3163,11 +3284,15 @@ def build_application() -> Application:
     # Заполняем dispatch для reply-keyboard кнопок (объявлен раньше функций,
     # заполняем здесь когда все cmd_* уже определены)
     _COMMAND_DISPATCH.update({
+        "board": cmd_board,
         "today": cmd_today,
+        "journeys": cmd_journeys,
+        "checks": cmd_checks,
+        "experiments": cmd_checks,
         "funnel": cmd_funnel,
-        "experiments": cmd_experiments,
         "pay": cmd_pay,
         "ads": cmd_ads,
+        "alerts": cmd_alerts,
         "status": cmd_status,
     })
 
@@ -3177,12 +3302,18 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("board", cmd_board))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("run_full", cmd_run_full))
+    app.add_handler(CommandHandler("journeys", cmd_journeys))
+    app.add_handler(CommandHandler("checks", cmd_checks))
     app.add_handler(CommandHandler("experiments", cmd_experiments))
     app.add_handler(CommandHandler("ads", cmd_ads))
     app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("live", cmd_live))
+    app.add_handler(CommandHandler("alerts_legacy", cmd_alerts_legacy))
     app.add_handler(CommandHandler("funnel", cmd_funnel))
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("settings", cmd_settings))

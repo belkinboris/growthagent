@@ -543,3 +543,236 @@ def build_journey_notifications(
                 results.append((key, format_journey_payment_failed(journey)))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Founder Live Feed (v2) -- дискретные события из /api/internal/user-events,
+# с режимами smart/founder и digest anti-spam.
+# ---------------------------------------------------------------------------
+
+# Событие считается "важным" (smart mode) если оно в этом множестве.
+# Обычная регистрация/создание канала/good feedback НЕ входят в smart --
+# они шумные при малом трафике их можно пропускать, если владелец не хочет
+# видеть вообще всё.
+SMART_MODE_EVENT_TYPES = frozenset([
+    "first_post_feedback_bad",
+    "pricing_viewed",
+    "payment_started",
+    "payment_success",
+    "payment_failed",
+    "stuck_tariff_screen",  # синтетическое событие, генерируется отдельно
+])
+
+# founder mode -- показывает вообще все определённые типы событий, включая
+# user_registered / channel_created / good feedback.
+FOUNDER_MODE_EVENT_TYPES = frozenset([
+    "user_registered", "channel_created",
+    "first_post_feedback_good", "first_post_feedback_bad",
+    "pricing_viewed", "payment_cta_clicked",
+    "payment_started", "payment_success", "payment_failed",
+    "stuck_tariff_screen",
+])
+
+FOUNDER_FEED_DIGEST_THRESHOLD = 10
+
+
+def should_notify_event(event_type: str, mode: str) -> bool:
+    """True если событие этого типа должно уведомляться в данном режиме."""
+    if mode == "off":
+        return False
+    if mode == "founder":
+        return event_type in FOUNDER_MODE_EVENT_TYPES
+    # smart (по умолчанию)
+    return event_type in SMART_MODE_EVENT_TYPES
+
+
+def build_user_event_key(event_id: str) -> str:
+    """event_key для discrete user-event. Формат: user_event:<event_id>"""
+    return f"user_event:{event_id}"
+
+
+def build_stuck_event_key(user_key: str, stuck_at: str, base_timestamp: str | None) -> str:
+    """
+    event_key для синтетического stuck-события.
+    Формат: stuck:<user_key>:<stuck_at>:<base_event_timestamp>
+    """
+    return f"stuck:{user_key}:{stuck_at}:{base_timestamp or 'none'}"
+
+
+def _feed_source_label(event: dict) -> str:
+    raw = (event.get("source") or event.get("utm_source") or "").strip().lower()
+    return _SOURCE_LABELS.get(raw, "неизвестного источника")
+
+
+def _feed_path_lines(snapshot: dict) -> list[str]:
+    """Короткий путь из journey_snapshot для Founder Live Feed сообщений."""
+    steps = []
+    if snapshot.get("registered"):
+        steps.append("регистрация ✓")
+    if snapshot.get("channel_created"):
+        steps.append("канал ✓")
+    if snapshot.get("pricing_viewed"):
+        steps.append("тарифы ✓")
+    return " → ".join(steps) if steps else "регистрация ✓"
+
+
+def format_feed_user_registered(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    source = _feed_source_label(event)
+    return (
+        f"Новая конверсия — TruePost\n\n"
+        f"{user_key} из {source} зарегистрировался.\n\n"
+        f"Путь:\nрегистрация ✓\n\n"
+        f"Ждём:\nсоздаст ли канал.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_channel_created(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    return (
+        f"Путь обновился — TruePost\n\n"
+        f"{user_key} создал канал.\n\n"
+        f"Путь:\nрегистрация ✓ → канал ✓\n\n"
+        f"Ждём:\nоценит ли первый пост и дойдёт ли до тарифов.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_first_post_feedback_bad(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    reason = (event.get("journey_snapshot") or {}).get("first_post_feedback_reason") or "не указана"
+    return (
+        f"Первый пост не подошёл — TruePost\n\n"
+        f"{user_key} оценил первый пост: не подошёл.\n\n"
+        f"Причина:\n{reason}\n\n"
+        f"Что это значит:\n"
+        f"этот путь пока упирается в первый результат, не в оплату.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_first_post_feedback_good(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    return (
+        f"Первый пост подошёл — TruePost\n\n"
+        f"{user_key} оценил первый пост: подходит.\n\n"
+        f"Что это значит:\n"
+        f"качество первого результата по этому пути не выглядит блокером. "
+        f"Смотрим, дойдёт ли до тарифов.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_pricing_viewed(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    snapshot = event.get("journey_snapshot") or {}
+    path = _feed_path_lines(snapshot)
+    return (
+        f"Коммерческий сигнал — TruePost\n\n"
+        f"{user_key} открыл тарифы.\n\n"
+        f"Путь:\n{path}\n\n"
+        f"Ждём:\nнажмёт ли оплату.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_payment_started(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    return (
+        f"Важный сигнал — TruePost\n\n"
+        f"{user_key} начал оплату.\n\n"
+        f"Что это значит:\n"
+        f"появился реальный платёжный интерес. "
+        f"Если не завершит — проверяем платёжный путь.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_payment_success(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    return (
+        f"Оплата — TruePost\n\n"
+        f"{user_key} оплатил.\n\n"
+        f"Что это значит:\n"
+        f"получен коммерческий proof. Нужно смотреть источник и повторяемость.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_payment_failed(event: dict) -> str:
+    user_key = event.get("user_key", "unknown")
+    return (
+        f"Внимание — TruePost\n\n"
+        f"У {user_key} не получилось оплатить.\n\n"
+        f"Что это значит:\n"
+        f"стоит проверить платёжный шлюз — /pay.\n\n"
+        f"Доска: /board"
+    )
+
+
+def format_feed_stuck_tariff_screen(user_key: str, minutes: int) -> str:
+    return (
+        f"Пользователь застрял — TruePost\n\n"
+        f"{user_key} открыл тарифы {minutes}+ минут назад, но оплату не начал.\n\n"
+        f"Что это значит:\n"
+        f"если таких будет 5+, проверяем тарифный экран.\n\n"
+        f"Доска: /board"
+    )
+
+
+_FEED_FORMATTERS = {
+    "user_registered": format_feed_user_registered,
+    "channel_created": format_feed_channel_created,
+    "first_post_feedback_bad": format_feed_first_post_feedback_bad,
+    "first_post_feedback_good": format_feed_first_post_feedback_good,
+    "pricing_viewed": format_feed_pricing_viewed,
+    "payment_started": format_feed_payment_started,
+    "payment_success": format_feed_payment_success,
+    "payment_failed": format_feed_payment_failed,
+}
+
+
+def format_feed_event(event: dict) -> str | None:
+    """Форматирует одно discrete-событие. None если тип не поддерживается (не должно случаться)."""
+    formatter = _FEED_FORMATTERS.get(event.get("event_type"))
+    if formatter is None:
+        return None
+    return formatter(event)
+
+
+def format_feed_digest(events: list[dict]) -> str:
+    """Дайджест вместо потока отдельных сообщений (>FOUNDER_FEED_DIGEST_THRESHOLD за цикл)."""
+    by_type: dict[str, int] = {}
+    for e in events:
+        et = e.get("event_type", "unknown")
+        by_type[et] = by_type.get(et, 0) + 1
+
+    parts = []
+    labels = {
+        "user_registered": "регистраций", "channel_created": "каналов",
+        "first_post_feedback_good": "хороших отзывов", "first_post_feedback_bad": "плохих отзывов",
+        "pricing_viewed": "открытий тарифов", "payment_started": "попыток оплаты",
+        "payment_success": "успешных оплат", "payment_failed": "неуспешных оплат",
+    }
+    for event_type, count in by_type.items():
+        label = labels.get(event_type, event_type)
+        parts.append(f"{count} {label}")
+
+    summary = ", ".join(parts) if parts else "новых событий"
+    return f"Активность пользователей — TruePost\n\nЗа последний цикл: {summary}.\n\nДоска: /board"
+
+
+def detect_stuck_events(journeys: list[dict]) -> list[tuple[str, str, int]]:
+    """
+    Определяет застрявшие пути среди journeys (snapshot list, не discrete events).
+    Возвращает список (user_key, pricing_viewed_at, minutes) для тех, кто
+    >=STUCK_TARIFF_SCREEN_MINUTES на тарифном экране без payment_started.
+    """
+    results = []
+    for j in journeys:
+        if j.get("pricing_viewed_at") and not j.get("payment_started_at"):
+            minutes = int(j.get("minutes_since_last_step") or 0)
+            if minutes >= STUCK_TARIFF_SCREEN_MINUTES:
+                results.append((j.get("user_key", "unknown"), j.get("pricing_viewed_at"), minutes))
+    return results
