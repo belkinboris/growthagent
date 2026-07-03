@@ -2176,11 +2176,11 @@ class TestStartCommand:
         assert result.returncode == 1, f"Слово 'штаб' найдено: {result.stdout}"
 
     def test_start_function_source_has_required_commands(self):
-        """Текст функции cmd_start содержит owner-facing команды (/run теперь в /help)."""
+        """Текст функции cmd_start содержит /board как главную команду + детали."""
         import inspect
         from app.telegram_bot import cmd_start
         src = inspect.getsource(cmd_start)
-        for cmd in ["/today", "/funnel", "/experiments", "/pay", "/ads", "/status", "/help"]:
+        for cmd in ["/board", "/journeys", "/checks", "/funnel", "/pay", "/ads", "/status", "/help"]:
             assert cmd in src, f"{cmd} не найден в /start"
 
     def test_start_is_short(self):
@@ -2268,23 +2268,23 @@ class TestProgressBarHelper:
 class TestStartHelpTwoLevel:
 
     def test_start_short_owner_facing_list(self):
-        """/start показывает короткий owner-facing список (не все 18 команд)."""
+        """/start показывает короткий owner-facing список с /board как главной."""
         import inspect
         from app.telegram_bot import cmd_start
         src = inspect.getsource(cmd_start)
         # Owner-facing команды есть
-        for cmd in ["/today", "/funnel", "/experiments", "/pay", "/ads", "/status"]:
+        for cmd in ["/board", "/journeys", "/checks", "/funnel", "/pay", "/ads", "/status"]:
             assert cmd in src
         # Технических нет напрямую (только ссылка на /help)
         for tech_cmd in ["/test_metrika", "/test_direct", "/mode", "/settings", "/deep_direct"]:
             assert tech_cmd not in src, f"{tech_cmd} не должен быть в /start"
 
     def test_start_contains_today_and_experiments(self):
+        """/start содержит /board как главную команду (задача P0 board refactor)."""
         import inspect
         from app.telegram_bot import cmd_start
         src = inspect.getsource(cmd_start)
-        assert "/today" in src
-        assert "/experiments" in src
+        assert "/board" in src
 
     def test_start_does_not_show_all_technical_commands(self):
         import inspect
@@ -2867,3 +2867,451 @@ class TestOldDeltaNotificationsStillWork:
         deltas = [StepDelta("user_registered", 5, 35, 30)]
         batch = build_notification_batch(deltas)
         assert batch.is_digest is False
+
+
+# ---------------------------------------------------------------------------
+# /board refactor — board/journeys/checks/pay/ads structure
+# ---------------------------------------------------------------------------
+
+class TestBoardReport:
+
+    def _m(self, **kw):
+        from app.rules import NormalizedMetrics
+        d = dict(period_key="7d", signup=15, activation_1=12, activation_2=40,
+            payment_started=0, payment_success=0, spend=3000, clicks=300, sources_ok=set())
+        d.update(kw)
+        return NormalizedMetrics(**d)
+
+    def test_board_has_large_status(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert "РЕШЕНИЕ" in text
+
+    def test_board_has_week_section(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert "НЕДЕЛЯ" in text
+        assert "Регистрации" in text
+        assert "Отзывы" in text
+        assert "Тарифы" in text
+        assert "Оплаты" in text
+
+    def test_board_has_focus_section(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert "ФОКУС" in text
+
+    def test_board_has_today_section(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert "СЕГОДНЯ" in text
+
+    def test_board_has_do_not_touch(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert "НЕ МЕНЯТЬ" in text
+
+    def test_board_no_raw_post_generations(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m(activation_2=500))
+        assert "500" not in text
+        assert "генерир" not in text.lower()
+
+    def test_board_is_compact(self):
+        """/board укладывается в разумный объём (не длинный отчёт)."""
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m())
+        assert len(text) < 1200, f"/board слишком длинный: {len(text)} символов"
+
+    def test_board_decision_waiting_for_data(self):
+        from app.commercial_report import build_board_report
+        text = build_board_report("TruePost", self._m(signup=3, activation_1=2))
+        assert "ЖДЁМ ДАННЫЕ" in text
+
+    def test_board_decision_scale_when_paid(self):
+        from app.commercial_report import build_board_report
+        m = self._m(signup=50, activation_1=40, payment_success=3)
+        text = build_board_report("TruePost", m, payment_path={"payment_success": 3, "payment_started": 5})
+        assert "МАСШТАБИРУЕМ" in text
+
+
+class TestTodayEqualsBoard:
+
+    def test_today_is_alias_of_board(self):
+        from app.telegram_bot import cmd_today, cmd_board
+        assert cmd_today is cmd_board
+
+
+class TestJourneysNotDuplicatingFunnel:
+
+    def test_journeys_shows_individual_paths_not_aggregates(self):
+        from app.commercial_report import build_journeys_report
+        journeys = [
+            {"user_key": "u_1", "source": "telegram_ads", "channel_created_at": "T",
+             "pricing_viewed_at": None, "payment_started_at": None, "payment_success_at": None,
+             "first_post_feedback": None, "minutes_since_last_step": 0},
+        ]
+        text = build_journeys_report("TruePost", journeys)
+        assert "u_1" in text
+        assert "Последние пути" in text
+        # Не должно быть длинных % конверсии как в /funnel
+        assert "% из кликов" not in text
+        assert "% из регистраций" not in text
+
+    def test_journeys_empty_honest_message(self):
+        from app.commercial_report import build_journeys_report
+        text = build_journeys_report("TruePost", None)
+        assert "недоступны" in text.lower()
+
+
+class TestChecksReport:
+
+    def test_checks_has_decision_rules(self):
+        from app.commercial_report import build_checks_report
+        text = build_checks_report("TruePost")
+        assert "Правило решения" in text
+
+    def test_checks_does_not_duplicate_board(self):
+        """/checks не показывает НЕДЕЛЯ/ФОКУС/СЕГОДНЯ (это /board)."""
+        from app.commercial_report import build_checks_report
+        text = build_checks_report("TruePost")
+        assert "НЕДЕЛЯ" not in text
+        assert "СЕГОДНЯ делать" not in text
+        assert "сегодня делать" not in text.lower()
+
+    def test_experiments_is_alias_of_checks(self):
+        from app.telegram_bot import cmd_experiments, cmd_checks
+        assert cmd_experiments is cmd_checks
+
+
+class TestFunnelConversionNotLongRecommendations:
+
+    def test_funnel_has_conversion_steps(self):
+        from app.commercial_report import build_funnel_report
+        m = self._m() if hasattr(self, "_m") else None
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=15, activation_1=12, activation_2=40,
+            payment_started=0, payment_success=0, spend=3000, clicks=300, sources_ok=set())
+        text = build_funnel_report("TruePost", m)
+        assert "%" in text  # конверсия по шагам
+
+    def test_funnel_no_raw_post_generations(self):
+        from app.rules import NormalizedMetrics
+        from app.commercial_report import build_funnel_report
+        m = NormalizedMetrics(period_key="7d", signup=15, activation_1=12, activation_2=500,
+            payment_started=0, payment_success=0, spend=3000, clicks=300, sources_ok=set())
+        text = build_funnel_report("TruePost", m)
+        assert "500" not in text
+
+
+class TestPayDoesNotDiscussAdsOrOnboarding:
+
+    def test_pay_no_ads_terms(self):
+        from app.commercial_report import build_pay_report
+        text = build_pay_report("TruePost", payment_path={"pricing_viewed": 5, "payment_started": 1})
+        for term in ["Директ", "Telegram Ads", "CPA", "клик"]:
+            assert term.lower() not in text.lower()
+
+    def test_pay_no_onboarding_terms(self):
+        from app.commercial_report import build_pay_report
+        text = build_pay_report("TruePost", payment_path={"pricing_viewed": 5})
+        assert "onboarding" not in text.lower()
+        assert "онбординг" not in text.lower()
+
+
+class TestAdsDoesNotDiscussPaymentPathDeeply:
+
+    def test_ads_no_deep_payment_discussion(self):
+        from app.commercial_report import build_ads_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=15, activation_1=12, activation_2=40,
+            payment_started=2, payment_success=1, spend=3000, clicks=300, sources_ok=set())
+        text = build_ads_report("TruePost", metrics=m)
+        # Не должно углубляться в YooKassa/платёжный шлюз
+        assert "YooKassa" not in text
+        assert "платёжный шлюз" not in text.lower()
+
+
+class TestAlertsCommand:
+
+    def test_alerts_status_no_args(self):
+        import inspect
+        from app.telegram_bot import cmd_alerts
+        src = inspect.getsource(cmd_alerts)
+        assert "Режим" in src
+
+    def test_live_is_alias_of_alerts(self):
+        from app.telegram_bot import cmd_alerts, cmd_live
+        assert cmd_live is cmd_alerts
+
+
+class TestStatusOnlyHealth:
+
+    def test_status_function_no_business_terms(self):
+        """/status не должен обсуждать регистрации/тарифы (бизнес-метрики)."""
+        import inspect
+        from app.telegram_bot import cmd_status
+        src = inspect.getsource(cmd_status)
+        # cmd_status может ссылаться на другие health-related вещи, но не
+        # должен строить бизнес-отчёт с тарифами/оплатами
+        assert "payment_success" not in src
+        assert "pricing_viewed" not in src
+
+
+class TestHelpTwoLevelStructure:
+
+    def test_help_has_aliases_section(self):
+        import inspect
+        from app.telegram_bot import cmd_help
+        src = inspect.getsource(cmd_help)
+        assert "Aliases" in src or "aliases" in src.lower()
+        assert "/today = /board" in src or "/today" in src
+        assert "/experiments = /checks" in src or "/experiments" in src
+        assert "/live = /alerts" in src or "/live" in src
+
+    def test_help_has_technical_section_with_run(self):
+        import inspect
+        from app.telegram_bot import cmd_help
+        src = inspect.getsource(cmd_help)
+        assert "/run" in src
+        assert "/mode" in src
+        assert "/settings" in src
+
+
+class TestNoShtabAnywhereBoardRefactor:
+
+    def test_no_shtab_in_board_checks_journeys(self):
+        from app.commercial_report import build_board_report, build_checks_report, build_journeys_report
+        from app.rules import NormalizedMetrics
+        m = NormalizedMetrics(period_key="7d", signup=15, activation_1=12, activation_2=40,
+            payment_started=0, payment_success=0, spend=3000, clicks=300, sources_ok=set())
+        for text in [
+            build_board_report("TruePost", m),
+            build_checks_report("TruePost"),
+            build_journeys_report("TruePost", None),
+        ]:
+            assert "штаб" not in text.lower()
+
+
+class TestTechnicalCommandsStillExist:
+
+    def test_technical_commands_not_removed(self):
+        from app.telegram_bot import (
+            cmd_ping, cmd_build, cmd_mode, cmd_debug,
+            cmd_test_metrika, cmd_test_direct, cmd_deep_direct,
+            cmd_check_landing, cmd_check_onboarding, cmd_settings,
+        )
+        # Просто проверяем что импорт не падает -- функции существуют
+        assert all([
+            cmd_ping, cmd_build, cmd_mode, cmd_debug,
+            cmd_test_metrika, cmd_test_direct, cmd_deep_direct,
+            cmd_check_landing, cmd_check_onboarding, cmd_settings,
+        ])
+
+    def test_run_full_exists(self):
+        from app.telegram_bot import cmd_run_full
+        assert cmd_run_full is not None
+
+
+# ---------------------------------------------------------------------------
+# Founder Live Feed (v2): user-events, smart/founder modes, digest, dedup
+# ---------------------------------------------------------------------------
+
+class TestUserEventsConnector:
+
+    @pytest.mark.asyncio
+    async def test_parses_events_successfully(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.user_events import fetch_user_events
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "ok": True,
+            "events": [
+                {
+                    "event_id": "ev_1", "event_type": "user_registered",
+                    "user_key": "u_x", "source": "yandex_direct",
+                    "created_at": "2026-06-29T10:00:00Z",
+                    "journey_snapshot": {"registered": True, "channel_created": False},
+                },
+            ],
+        }
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_events(base_url="https://example.com", api_token="test")
+
+        assert result["ok"] is True
+        assert len(result["events"]) == 1
+        assert result["events"][0]["event_id"] == "ev_1"
+
+    @pytest.mark.asyncio
+    async def test_ignores_auto_post_created_events(self):
+        """auto_post_created/post_generated события отфильтровываются на уровне connector-а."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.connectors.user_events import fetch_user_events
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "ok": True,
+            "events": [
+                {"event_id": "ev_1", "event_type": "user_registered", "user_key": "u_x"},
+                {"event_id": "ev_2", "event_type": "auto_post_created", "user_key": "u_x"},
+                {"event_id": "ev_3", "event_type": "post_generated", "user_key": "u_x"},
+            ],
+        }
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_user_events(base_url="https://example.com", api_token="test")
+
+        assert result["ok"] is True
+        assert len(result["events"]) == 1
+        assert result["events"][0]["event_id"] == "ev_1"
+
+    @pytest.mark.asyncio
+    async def test_not_configured(self):
+        from app.connectors.user_events import fetch_user_events
+        result = await fetch_user_events(base_url=None, api_token=None)
+        assert result["ok"] is False
+        assert result["status"] == "not_configured"
+
+
+class TestFounderModeVsSmartMode:
+
+    def test_smart_mode_skips_plain_registration(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("user_registered", "smart") is False
+
+    def test_smart_mode_sends_bad_feedback(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("first_post_feedback_bad", "smart") is True
+
+    def test_smart_mode_sends_pricing_viewed(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("pricing_viewed", "smart") is True
+
+    def test_smart_mode_sends_payment_events(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("payment_started", "smart") is True
+        assert should_notify_event("payment_success", "smart") is True
+
+    def test_founder_mode_sends_registration(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("user_registered", "founder") is True
+
+    def test_founder_mode_sends_channel_created(self):
+        from app.notifications import should_notify_event
+        assert should_notify_event("channel_created", "founder") is True
+
+    def test_off_mode_sends_nothing(self):
+        from app.notifications import should_notify_event
+        for event_type in ["user_registered", "pricing_viewed", "payment_success"]:
+            assert should_notify_event(event_type, "off") is False
+
+
+class TestFeedNoRawPostGenerations:
+
+    def test_no_raw_post_generations_event_types_in_founder_set(self):
+        from app.notifications import FOUNDER_MODE_EVENT_TYPES, SMART_MODE_EVENT_TYPES
+        for bad in ["post_generated", "auto_post_created", "post_generations"]:
+            assert bad not in FOUNDER_MODE_EVENT_TYPES
+            assert bad not in SMART_MODE_EVENT_TYPES
+
+    def test_ignored_event_types_in_connector(self):
+        from app.connectors.user_events import _IGNORED_EVENT_TYPES
+        assert "post_generated" in _IGNORED_EVENT_TYPES
+        assert "auto_post_created" in _IGNORED_EVENT_TYPES
+
+
+class TestFeedFormatting:
+
+    def test_pricing_viewed_has_user_key_and_path(self):
+        from app.notifications import format_feed_pricing_viewed
+        event = {
+            "user_key": "u_febdae54", "source": "telegram_ads",
+            "journey_snapshot": {"registered": True, "channel_created": True, "pricing_viewed": True},
+        }
+        text = format_feed_pricing_viewed(event)
+        assert "u_febdae54" in text
+        assert "Путь:" in text
+        assert "Доска: /board" in text
+
+    def test_payment_started_has_user_key(self):
+        from app.notifications import format_feed_payment_started
+        text = format_feed_payment_started({"user_key": "u_x"})
+        assert "u_x" in text
+        assert "начал оплату" in text
+
+    def test_registration_formatted(self):
+        from app.notifications import format_feed_user_registered
+        event = {"user_key": "u_x", "source": "yandex_direct"}
+        text = format_feed_user_registered(event)
+        assert "u_x" in text
+        assert "Яндекс.Директ" in text
+
+
+class TestFeedStuckAfter45Minutes:
+
+    def test_stuck_not_before_45(self):
+        from app.notifications import detect_stuck_events
+        journeys = [{"user_key": "u_x", "pricing_viewed_at": "T", "payment_started_at": None,
+                     "minutes_since_last_step": 30}]
+        result = detect_stuck_events(journeys)
+        assert result == []
+
+    def test_stuck_at_45_plus(self):
+        from app.notifications import detect_stuck_events
+        journeys = [{"user_key": "u_x", "pricing_viewed_at": "T", "payment_started_at": None,
+                     "minutes_since_last_step": 45}]
+        result = detect_stuck_events(journeys)
+        assert len(result) == 1
+        assert result[0][0] == "u_x"
+        assert result[0][2] == 45
+
+
+class TestFeedDedup:
+
+    def test_event_key_format(self):
+        from app.notifications import build_user_event_key
+        assert build_user_event_key("ev_123") == "user_event:ev_123"
+
+    def test_stuck_event_key_format(self):
+        from app.notifications import build_stuck_event_key
+        key = build_stuck_event_key("u_x", "tariff_screen", "T1")
+        assert key == "stuck:u_x:tariff_screen:T1"
+
+    def test_dedup_same_event_id_same_key(self):
+        from app.notifications import build_user_event_key
+        k1 = build_user_event_key("ev_1")
+        k2 = build_user_event_key("ev_1")
+        assert k1 == k2
+
+
+class TestFeedDigestOver10Events:
+
+    def test_digest_triggered_over_threshold(self):
+        from app.notifications import format_feed_digest, FOUNDER_FEED_DIGEST_THRESHOLD
+        events = [{"event_type": "user_registered", "event_id": f"ev_{i}"} for i in range(FOUNDER_FEED_DIGEST_THRESHOLD + 1)]
+        text = format_feed_digest(events)
+        assert "регистраций" in text
+        assert str(FOUNDER_FEED_DIGEST_THRESHOLD + 1) in text
+
+    def test_digest_mixed_event_types(self):
+        from app.notifications import format_feed_digest
+        events = [
+            {"event_type": "user_registered", "event_id": "1"},
+            {"event_type": "user_registered", "event_id": "2"},
+            {"event_type": "pricing_viewed", "event_id": "3"},
+        ]
+        text = format_feed_digest(events)
+        assert "2 регистраций" in text
+        assert "1 открытий тарифов" in text
