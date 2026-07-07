@@ -357,3 +357,36 @@ class TestSendDailyBoard:
             cached = get_cached_diagnostics(
                 session, project_id, f"{DAILY_COUNTERS_KEY_PREFIX}{day}")
             assert cached is not None, "точка динамики должна сохраняться каждый день"
+
+
+# ---------------------------------------------------------------------------
+# Мост «очередь на неделю» в /funnel (queue_offer_shown/clicked)
+# ---------------------------------------------------------------------------
+
+class TestQueueOfferInFunnel:
+
+    def _signals(self, **pp):
+        from app.commercial_report import _format_new_product_signals as build_new_signals_block
+        return build_new_signals_block(pp)
+
+    def test_queue_counts_rendered(self):
+        text = self._signals(first_post_feedback_good=4, first_post_feedback_bad=9,
+                             queue_offer_shown=3, queue_offer_clicked=1)
+        assert "Мост «очередь на неделю»: показан 3, кликнули 1" in text
+
+    def test_warns_when_good_but_no_shows(self):
+        text = self._signals(first_post_feedback_good=4, queue_offer_shown=0, queue_offer_clicked=0)
+        assert "проверить кэш фронтенда" in text
+
+    def test_no_warn_when_shows_present(self):
+        text = self._signals(first_post_feedback_good=4, queue_offer_shown=2, queue_offer_clicked=0)
+        assert "проверить кэш" not in text
+
+    def test_absent_fields_no_queue_line(self):
+        text = self._signals(first_post_feedback_good=4, first_post_feedback_bad=9)
+        assert "Мост" not in text
+
+    def test_connector_accepts_fields(self):
+        from app.connectors.payment_path import _EXPECTED_FIELDS
+        assert "queue_offer_shown" in _EXPECTED_FIELDS
+        assert "queue_offer_clicked" in _EXPECTED_FIELDS

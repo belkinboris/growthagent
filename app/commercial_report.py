@@ -520,13 +520,16 @@ def _format_new_product_signals(payment_path: dict | None, skip_feedback_summary
     fb_reasons = payment_path.get("first_post_feedback_reasons")    # dict | None
     gen_verified = payment_path.get("post_generations_verified")    # int | None
     gen_unverified = payment_path.get("post_generations_unverified") # int | None
+    queue_shown = payment_path.get("queue_offer_shown")              # int | None
+    queue_clicked = payment_path.get("queue_offer_clicked")          # int | None
 
     # Определяем есть ли хоть что-то новое
     has_choice = bool(choice_counts)
     has_feedback = fb_good is not None or fb_bad is not None
     has_gen_breakdown = gen_verified is not None or gen_unverified is not None
+    has_queue = queue_shown is not None or queue_clicked is not None
 
-    if not has_choice and not has_feedback and not has_gen_breakdown:
+    if not has_choice and not has_feedback and not has_gen_breakdown and not has_queue:
         return "\nНовые сигналы ещё не накопились после деплоя."
 
     lines = ["\nНовые сигналы:"]
@@ -580,6 +583,16 @@ def _format_new_product_signals(payment_path: dict | None, skip_feedback_summary
                 lines.extend(reasons_lines)
 
     # Breakdown верифицированные/неверифицированные каналы
+    # Мост к тарифам: показы и клики блока «Собрать очередь на неделю».
+    # good-отзывов может быть больше показов (кэш старого фронта, регенерации),
+    # поэтому показываем сырые счётчики без вычисления доли от good.
+    if has_queue:
+        shown_n = _n(queue_shown)
+        clicked_n = _n(queue_clicked)
+        lines.append(f"— Мост «очередь на неделю»: показан {shown_n}, кликнули {clicked_n}")
+        if shown_n == 0 and _n(fb_good) > 0:
+            lines.append("  (good-отзывы есть, показов моста нет — проверить кэш фронтенда)")
+
     if has_gen_breakdown:
         if gen_verified is not None:
             lines.append(f"— Генерации у подключённых каналов: {_n(gen_verified)}")

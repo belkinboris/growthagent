@@ -70,6 +70,9 @@ _EXPECTED_FIELDS = [
     "post_generations_unverified",  # int — генерации у неподключённых каналов
     # Source breakdown (новые, 2026-06-29) — разбивка по traffic source
     "source_breakdown",   # dict: {"yandex_direct": {...}, "telegram_ads": {...}, "unknown": {...}}
+    # Мост к тарифам «очередь на неделю» (новые, 2026-07-07)
+    "queue_offer_shown",    # int — сколько раз блок показан после good feedback
+    "queue_offer_clicked",  # int — сколько раз нажали «Собрать очередь»
 ]
 
 _FIELD_ALIASES: dict[str, list[str]] = {
