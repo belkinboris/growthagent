@@ -101,6 +101,15 @@ def build_context(session, project) -> str:
         if running is not None:
             progress = growth_loop.experiment_progress(running, pp_dict)
             parts.append("АКТИВНЫЙ ЭКСПЕРИМЕНТ:\n" + build_experiment_block(running, progress))
+            # Легенда семантики — без неё LLM путает «10 отзывов» с «10 хороших»
+            # и счётчик эксперимента с сырыми числами за 7 дней.
+            parts.append(
+                "КАК ЧИТАТЬ ЭКСПЕРИМЕНТ: прогресс N/M — это НОВЫЕ события выборки "
+                f"({running.sample_metric}) с момента старта эксперимента, любые, не только успешные. "
+                f"Вердикт выносится автоматически по ДОЛЕ {running.primary_metric} среди этих новых "
+                "событий против baseline. СЫРЫЕ ЧИСЛА ниже — за 7 дней целиком и включают "
+                "события ДО старта эксперимента; не смешивать со счётчиком прогресса."
+            )
         rec = growth_loop.get_active_recommendation(session, project.id)
         if rec is not None:
             parts.append("ЖДЁТ РЕШЕНИЯ ВЛАДЕЛЬЦА:\n" + build_recommendation_details(rec))
