@@ -133,6 +133,51 @@ def build_context(session, project) -> str:
         if isinstance(sb, dict) and sb:
             parts.append("ПО ИСТОЧНИКАМ: " + str(sb))
 
+    # Расход рекламы: последний combined-снимок 7д (spend/clicks)
+    try:
+        from sqlmodel import select as _select
+        from app.models import MetricSnapshot
+        from app.service import extract_normalized_metrics_from_snapshot
+        snapshot = session.exec(
+            _select(MetricSnapshot)
+            .where(
+                MetricSnapshot.project_id == project.id,
+                MetricSnapshot.period_key == "7d",
+                MetricSnapshot.source == "combined",
+            )
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(1)
+        ).first()
+        if snapshot is not None:
+            raw = extract_normalized_metrics_from_snapshot(snapshot)
+            spend, clicks = raw.get("spend"), raw.get("clicks")
+            if spend is not None or clicks is not None:
+                cpa = None
+                regs = (pp_dict or {}).get("registrations")
+                if spend and regs:
+                    cpa = round(float(spend) / int(regs))
+                parts.append(
+                    f"РЕКЛАМА (7 дней, Яндекс Директ): расход {spend} ₽, кликов {clicks}"
+                    + (f", цена регистрации ≈ {cpa} ₽" if cpa else "")
+                )
+    except Exception:
+        logger.exception("ask: ads spend context failed")
+
+    # Как читать сырые числа (типовые вопросы владельца)
+    parts.append(
+        "КАК ЧИТАТЬ ЦИФРЫ: все сырые числа — за 7 дней. channels_created может "
+        "превышать registrations: каналы создают и пользователи, зарегистрированные "
+        "раньше этого окна. post_generations_* — НЕ действия пользователей (есть "
+        "автогенерация), по ним выводов о вовлечённости не делать."
+    )
+
+    # Факты о проекте (TruePost-specific, живут в playbook)
+    try:
+        from app.truepost_playbook import PROJECT_FACTS
+        parts.append(PROJECT_FACTS)
+    except Exception:
+        logger.exception("ask: project facts failed")
+
     # Динамика по дням
     try:
         history = load_daily_counters_history(session, project.id, days=7)
