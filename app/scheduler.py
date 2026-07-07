@@ -1306,14 +1306,19 @@ async def run_landing_funnel_diagnostics_for_project(
 
 
 async def _send_telegram_notification(settings, text: str) -> bool:
-    """Общий helper отправки уведомления всем admin chat_ids. Не кидает исключений."""
+    """Общий helper отправки уведомления всем admin chat_ids. Не кидает исключений.
+    Пробует HTML (<b>жирный</b>); при ошибке парсинга откатывается к plain."""
+    import re
     import httpx
     api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
+    plain = re.sub(r"</?(b|i|code|u|s)>", "", text)
     ok_any = False
     async with httpx.AsyncClient(timeout=10.0) as client:
         for chat_id in settings.admin_chat_ids_list:
             try:
-                resp = await client.post(api_url, json={"chat_id": chat_id, "text": text})
+                resp = await client.post(api_url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+                if resp.status_code != 200:
+                    resp = await client.post(api_url, json={"chat_id": chat_id, "text": plain})
                 if resp.status_code == 200:
                     ok_any = True
                 else:
@@ -1800,9 +1805,12 @@ async def send_daily_board(
 
     _send/_session_factory/_settings -- инъекция для тестов, в проде None.
     """
+    from app import growth_loop
     from app.commercial_report import (
         build_board_report,
         build_daily_board_message,
+        build_morning_story,
+        experiment_one_liner,
     )
     from app.service import (
         load_daily_counters_history,
@@ -1846,13 +1854,32 @@ async def send_daily_board(
             save_daily_counters(session, project.id, pp_dict, day)
             history = load_daily_counters_history(session, project.id, days=7)
 
+            # Состояние цикла -> строка эксперимента + что нужно от владельца.
+            experiment_line = None
+            owner_action = "ничего — копим данные."
+            running = growth_loop.get_running_experiment(session, project.id)
+            rec = growth_loop.get_active_recommendation(session, project.id)
+            if running is not None:
+                progress = growth_loop.experiment_progress(running, pp_dict)
+                experiment_line = experiment_one_liner(running, progress)
+                owner_action = "ничего — эксперимент копит данные, не менять запертые переменные."
+            elif rec is not None:
+                experiment_line = f"Ждёт твоего решения: «{rec.title}»."
+                owner_action = "открыть /board и нажать Принять / Отклонить."
+            else:
+                last = growth_loop.get_last_finished_experiment(session, project.id)
+                if last is not None and last.ended_at is not None:
+                    experiment_line = f"Последний вердикт: {last.verdict} — «{last.title}»."
+
+            story = build_morning_story(history, experiment_line, owner_action)
             board_text = build_board_report(
                 project.name,
                 None,  # NormalizedMetrics не обязателен: регистрации берём из payment_path
                 payment_path=pp_dict,
                 new_registrations_since_deploy=(pp_dict or {}).get("registrations"),
+                skip_decision=True,  # рассказ выше уже сказал, что происходит
             )
-            text = build_daily_board_message(board_text, history)
+            text = story + "\n\n" + build_daily_board_message(board_text, history)
             project_id = project.id
 
         sent_ok = await send(settings, text)
@@ -1935,7 +1962,7 @@ async def growth_loop_tick_and_notify(
                 already = was_notified(session, project_id, key)
             if not already:
                 text = (
-                    f"ВЕРДИКТ — {finished_payload['verdict']}\n\n"
+                    f"⚖️ <b>ВЕРДИКТ — {finished_payload['verdict']}</b>\n\n"
                     f"{finished_payload['title']}\n\n"
                     f"{finished_payload['summary']}\n\n"
                     f"Следующий шаг: /board"
@@ -1951,7 +1978,7 @@ async def growth_loop_tick_and_notify(
                 already = was_notified(session, project_id, key)
             if not already:
                 text = (
-                    f"НОВОЕ ПРЕДЛОЖЕНИЕ\n\n"
+                    f"💡 <b>НОВОЕ ПРЕДЛОЖЕНИЕ</b>\n\n"
                     f"{rec_payload['title']}\n\n"
                     f"{rec_payload['action']}\n\n"
                     f"Принять/отклонить: /board"

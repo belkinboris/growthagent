@@ -1281,6 +1281,7 @@ def build_board_report(
     new_registrations_target: int = BOARD_WEEK_REGISTRATIONS_TARGET,
     feedback_target: int = BOARD_WEEK_FEEDBACK_TARGET,
     pricing_target: int = BOARD_WEEK_PRICING_TARGET,
+    skip_decision: bool = False,
 ) -> str:
     """
     /board -- компактное табло, единый builder для /board, /today, /run.
@@ -1316,19 +1317,30 @@ def build_board_report(
     )
 
     lines: list[str] = []
-    lines.append(f"Доска — {project_name}")
+    lines.append(f"📊 <b>Доска — {project_name}</b>")
 
-    lines.append("\nРЕШЕНИЕ")
-    lines.append(decision)
-    lines.append(f"\nДо решения:\n{missing}")
+    # skip_decision=True: состояние цикла (рекомендация/эксперимент/вердикт)
+    # уже показано выше блоком Growth Loop -- РЕШЕНИЕ/ФОКУС/СЕГОДНЯ из
+    # легаси-логики убираем, чтобы на доске не было двух противоречащих
+    # мозгов ("ЧИНИМ ТАРИФНЫЙ ЭКРАН" под "ЭКСПЕРИМЕНТ: чиним первый пост").
+    if not skip_decision:
+        lines.append("\n<b>РЕШЕНИЕ</b>")
+        lines.append(decision)
+        lines.append(f"\nДо решения:\n{missing}")
 
-    lines.append("\nНЕДЕЛЯ")
+    lines.append("\n<b>НЕДЕЛЯ</b>")
     lines.append(f"Регистрации   {reg_count} / {new_registrations_target}   {progress_bar(reg_count, new_registrations_target)}")
     lines.append(f"Отзывы        {total_feedback} / {feedback_target}   {progress_bar(total_feedback, feedback_target)}")
     lines.append(f"Тарифы        {pricing_viewed} / {pricing_target}   {progress_bar(pricing_viewed, pricing_target)}")
     lines.append(f"Оплаты        {pp_success}")
 
-    lines.append("\nФОКУС")
+    if skip_decision:
+        lines.append("\n<b>НЕ МЕНЯТЬ</b> 🔒")
+        lines.append("бюджет, ставки, тарифы, цены, лендинг")
+        lines.append("\nДетали: /journeys /checks /funnel /pay /ads")
+        return "\n".join(lines)
+
+    lines.append("\n<b>ФОКУС</b>")
     if decision == "ЧИНИМ ПЕРВЫЙ ПОСТ":
         focus = "первый пост → платный шаг"
     elif decision == "ЧИНИМ ПУТЬ К ТАРИФАМ":
@@ -1343,7 +1355,7 @@ def build_board_report(
         focus = "сбор данных"
     lines.append(focus)
 
-    lines.append("\nСЕГОДНЯ")
+    lines.append("\n<b>СЕГОДНЯ</b>")
     if decision == "ЖДЁМ ДАННЫЕ":
         today_action = "смотреть новых пользователей, ждать данные проверки"
     elif decision == "ЧИНИМ ПЕРВЫЙ ПОСТ":
@@ -1569,7 +1581,7 @@ def build_dynamics_block(history: list[dict]) -> str:
     Меньше 2 точек -- честно говорим, что динамика копится, не рисуем
     график из одной точки.
     """
-    lines = ["ДИНАМИКА (неделя, по дням)"]
+    lines = ["📈 <b>ДИНАМИКА</b> (неделя, по дням)"]
     if len(history) < 2:
         lines.append("Появится после 2 дней наблюдений.")
         return "\n".join(lines)
@@ -1609,8 +1621,8 @@ def build_recommendation_block(rec) -> str:
     не менять. Детали (полный change set) -- по кнопке «Данные».
     """
     lines = [
-        "РЕШЕНИЕ",
-        "ПРЕДЛАГАЮ ЭКСПЕРИМЕНТ",
+        "<b>РЕШЕНИЕ</b>",
+        "💡 <b>ПРЕДЛАГАЮ ЭКСПЕРИМЕНТ</b>",
         "",
         rec.title,
         "",
@@ -1656,7 +1668,7 @@ def _fmt_rate(rate) -> str:
 def build_experiment_block(exp, progress: dict) -> str:
     """Состояние 3: ЭКСПЕРИМЕНТ ИДЁТ. Прогресс + текущий результат + не менять."""
     lines = [
-        "ЭКСПЕРИМЕНТ ИДЁТ",
+        "🧪 <b>ЭКСПЕРИМЕНТ ИДЁТ</b>",
         "",
         exp.title,
         "",
@@ -1679,7 +1691,7 @@ def build_experiment_block(exp, progress: dict) -> str:
 def build_verdict_block(exp) -> str:
     """Состояние 4: ВЕРДИКТ завершённого эксперимента."""
     lines = [
-        "ВЕРДИКТ",
+        "⚖️ <b>ВЕРДИКТ</b>",
         exp.verdict or "—",
         "",
         exp.title,
@@ -1715,3 +1727,70 @@ def build_recommendation_why(rec) -> str:
     if not (rec.evidence_json or []):
         lines.append("Доказательства не заполнены.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Утренний рассказ: 6-8 человеческих строк вместо приборной панели
+# ---------------------------------------------------------------------------
+
+def _delta_phrase(history: list[dict], key: str, word: str) -> str | None:
+    """«+2 регистрации» из разницы двух последних дневных точек."""
+    if len(history) < 2:
+        return None
+    prev, cur = history[-2].get(key), history[-1].get(key)
+    if prev is None or cur is None:
+        return None
+    d = int(cur) - int(prev)
+    if d <= 0:
+        return None
+    return f"+{d} {word}"
+
+
+def build_morning_story(
+    history: list[dict],
+    experiment_line: str | None,
+    owner_action: str,
+) -> str:
+    """
+    Верх утренней сводки: что произошло за сутки (дельты дневных точек),
+    где эксперимент, и ГЛАВНАЯ строка -- что нужно от владельца.
+    Без блоков и прогресс-баров: их место на /board.
+    """
+    lines = ["☀️ <b>Доброе утро.</b>"]
+
+    deltas = [p for p in (
+        _delta_phrase(history, "registrations", "регистрации"),
+        _delta_phrase(history, "feedback_total", "отзыва"),
+        _delta_phrase(history, "pricing_viewed", "открытия тарифов"),
+        _delta_phrase(history, "payment_success", "ОПЛАТЫ"),
+    ) if p]
+    if deltas:
+        lines.append("За сутки: " + ", ".join(deltas) + ".")
+    else:
+        lines.append("За сутки новых событий не было — при 1–3 регистрациях в день это нормально.")
+
+    if experiment_line:
+        lines.append(experiment_line)
+
+    lines.append("")
+    lines.append(f"👉 <b>От тебя сегодня:</b> {owner_action}")
+    return "\n".join(lines)
+
+
+def experiment_one_liner(exp, progress: dict) -> str:
+    """«Эксперимент „X“: 4/10 отзывов, пока 50% good против 25% — предварительный сигнал.»"""
+    base = _fmt_rate(progress.get("baseline_rate"))
+    cur_rate = progress.get("current_rate")
+    cur = _fmt_rate(cur_rate)
+    n = progress.get("current_sample", 0)
+    tail = ""
+    if cur_rate is not None:
+        d = progress.get("delta_metric", 0)
+        if d >= 3:
+            tail = " — предварительный сигнал"
+        elif d >= 1:
+            tail = " — единичные события, выводов не делаем"
+    return (
+        f"Эксперимент «{exp.title}»: {n}/{exp.target_sample} ({_metric_ru(exp.sample_metric)}), "
+        f"{_metric_ru(exp.primary_metric)} {base} → {cur}{tail}."
+    )

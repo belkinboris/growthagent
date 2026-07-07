@@ -390,3 +390,88 @@ class TestQueueOfferInFunnel:
         from app.connectors.payment_path import _EXPECTED_FIELDS
         assert "queue_offer_shown" in _EXPECTED_FIELDS
         assert "queue_offer_clicked" in _EXPECTED_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Утренний рассказ и один мозг на доске
+# ---------------------------------------------------------------------------
+
+class TestMorningStory:
+
+    def test_story_with_deltas_and_action(self):
+        from app.commercial_report import build_morning_story
+        history = [
+            {"registrations": 16, "feedback_total": 12, "pricing_viewed": 5, "payment_success": 0},
+            {"registrations": 19, "feedback_total": 14, "pricing_viewed": 6, "payment_success": 0},
+        ]
+        text = build_morning_story(history, "Эксперимент «X»: 2/10.", "ничего — копим данные.")
+        assert "За сутки: +3 регистрации, +2 отзыва, +1 открытия тарифов." in text
+        assert "Эксперимент «X»" in text
+        assert "От тебя сегодня:</b> ничего" in text
+
+    def test_story_quiet_day(self):
+        from app.commercial_report import build_morning_story
+        history = [
+            {"registrations": 16, "feedback_total": 12, "pricing_viewed": 5, "payment_success": 0},
+            {"registrations": 16, "feedback_total": 12, "pricing_viewed": 5, "payment_success": 0},
+        ]
+        text = build_morning_story(history, None, "ничего.")
+        assert "новых событий не было" in text
+        assert "это нормально" in text
+
+    def test_experiment_one_liner_honest_on_small_n(self):
+        from app.commercial_report import experiment_one_liner
+        f = _make_session_factory()
+        from app.models import GrowthExperiment
+        exp = GrowthExperiment(
+            project_id=1, recommendation_id=1, title="Чиним качество первого поста",
+            area="first_post", primary_metric="first_post_feedback_good",
+            sample_metric="first_post_feedback_total", target_sample=10,
+        )
+        line = experiment_one_liner(exp, {"current_sample": 2, "delta_metric": 1,
+                                          "baseline_rate": 0.25, "current_rate": 0.5})
+        assert "2/10" in line and "25% → 50%" in line
+        assert "единичные события" in line
+
+    def test_board_skip_decision_removes_legacy_brain(self):
+        from app.commercial_report import build_board_report
+        pp = dict(registrations=16, first_post_feedback_good=4, first_post_feedback_bad=9,
+                  pricing_viewed=6, payment_started=0, payment_success=0)
+        full = build_board_report("TruePost", None, payment_path=pp,
+                                  new_registrations_since_deploy=16)
+        compact = build_board_report("TruePost", None, payment_path=pp,
+                                     new_registrations_since_deploy=16, skip_decision=True)
+        assert "РЕШЕНИЕ" in full and "СЕГОДНЯ" in full
+        assert "РЕШЕНИЕ" not in compact and "СЕГОДНЯ" not in compact and "ФОКУС" not in compact
+        assert "НЕДЕЛЯ" in compact and "НЕ МЕНЯТЬ" in compact
+
+
+class TestHtmlStyling:
+
+    def test_board_has_bold_and_emoji(self):
+        from app.commercial_report import build_board_report
+        pp = dict(registrations=16, first_post_feedback_good=4, first_post_feedback_bad=9,
+                  pricing_viewed=6, payment_started=0, payment_success=0)
+        text = build_board_report("АвтоПост", None, payment_path=pp, new_registrations_since_deploy=16)
+        assert "📊 <b>Доска — АвтоПост</b>" in text
+        assert "<b>НЕДЕЛЯ</b>" in text
+        # Незакрытых тегов нет
+        assert text.count("<b>") == text.count("</b>")
+
+    def test_gl_blocks_styled_and_balanced(self):
+        from app.commercial_report import build_recommendation_block, build_verdict_block
+        from app.models import GrowthRecommendation, GrowthExperiment
+        rec = GrowthRecommendation(project_id=1, area="x", title="Т", action="Д",
+                                   evidence_json=["e"], locked_variables_json=["цены"])
+        t1 = build_recommendation_block(rec)
+        assert "💡 <b>ПРЕДЛАГАЮ ЭКСПЕРИМЕНТ</b>" in t1
+        exp = GrowthExperiment(project_id=1, recommendation_id=1, title="Т", area="x",
+                               verdict="ЭКСПЕРИМЕНТ ВЫИГРАЛ", result_summary="итог")
+        t2 = build_verdict_block(exp)
+        assert "⚖️ <b>ВЕРДИКТ</b>" in t2
+        for t in (t1, t2):
+            assert t.count("<b>") == t.count("</b>")
+
+    def test_strip_html_tags(self):
+        from app.telegram_bot import _strip_html_tags
+        assert _strip_html_tags("☀️ <b>Доброе утро.</b> <i>x</i>") == "☀️ Доброе утро. x"

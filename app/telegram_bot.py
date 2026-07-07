@@ -62,7 +62,10 @@ async def safe_reply(update_or_message, text: str, **kwargs) -> None:
     """
     # Поддерживаем как update.message, так и объект message напрямую
     msg = getattr(update_or_message, "message", update_or_message)
-    # kwargs без parse_mode — всегда plain text
+    # По умолчанию plain text. html=True -- отправка с parse_mode=HTML
+    # (<b>жирный</b>); при ошибке парсинга Telegram автоматически откатываемся
+    # к plain: сообщение важнее разметки.
+    use_html = bool(kwargs.pop("html", False))
     kwargs.pop("parse_mode", None)
 
     parts: list[str] = []
@@ -85,12 +88,25 @@ async def safe_reply(update_or_message, text: str, **kwargs) -> None:
 
     for i, part in enumerate(parts):
         try:
+            if use_html:
+                try:
+                    await msg.reply_text(part, parse_mode="HTML", **kwargs)
+                    continue
+                except Exception as html_exc:
+                    logger.warning("safe_reply: HTML parse failed, fallback to plain: %s", html_exc)
+                    part = _strip_html_tags(part)
             await msg.reply_text(part, **kwargs)
         except Exception as exc:
             logger.error(
                 "safe_reply: failed to send message part %d/%d: %s: %s",
                 i + 1, len(parts), type(exc).__name__, exc,
             )
+
+
+def _strip_html_tags(text: str) -> str:
+    """Убирает <b>/<i>/<code> при откате к plain text."""
+    import re
+    return re.sub(r"</?(b|i|code|u|s)>", "", text)
 
 
 CONFIDENCE_RU = {
@@ -1634,14 +1650,70 @@ _COMMAND_DISPATCH: dict = {}  # заполняется в register_handlers() н
 
 
 async def on_keyboard_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply keyboard шлёт обычный текст — роутим кнопки на нужные команды."""
+    """Reply keyboard шлёт обычный текст — роутим кнопки на нужные команды.
+    Всё остальное — свободный вопрос владельца, отвечаем через LLM-слой
+    (app/ask.py) с данными проекта в контексте."""
     text = (update.message.text or "").strip() if update.message else ""
     command = _KEYBOARD_BUTTON_TO_COMMAND.get(text)
-    if command is None:
-        return  # не наша кнопка — игнорируем молча
-    handler = _COMMAND_DISPATCH.get(command)
-    if handler:
-        await handler(update, context)
+    if command is not None:
+        handler = _COMMAND_DISPATCH.get(command)
+        if handler:
+            await handler(update, context)
+        return
+
+    if not text:
+        return
+    await _answer_free_question(update, text)
+
+
+async def _answer_free_question(update: Update, question: str) -> None:
+    """
+    Свободный вопрос владельца -> Anthropic API с текущими данными проекта.
+    Только admin chat_ids (вопросы стоят денег). Никогда не роняет бота.
+    """
+    from app import ask
+
+    settings = get_settings()
+
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    if chat_id not in settings.admin_chat_ids_list:
+        return  # молча: не-админам разговорный слой недоступен
+
+    if not ask.is_configured(settings):
+        await safe_reply(
+            update,
+            "Разговорный режим не настроен: добавь ANTHROPIC_API_KEY и "
+            "LLM_PROVIDER=anthropic в переменные окружения. "
+            "Пока — команды: /board /funnel /pay /ads /help",
+        )
+        return
+
+    try:
+        # «печатает...» пока думаем
+        try:
+            await update.effective_chat.send_action("typing")
+        except Exception:
+            pass
+
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is None:
+                await safe_reply(update, "Активный проект не найден.")
+                return
+            context_text = ask.build_context(session, project)
+
+        answer = await ask.answer_question(question, context_text, settings)
+        if answer:
+            await safe_reply(update, answer)
+        else:
+            await safe_reply(
+                update,
+                "Не получилось ответить (ошибка LLM-запроса). "
+                "Данные на месте: /board /funnel /pay. Попробуй ещё раз.",
+            )
+    except Exception:
+        logger.exception("free question failed")
+        await safe_reply(update, "Не получилось обработать вопрос. Команды: /help")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1658,6 +1730,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "Аналитик Воронки помогает вести TruePost к первым оплатам: "
         "показывает, что происходит, какая проверка идёт и что делать дальше.\n\n"
+        "Можно просто написать вопрос обычным текстом — отвечу по данным.\n\n"
         "Главное:\n"
         "/board — главная доска\n\n"
         "Детали:\n"
@@ -1677,34 +1750,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update,
-        "Команды Аналитика Воронки\n\n"
-        "Основные:\n"
-        "— /board\n"
-        "— /journeys\n"
-        "— /checks\n"
-        "— /funnel\n"
-        "— /pay\n"
-        "— /ads\n"
-        "— /alerts\n"
-        "— /daily — утренняя сводка сейчас\n"
-        "— /status\n\n"
-        "Aliases:\n"
-        "— /today = /board\n"
-        "— /experiments = /checks\n"
-        "— /live = /alerts\n\n"
-        "Технические:\n"
-        "— /ping\n"
-        "— /build\n"
-        "— /run\n"
-        "— /run_full\n"
-        "— /mode\n"
-        "— /settings\n"
-        "— /debug\n"
-        "— /test_metrika\n"
-        "— /test_direct\n"
-        "— /deep_direct\n"
-        "— /check_landing\n"
-        "— /check_onboarding",
+        "<b>Команды Аналитика Воронки</b>\n"
+        "(все они есть в меню — кнопка «/» у поля ввода)\n\n"
+        "<b>Каждый день:</b>\n"
+        "/board — 📊 что происходит и что делать; здесь же кнопки Принять/Отклонить\n"
+        "/daily — ☀️ утренняя сводка прямо сейчас\n\n"
+        "<b>Разобраться глубже:</b>\n"
+        "/journeys — 🧭 что делали конкретные пользователи и где застряли\n"
+        "/checks — 🧪 какая проверка идёт, сколько данных до решения\n"
+        "/funnel — 🔽 воронка по шагам: где ломается путь\n"
+        "/pay — 💳 путь к оплате: тарифы → кнопка → оплата\n"
+        "/ads — 📢 реклама: расход и качество источников\n\n"
+        "<b>Реклама глубже:</b>\n"
+        "/deep_direct — 🔍 поисковые запросы Директа: что минусовать, что оставить\n"
+        "/check_landing — 🩺 диагностика лендинга (клики → регистрации)\n"
+        "/check_onboarding — 🩺 диагностика онбординга\n\n"
+        "<b>Настройки и техника:</b>\n"
+        "/alerts — 🔔 live-уведомления: off / smart / founder\n"
+        "/run — 🔄 обновить все данные сейчас\n"
+        "/status — ⚙️ здоровье системы и интеграций\n"
+        "/ping, /build, /debug, /mode, /settings, /test_metrika, /test_direct — техника\n\n"
+        "Aliases: /today = /board, /experiments = /checks, /live = /alerts\n\n"
+        "💬 И можно просто написать вопрос обычным текстом — отвечу по данным.",
+        html=True,
     )
 
 
@@ -2411,10 +2479,13 @@ async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Growth Loop: активная рекомендация / идущий эксперимент / свежий вердикт
         gl_block, gl_markup = _growth_loop_board_state(pp_dict)
 
-        text = build_board_report(project_name, metrics_obj, payment_path=pp_dict)
+        text = build_board_report(
+            project_name, metrics_obj, payment_path=pp_dict,
+            skip_decision=bool(gl_block),
+        )
         if gl_block:
             text = gl_block + "\n\n————————————\n\n" + text
-        await safe_reply(update, text, reply_markup=gl_markup)
+        await safe_reply(update, text, reply_markup=gl_markup, html=True)
     except Exception as exc:
         logger.exception("/board failed: %s: %s", type(exc).__name__, exc)
         await safe_reply(update, "Не удалось сформировать доску. Технические детали: /status")
@@ -3445,7 +3516,35 @@ def build_application() -> Application:
     if not settings.bot_token:
         raise ValueError("BOT_TOKEN not set")
 
-    app = Application.builder().token(settings.bot_token).build()
+    async def _register_command_menu(application) -> None:
+        """
+        Родное меню команд Telegram (кнопка «/» у поля ввода) -- ЕДИНОЕ место,
+        где собраны все команды с русскими описаниями. Технические команды
+        тоже здесь: владелец жаловался, что deep_direct/check_landing
+        «теряются». Ошибка регистрации не мешает старту бота.
+        """
+        from telegram import BotCommand
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("board", "📊 Доска: что происходит и что делать"),
+                BotCommand("daily", "☀️ Утренняя сводка прямо сейчас"),
+                BotCommand("journeys", "🧭 Пути конкретных пользователей"),
+                BotCommand("checks", "🧪 Какая проверка идёт и когда решение"),
+                BotCommand("funnel", "🔽 Воронка: где ломается путь"),
+                BotCommand("pay", "💳 Путь к оплате"),
+                BotCommand("ads", "📢 Реклама и источники"),
+                BotCommand("deep_direct", "🔍 Разбор поисковых запросов Директа"),
+                BotCommand("check_landing", "🩺 Диагностика лендинга"),
+                BotCommand("check_onboarding", "🩺 Диагностика онбординга"),
+                BotCommand("alerts", "🔔 Live-уведомления: off / smart / founder"),
+                BotCommand("run", "🔄 Обновить данные сейчас"),
+                BotCommand("status", "⚙️ Здоровье системы"),
+                BotCommand("help", "📖 Все команды с пояснениями"),
+            ])
+        except Exception:
+            logger.exception("set_my_commands failed (non-fatal)")
+
+    app = Application.builder().token(settings.bot_token).post_init(_register_command_menu).build()
 
     # Заполняем dispatch для reply-keyboard кнопок (объявлен раньше функций,
     # заполняем здесь когда все cmd_* уже определены)
