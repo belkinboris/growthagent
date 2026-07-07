@@ -137,3 +137,57 @@ class TestExperimentLegend:
         assert "КАК ЧИТАТЬ ЭКСПЕРИМЕНТ" in ctx
         assert "не только успешные" in ctx
         assert "ДО старта эксперимента" in ctx
+
+
+class TestContextGapsClosed:
+    """Дыры, найденные прогоном по сценариям владельца 2026-07-07."""
+
+    def _project_with_pp(self, s, pp):
+        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
+        p = Project(name="АвтоПост", type="t", is_active=True)
+        s.add(p); s.commit(); s.refresh(p)
+        save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "t", pp)
+        return p
+
+    def test_ad_spend_in_context(self):
+        from datetime import datetime, timezone
+        from app.models import MetricSnapshot
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            s.add(MetricSnapshot(
+                project_id=p.id, period_key="7d", source="combined",
+                period_start=now, period_end=now,
+                metrics_json={"product": {"signup": 16}, "direct": {"spend": 4124, "clicks": 136}},
+            ))
+            s.commit()
+            ctx = ask.build_context(s, p)
+        assert "расход 4124 ₽" in ctx
+        assert "кликов 136" in ctx
+        assert "цена регистрации ≈ 258 ₽" in ctx
+
+    def test_project_facts_and_price_honesty(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            ctx = ask.build_context(s, p)
+        assert "ФАКТЫ О ПРОЕКТЕ" in ctx
+        assert "актуальных цен в" in ctx and "НЕТ" in ctx  # честность про цены
+        assert "ПАУЗУ" in ctx  # статус Telegram Ads
+
+    def test_how_to_read_numbers(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16, "channels_created": 18})
+            ctx = ask.build_context(s, p)
+        assert "КАК ЧИТАТЬ ЦИФРЫ" in ctx
+        assert "превышать registrations" in ctx
+        assert "автогенерация" in ctx
+
+    def test_context_still_under_limit(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            ctx = ask.build_context(s, p)
+        assert len(ctx) <= ask.MAX_CONTEXT_CHARS
