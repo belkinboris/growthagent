@@ -116,3 +116,24 @@ class TestIsConfigured:
             anthropic_api_key = "sk"
             llm_provider = "none"
         assert ask.is_configured(WrongProvider()) is False
+
+
+class TestExperimentLegend:
+
+    def test_legend_present_when_experiment_running(self):
+        from app.growth_loop import accept_recommendation, propose_if_needed
+        from app.truepost_playbook import truepost_playbook
+        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
+        f = _factory()
+        pp = dict(registrations=20, channels_created=16, first_post_feedback_good=3,
+                  first_post_feedback_bad=9, pricing_viewed=6, payment_started=0, payment_success=0)
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "test", pp)
+            rec = propose_if_needed(s, p.id, pp, truepost_playbook)
+            accept_recommendation(s, rec, pp)
+            ctx = ask.build_context(s, p)
+        assert "КАК ЧИТАТЬ ЭКСПЕРИМЕНТ" in ctx
+        assert "не только успешные" in ctx
+        assert "ДО старта эксперимента" in ctx
