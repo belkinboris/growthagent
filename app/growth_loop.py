@@ -418,11 +418,23 @@ def reject_recommendation(
 # Прогресс и автоматический вердикт
 # ---------------------------------------------------------------------------
 
+# Виртуальные метрики: считаются из payment_path на лету. Нужны, когда
+# правильная выборка эксперимента -- не строка payment_path, а их сумма.
+# Пример: для качества первого поста выборка = ВСЕ новые отзывы (good+bad),
+# а не регистрации -- иначе rate может превышать 100% (отзывы оставляют и
+# старые пользователи, не входящие в новые регистрации).
+def get_metric(pp: dict | None, name: str) -> int:
+    pp = pp or {}
+    if name == "first_post_feedback_total":
+        return _n(pp.get("first_post_feedback_good")) + _n(pp.get("first_post_feedback_bad"))
+    return _n(pp.get(name))
+
+
 def _rate(pp: dict, metric: str, sample_metric: str) -> Optional[float]:
-    sample = _n(pp.get(sample_metric))
+    sample = get_metric(pp, sample_metric)
     if sample <= 0:
         return None
-    return _n(pp.get(metric)) / sample
+    return get_metric(pp, metric) / sample
 
 
 def experiment_progress(exp: GrowthExperiment, payment_path: dict | None) -> dict:
@@ -435,8 +447,8 @@ def experiment_progress(exp: GrowthExperiment, payment_path: dict | None) -> dic
     """
     pp = payment_path or {}
     base = exp.baseline_json or {}
-    delta_sample = max(0, _n(pp.get(exp.sample_metric)) - _n(base.get(exp.sample_metric)))
-    delta_metric = max(0, _n(pp.get(exp.primary_metric)) - _n(base.get(exp.primary_metric)))
+    delta_sample = max(0, get_metric(pp, exp.sample_metric) - get_metric(base, exp.sample_metric))
+    delta_metric = max(0, get_metric(pp, exp.primary_metric) - get_metric(base, exp.primary_metric))
     baseline_rate = _rate(base, exp.primary_metric, exp.sample_metric)
     current_rate = (delta_metric / delta_sample) if delta_sample > 0 else None
     return {

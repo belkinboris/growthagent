@@ -1626,6 +1626,7 @@ _METRIC_RU = {
     "payment_success": "оплат",
     "channels_created": "созданных каналов",
     "first_post_feedback_good": "хороших отзывов",
+    "first_post_feedback_total": "отзывов",
 }
 
 
@@ -1634,7 +1635,9 @@ def _metric_ru(metric: str) -> str:
 
 
 def _fmt_rate(rate) -> str:
-    return f"{rate:.0%}" if rate is not None else "—"
+    if rate is None:
+        return "—"
+    return f"{min(rate, 1.0):.0%}"  # защитный clamp: доля не может быть > 100%
 
 
 def build_experiment_block(exp, progress: dict) -> str:

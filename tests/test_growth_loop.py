@@ -445,3 +445,49 @@ class TestBoardBlocks:
             why = build_recommendation_why(rec)
             assert "Почему" in why
             assert any(line.startswith("—") for line in why.splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Виртуальная метрика first_post_feedback_total (фикс бага «0% → 300%»)
+# ---------------------------------------------------------------------------
+
+class TestVirtualFeedbackMetric:
+
+    def test_get_metric_sums_feedback(self):
+        from app.growth_loop import get_metric
+        pp = _pp(first_post_feedback_good=3, first_post_feedback_bad=9)
+        assert get_metric(pp, "first_post_feedback_total") == 12
+        assert get_metric(pp, "registrations") == 20
+        assert get_metric(None, "first_post_feedback_total") == 0
+
+    def test_first_post_experiment_rate_cannot_exceed_100(self):
+        """Сценарий бага с прода: 1 новая регистрация, 3 новых good-отзыва
+        давали rate 300%. С выборкой в отзывах rate ≤ 100%."""
+        f = _factory()
+        with f() as s:
+            p = _project(s)
+            content = truepost_playbook("first_post", _pp(first_post_feedback_good=3, first_post_feedback_bad=9), DEFAULT_THRESHOLDS)
+            assert content["sample_metric"] == "first_post_feedback_total"
+            rec = GrowthRecommendation(
+                project_id=p.id, area="first_post", title=content["title"],
+                action=content["action"], primary_metric=content["primary_metric"],
+                sample_metric=content["sample_metric"], target_sample=content["target_sample"],
+                status=GrowthRecommendationStatus.proposed,
+            )
+            s.add(rec); s.commit(); s.refresh(rec)
+            baseline = _pp(registrations=16, first_post_feedback_good=3, first_post_feedback_bad=9)
+            exp = accept_recommendation(s, rec, baseline)
+            # +1 регистрация, +3 good, +1 bad
+            now = _pp(registrations=17, first_post_feedback_good=6, first_post_feedback_bad=10)
+            prog = experiment_progress(exp, now)
+            assert prog["current_sample"] == 4      # новых отзывов
+            assert prog["delta_metric"] == 3        # из них good
+            assert prog["current_rate"] == pytest.approx(0.75)
+            assert prog["current_rate"] <= 1.0
+            assert prog["baseline_rate"] == pytest.approx(3 / 12)
+
+    def test_display_clamped(self):
+        from app.commercial_report import _fmt_rate
+        assert _fmt_rate(3.0) == "100%"
+        assert _fmt_rate(0.42) == "42%"
+        assert _fmt_rate(None) == "—"
