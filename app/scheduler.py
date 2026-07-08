@@ -1305,11 +1305,28 @@ async def run_landing_funnel_diagnostics_for_project(
     return {"status": "ok", "result": diag_result.to_dict(), "error": None}
 
 
+def is_quiet_hour(settings, now_utc_hour: int | None = None) -> bool:
+    """Тихие часы (по умолчанию 23:00–08:00 МСК): пуши не отправляем.
+    Интервал через полночь: start=20, end=5 -> тихо при hour >= 20 ИЛИ < 5."""
+    if not getattr(settings, "quiet_hours_enabled", False):
+        return False
+    if now_utc_hour is None:
+        now_utc_hour = datetime.now(timezone.utc).hour
+    start = getattr(settings, "quiet_hours_start_utc", 20)
+    end = getattr(settings, "quiet_hours_end_utc", 5)
+    if start <= end:
+        return start <= now_utc_hour < end
+    return now_utc_hour >= start or now_utc_hour < end
+
+
 async def _send_telegram_notification(settings, text: str) -> bool:
     """Общий helper отправки уведомления всем admin chat_ids. Не кидает исключений.
     Пробует HTML (<b>жирный</b>); при ошибке парсинга откатывается к plain."""
     import re
     import httpx
+    if is_quiet_hour(settings):
+        logger.info("Notification suppressed: quiet hours")
+        return False  # не помечаем отправленным -- дошлётся после тихих часов
     api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
     plain = re.sub(r"</?(b|i|code|u|s)>", "", text)
     ok_any = False

@@ -3473,6 +3473,30 @@ async def send_cycle_notification(app: Application, result: CycleResult, project
         logger.warning("No admin chat IDs configured, cannot send notification")
         return
 
+    # Тихие часы: ночной полный отчёт никому не нужен (владелец получил
+    # его в 03:55 -- это баг, а не фича). Утром придёт ☀️ сводка.
+    from app.scheduler import is_quiet_hour
+    if is_quiet_hour(settings):
+        logger.info("Legacy cycle report suppressed: quiet hours")
+        return
+
+    # Один мозг: пока у Growth Loop есть активный эксперимент или ждущая
+    # рекомендация, легаси-отчёт со своим «Что сделать сегодня» молчит --
+    # его советы из старых правил противоречат запертым переменным цикла.
+    # Live feed и уведомления цикла продолжают работать как раньше.
+    try:
+        from app import growth_loop
+        with get_session() as session:
+            project = _get_active_project(session)
+            if project is not None and (
+                growth_loop.get_running_experiment(session, project.id) is not None
+                or growth_loop.get_active_recommendation(session, project.id) is not None
+            ):
+                logger.info("Legacy cycle report suppressed: growth loop is active")
+                return
+    except Exception:
+        logger.exception("growth loop gate failed; sending legacy report as fallback")
+
     text = format_cycle_message(result, project_name)
 
     keyboard = None

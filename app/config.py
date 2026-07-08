@@ -198,6 +198,13 @@ class Settings(BaseSettings):
     daily_board_enabled: bool = True
     daily_board_hour_utc: int = 6  # 06:00 UTC = 09:00 МСК
 
+    # --- Тихие часы: не будить владельца пушами ночью ---
+    # Отложенные уведомления не теряются: дедуп помечает отправку только
+    # после успеха, следующий цикл после тихих часов дошлёт.
+    quiet_hours_enabled: bool = True
+    quiet_hours_start_utc: int = 20  # 23:00 МСК
+    quiet_hours_end_utc: int = 5     # 08:00 МСК
+
     # --- Пороги для свежести данных интеграций ---
     integration_stale_minutes: int = 180  # если as_of старше -- алерт integration_down
 
@@ -264,4 +271,4 @@ STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-ask-context-v2-2026-07-07"
+BUILD_MARKER = "growth-agent-quiet-one-brain-2026-07-08"
