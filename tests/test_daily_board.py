@@ -475,3 +475,67 @@ class TestHtmlStyling:
     def test_strip_html_tags(self):
         from app.telegram_bot import _strip_html_tags
         assert _strip_html_tags("☀️ <b>Доброе утро.</b> <i>x</i>") == "☀️ Доброе утро. x"
+
+
+class TestQuietHours:
+
+    class _S:
+        quiet_hours_enabled = True
+        quiet_hours_start_utc = 20
+        quiet_hours_end_utc = 5
+
+    def test_quiet_at_night_msk(self):
+        from app.scheduler import is_quiet_hour
+        s = self._S()
+        # 03:55 МСК = 00:55 UTC — тихо (тот самый ночной отчёт)
+        assert is_quiet_hour(s, now_utc_hour=0) is True
+        assert is_quiet_hour(s, now_utc_hour=23) is True
+        assert is_quiet_hour(s, now_utc_hour=4) is True
+
+    def test_loud_at_day(self):
+        from app.scheduler import is_quiet_hour
+        s = self._S()
+        assert is_quiet_hour(s, now_utc_hour=6) is False   # 09:00 МСК — сводка
+        assert is_quiet_hour(s, now_utc_hour=12) is False
+        assert is_quiet_hour(s, now_utc_hour=19) is False
+
+    def test_disabled(self):
+        from app.scheduler import is_quiet_hour
+        class Off(self._S):
+            quiet_hours_enabled = False
+        assert is_quiet_hour(Off(), now_utc_hour=0) is False
+
+    def test_non_wrapping_interval(self):
+        from app.scheduler import is_quiet_hour
+        class Day(self._S):
+            quiet_hours_start_utc = 2
+            quiet_hours_end_utc = 6
+        assert is_quiet_hour(Day(), now_utc_hour=3) is True
+        assert is_quiet_hour(Day(), now_utc_hour=7) is False
+
+    def test_sender_suppresses_and_does_not_mark(self):
+        """Подавленный ночью пуш не помечается отправленным — дошлётся утром."""
+        import asyncio
+        from app.scheduler import send_daily_board
+        factory = _make_session_factory()
+        with factory() as session:
+            _make_project(session)
+
+        sent = []
+
+        async def fake_send(settings, text):
+            # реальный _send_telegram_notification при тихих часах вернул бы False;
+            # здесь моделируем его контрактом
+            return False
+
+        class S(_FakeSettings):
+            pass
+
+        ok = asyncio.run(send_daily_board(_send=fake_send, _session_factory=factory, _settings=S()))
+        assert ok is False
+        # Повторная попытка с успешной отправкой проходит (дедуп не сработал)
+        async def ok_send(settings, text):
+            sent.append(text)
+            return True
+        ok = asyncio.run(send_daily_board(_send=ok_send, _session_factory=factory, _settings=S()))
+        assert ok is True and len(sent) == 1
