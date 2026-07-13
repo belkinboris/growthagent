@@ -17,7 +17,21 @@ from app.models import Project, Integration, IntegrationType, IntegrationStatus
 settings = get_settings()
 
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, echo=False, connect_args=connect_args)
+
+# Пул с жёсткими границами. Без них SQLAlchemy держал соединения без предела:
+# при 8 циклах в сутки + вебхуках Telegram память росла до Out of memory
+# (7 падений за 3 дня, 2026-07-09..12). pool_recycle -- Railway рвёт idle-
+# соединения молча, pre_ping ловит мёртвые до запроса.
+_engine_kwargs: dict = {"echo": False, "connect_args": connect_args}
+if not settings.database_url.startswith("sqlite"):
+    _engine_kwargs.update(
+        pool_size=5,
+        max_overflow=2,
+        pool_recycle=280,
+        pool_pre_ping=True,
+        pool_timeout=30,
+    )
+engine = create_engine(settings.database_url, **_engine_kwargs)
 
 
 def get_session() -> Session:

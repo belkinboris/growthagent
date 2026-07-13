@@ -2007,3 +2007,26 @@ async def growth_loop_tick_and_notify(
     except Exception:
         logger.exception("growth_loop_tick_and_notify failed")
     return outcome
+
+
+async def run_daily_cleanup(_session_factory=None) -> dict[str, int]:
+    """
+    Ежедневная ретенция: удаляет данные старше срока хранения.
+    Никогда не роняет процесс -- при ошибке просто пишет в лог.
+    """
+    from app.db import get_session
+    from app.service import cleanup_old_data
+
+    factory = _session_factory or get_session
+    try:
+        with factory() as session:
+            deleted = cleanup_old_data(session)
+        total = sum(deleted.values())
+        if total:
+            logger.info("Daily cleanup: удалено %s записей: %s", total, deleted)
+        else:
+            logger.info("Daily cleanup: нечего удалять")
+        return deleted
+    except Exception:
+        logger.exception("Daily cleanup failed (non-fatal)")
+        return {}

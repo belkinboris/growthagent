@@ -111,6 +111,13 @@ async def on_startup() -> None:
             id="daily_board",
         )
 
+    # Ежедневная очистка старых данных: без неё таблицы растут вечно и
+    # процесс умирает по Out of memory (кейс июля 2026). 03:30 UTC = 06:30 МСК,
+    # тихие часы, никому не мешает.
+    from app.scheduler import run_daily_cleanup
+
+    scheduler.add_job(run_daily_cleanup, "cron", hour=3, minute=30, id="daily_cleanup")
+
     logger.info("Growth Agent started. Build: %s. Watch interval: %s sec", BUILD_MARKER, settings.watch_interval_seconds)
 
 

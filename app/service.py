@@ -1257,3 +1257,75 @@ def load_daily_counters_history(
         if cached is not None and cached.ok and cached.result_json:
             history.append(dict(cached.result_json))
     return history
+
+
+# ---------------------------------------------------------------------------
+# Ретенция данных: без неё таблицы растут вечно (причина Out of memory,
+# 7 падений за 3 дня в июле 2026). Историю дольше N дней не храним --
+# все решения принимаются на окне 7-30 дней, старое не нужно никому.
+# ---------------------------------------------------------------------------
+
+RETENTION_DAYS = {
+    "MetricSnapshot": 45,            # снимки метрик: 8 циклов/сутки
+    "DirectGranularSnapshot": 30,    # granular Директа: сотни строк за раз
+    "AgentRun": 30,
+    "NotificationLog": 30,
+    "DeepDiagnosticsCache": 14,      # кэш, старше -- мусор
+    "ProjectChangeEvent": 90,        # события изменений: нужны для истории
+    "Alert": 60,
+}
+
+
+def cleanup_old_data(session: Session, *, dry_run: bool = False) -> dict[str, int]:
+    """
+    Удаляет записи старше срока хранения. Возвращает {таблица: сколько удалено}.
+    Вызывается раз в сутки планировщиком. Живые сущности (Project, Integration,
+    GrowthExperiment, GrowthRecommendation, MetricBaseline) НЕ трогаются никогда.
+    """
+    from datetime import timedelta
+
+    from app.models import (
+        AgentRun,
+        Alert,
+        DeepDiagnosticsCache,
+        DirectGranularSnapshot,
+        MetricSnapshot,
+        NotificationLog,
+        ProjectChangeEvent,
+    )
+
+    models = {
+        "MetricSnapshot": MetricSnapshot,
+        "DirectGranularSnapshot": DirectGranularSnapshot,
+        "AgentRun": AgentRun,
+        "NotificationLog": NotificationLog,
+        "DeepDiagnosticsCache": DeepDiagnosticsCache,
+        "ProjectChangeEvent": ProjectChangeEvent,
+        "Alert": Alert,
+    }
+
+    deleted: dict[str, int] = {}
+    now = utcnow()
+    for name, model in models.items():
+        # Поле времени у моделей разное (created_at / sent_at / first_seen_at) --
+        # находим первое подходящее, а не предполагаем created_at.
+        time_field = next(
+            (f for f in ("created_at", "sent_at", "first_seen_at", "occurred_at")
+             if hasattr(model, f)),
+            None,
+        )
+        if time_field is None:
+            logger.warning("cleanup: у %s нет поля времени -- пропускаю", name)
+            deleted[name] = 0
+            continue
+
+        cutoff = now - timedelta(days=RETENTION_DAYS[name])
+        column = getattr(model, time_field)
+        rows = session.exec(select(model).where(column < cutoff)).all()
+        deleted[name] = len(rows)
+        if not dry_run:
+            for row in rows:
+                session.delete(row)
+    if not dry_run:
+        session.commit()
+    return deleted
