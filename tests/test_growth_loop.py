@@ -491,3 +491,102 @@ class TestVirtualFeedbackMetric:
         assert _fmt_rate(3.0) == "100%"
         assert _fmt_rate(0.42) == "42%"
         assert _fmt_rate(None) == "—"
+
+
+class TestPeakRatchet:
+    """
+    Урок 2026-07-16, подтверждён реальными цифрами прода: TruePost отдаёт
+    first_post_feedback_good/bad за СКОЛЬЗЯЩЕЕ 7-дневное окно, не
+    накопительно. Baseline эксперимента «Чиним качество первого поста»
+    (7 июля): good=3, bad=9, итого 12. Живые данные (16 июля): good=4,
+    bad=7, итого 11 -- МЕНЬШЕ базы, хотя good выросло. Прогресс застрял
+    на 0/10 на девять дней. Трещотка (peak_json) должна такое пережить.
+    """
+
+    def _factory(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        SQLModel.metadata.create_all(engine)
+        return lambda: Session(engine)
+
+    def _project_and_baseline_experiment(self, factory, baseline_pp):
+        with factory() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            rec = propose_if_needed(s, p.id, baseline_pp, truepost_playbook)
+            exp = accept_recommendation(s, rec, baseline_pp)
+            return p.id, exp.id
+
+    def test_real_prod_case_dip_does_not_erase_progress(self):
+        """Точное воспроизведение случая Бориса: baseline 12, живое 11 --
+        не должно быть 0, если между ними был пик выше базы."""
+        factory = self._factory()
+        baseline_pp = dict(registrations=16, channels_created=17,
+                           first_post_feedback_good=3, first_post_feedback_bad=9,
+                           pricing_viewed=5, payment_started=0, payment_success=0)
+        _, exp_id = self._project_and_baseline_experiment(factory, baseline_pp)
+
+        with factory() as s:
+            exp = s.get(GrowthExperiment, exp_id)
+            # Промежуточный цикл: реальный пик, который мы видели своими глазами
+            # («предварительный сигнал», 3/10) -- good=4, bad=11 (итого 15)
+            peak_pp = dict(baseline_pp, first_post_feedback_good=4, first_post_feedback_bad=11)
+            maybe_finish_experiment(s, exp, peak_pp)
+            assert exp.current_sample == 3   # 15-12=3, всё верно на пике
+
+        with factory() as s:
+            exp = s.get(GrowthExperiment, exp_id)
+            # Окно просело: good=4, bad=7 (итого 11) -- меньше и базы, и пика
+            dipped_pp = dict(baseline_pp, first_post_feedback_good=4, first_post_feedback_bad=7)
+            result = maybe_finish_experiment(s, exp, dipped_pp)
+            assert exp.current_sample == 3      # трещотка удержала пик, НЕ упало до 0
+            assert result is None               # эксперимент не завершился раньше времени
+
+    def test_first_call_never_below_baseline(self):
+        """Если самое первое живое значение уже ниже baseline -- прогресс 0,
+        это честно (пика ещё не было), не отрицательное число."""
+        factory = self._factory()
+        baseline_pp = dict(registrations=16, first_post_feedback_good=3,
+                           first_post_feedback_bad=9, pricing_viewed=5,
+                           payment_started=0, payment_success=0)
+        _, exp_id = self._project_and_baseline_experiment(factory, baseline_pp)
+        with factory() as s:
+            exp = s.get(GrowthExperiment, exp_id)
+            lower_pp = dict(baseline_pp, first_post_feedback_good=4, first_post_feedback_bad=7)
+            maybe_finish_experiment(s, exp, lower_pp)
+            assert exp.current_sample == 0
+
+    def test_peak_only_grows_across_many_cycles(self):
+        """Пила вверх-вниз-вверх: прогресс должен монотонно не убывать."""
+        factory = self._factory()
+        baseline_pp = dict(registrations=16, channels_created=17, first_post_feedback_good=3,
+                           first_post_feedback_bad=9, pricing_viewed=5,
+                           payment_started=0, payment_success=0)
+        _, exp_id = self._project_and_baseline_experiment(factory, baseline_pp)
+        readings = [12, 15, 11, 17, 9, 20]  # итоговые good+bad по циклам
+        seen_samples = []
+        for total in readings:
+            with factory() as s:
+                exp = s.get(GrowthExperiment, exp_id)
+                pp = dict(baseline_pp, first_post_feedback_good=total // 2,
+                         first_post_feedback_bad=total - total // 2)
+                maybe_finish_experiment(s, exp, pp)
+                seen_samples.append(exp.current_sample)
+        assert seen_samples == sorted(seen_samples)   # никогда не падает
+        assert seen_samples[-1] == max(readings) - 12  # 20-12=8, финальный пик учтён
+
+    def test_backward_compat_experiment_without_peak_json(self):
+        """Старые эксперименты в БД (созданные до этого фикса) не имеют
+        peak_json -- первый же вызов должен инициализировать его без падения."""
+        factory = self._factory()
+        baseline_pp = dict(registrations=16, channels_created=17, first_post_feedback_good=3,
+                           first_post_feedback_bad=9, pricing_viewed=5,
+                           payment_started=0, payment_success=0)
+        _, exp_id = self._project_and_baseline_experiment(factory, baseline_pp)
+        with factory() as s:
+            exp = s.get(GrowthExperiment, exp_id)
+            exp.peak_json = None  # имитируем старую запись без поля (до миграции)
+            s.add(exp); s.commit()
+        with factory() as s:
+            exp = s.get(GrowthExperiment, exp_id)
+            progress = experiment_progress(exp, dict(baseline_pp, first_post_feedback_good=5))
+            assert progress["current_sample"] >= 0   # не упало с исключением
