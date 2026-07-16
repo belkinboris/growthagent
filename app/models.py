@@ -293,6 +293,19 @@ class GrowthExperiment(SQLModel, table=True):
     фиксируется В МОМЕНТ принятия (snapshot payment_path), прогресс --
     прирост sample_metric относительно baseline, вердикт -- автоматически
     при достижении target_sample или max_runtime.
+
+    peak_json (2026-07-16): источники вроде TruePost отдают некоторые
+    метрики (first_post_feedback_good/bad) за СКОЛЬЗЯЩЕЕ 7-дневное окно,
+    не накопительно -- живое значение может со временем УМЕНЬШАТЬСЯ, когда
+    старые события выпадают из окна, даже если новых событий не было ни
+    одного. Наивная формула current-baseline тогда даёт отрицательную
+    (обнулённую) дельту и эксперимент застревает на 0 навсегда -- ровно
+    это случилось с «Чиним качество первого поста» (baseline 7 июля:
+    good=3/bad=9=12; живые данные 16 июля: good=4/bad=7=11 -- меньше
+    базы при том что good выросло). Чиним счётчиком-трещоткой: peak_json
+    хранит наблюдавшийся МАКСИМУМ primary/sample метрик с начала
+    эксперимента, обновляется только вверх, прогресс = peak - baseline.
+    Один раз просевшее окно больше никогда не откатывает прогресс назад.
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -303,6 +316,7 @@ class GrowthExperiment(SQLModel, table=True):
     hypothesis: str = ""
     status: GrowthExperimentStatus = GrowthExperimentStatus.running
     baseline_json: dict = Field(default_factory=dict, sa_column=Column(JSON))  # snapshot payment_path при старте
+    peak_json: dict = Field(default_factory=dict, sa_column=Column(JSON))  # исторический максимум live-метрик
     primary_metric: str = ""
     sample_metric: str = "registrations"
     guardrail_json: list = Field(default_factory=list, sa_column=Column(JSON))

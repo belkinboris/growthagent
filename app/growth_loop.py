@@ -439,16 +439,42 @@ def _rate(pp: dict, metric: str, sample_metric: str) -> Optional[float]:
 
 def experiment_progress(exp: GrowthExperiment, payment_path: dict | None) -> dict:
     """
-    Прогресс = прирост sample_metric относительно baseline (новые пользователи
-    С МОМЕНТА старта), не абсолют. Возвращает
-    {"current_sample", "baseline_rate", "current_rate", "delta_metric", "delta_sample"}.
-    current_rate считается ТОЛЬКО по новым данным (дельта метрики / дельта
-    выборки), чтобы baseline не размывал результат эксперимента.
+    Прогресс = прирост sample_metric относительно baseline, НО через
+    счётчик-трещотку (см. docstring GrowthExperiment.peak_json): вместо
+    сравнения baseline с ТЕКУЩИМ живым значением сравниваем baseline с
+    ИСТОРИЧЕСКИМ МАКСИМУМОМ, который только растёт. Источники вроде
+    TruePost отдают feedback-метрики за скользящее 7-дневное окно --
+    живое значение может упасть само по себе, когда старые события
+    выпадают из окна, даже без единого нового события. Трещотка не даёт
+    такому провалу тихо обнулить уже накопленный прогресс.
+
+    ВАЖНО: эта функция больше не должна вызываться как чистая (без
+    побочных эффектов) там, где важна консистентность peak_json -- она
+    сама обновляет peak, если новое значение выше уже сохранённого,
+    но КОММИТ делает вызывающий код (здесь сессии нет).
+
+    Возвращает {"current_sample", "baseline_rate", "current_rate",
+    "delta_metric", "delta_sample"}.
     """
     pp = payment_path or {}
     base = exp.baseline_json or {}
-    delta_sample = max(0, get_metric(pp, exp.sample_metric) - get_metric(base, exp.sample_metric))
-    delta_metric = max(0, get_metric(pp, exp.primary_metric) - get_metric(base, exp.primary_metric))
+    peak = dict(exp.peak_json or {})
+
+    live_sample = get_metric(pp, exp.sample_metric)
+    live_metric = get_metric(pp, exp.primary_metric)
+
+    # Трещотка: peak хранится по имени метрики, обновляется только вверх.
+    # При первом вызове (peak пуст) стартуем с baseline, чтобы старый
+    # эксперимент без peak_json не потерял уже прожитый прогресс молча --
+    # первый живой тик подтянет peak к максимуму из baseline/live.
+    peak_sample = max(peak.get(exp.sample_metric, 0), get_metric(base, exp.sample_metric), live_sample)
+    peak_metric = max(peak.get(exp.primary_metric, 0), get_metric(base, exp.primary_metric), live_metric)
+    peak[exp.sample_metric] = peak_sample
+    peak[exp.primary_metric] = peak_metric
+    exp.peak_json = peak  # вызывающий обязан session.add(exp) + commit, если хочет сохранить
+
+    delta_sample = max(0, peak_sample - get_metric(base, exp.sample_metric))
+    delta_metric = max(0, peak_metric - get_metric(base, exp.primary_metric))
     baseline_rate = _rate(base, exp.primary_metric, exp.sample_metric)
     current_rate = (delta_metric / delta_sample) if delta_sample > 0 else None
     return {

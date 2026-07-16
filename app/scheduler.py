@@ -453,6 +453,18 @@ def _jsonify(data: dict | None) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _log_memory(label: str) -> None:
+    """Пишет текущее потребление памяти процесса в лог. Диагностика после
+    инцидента Out of Memory 2026-07-14 -- при следующем падении по этим
+    строкам сразу видно, на каком шаге цикла память растёт, а не гадаем."""
+    try:
+        import resource
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info("memory: %s -- RSS ~%.0f MB", label, rss_mb)
+    except Exception:
+        pass  # диагностика не должна ронять цикл
+
+
 async def run_cycle_once(project_id: int | None = None) -> CycleResult:
     """
     Запускает один полный цикл наблюдения для проекта. Если project_id не
@@ -461,6 +473,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
     Используется из APScheduler, POST /api/run, и /run в Telegram -- все
     три точки вызова получают идентичный результат.
     """
+    _log_memory("cycle start")
     with get_session() as session:
         if project_id is not None:
             project = session.get(Project, project_id)
@@ -544,6 +557,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         )
         result.integration_down_changes = integration_changes
         result.source_statuses_by_window = source_statuses_by_window
+        _log_memory("after main windows, before deep diagnostics")
 
         # Deep diagnostics: гибридный режим. Автоматически запускается
         # только если (а) есть триггерящий алерт, (б) Direct настроен,
@@ -2018,9 +2032,11 @@ async def run_daily_cleanup(_session_factory=None) -> dict[str, int]:
     from app.service import cleanup_old_data
 
     factory = _session_factory or get_session
+    _log_memory("daily cleanup start")
     try:
         with factory() as session:
             deleted = cleanup_old_data(session)
+        _log_memory("daily cleanup done")
         total = sum(deleted.values())
         if total:
             logger.info("Daily cleanup: удалено %s записей: %s", total, deleted)

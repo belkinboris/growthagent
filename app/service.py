@@ -1276,13 +1276,23 @@ RETENTION_DAYS = {
 }
 
 
-def cleanup_old_data(session: Session, *, dry_run: bool = False) -> dict[str, int]:
+def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int = 500) -> dict[str, int]:
     """
     Удаляет записи старше срока хранения. Возвращает {таблица: сколько удалено}.
     Вызывается раз в сутки планировщиком. Живые сущности (Project, Integration,
     GrowthExperiment, GrowthRecommendation, MetricBaseline) НЕ трогаются никогда.
+
+    ВАЖНО (урок 2026-07-14): первая версия грузила ВСЕ устаревшие строки как
+    полные ORM-объекты (select(...).all()) перед удалением -- при первом
+    запуске после деплоя, с накопленным за недели бэклогом, это само стало
+    причиной Out of Memory (фикс утечки породил новую утечку). Теперь --
+    батчами по batch_size через bulk DELETE, который не грузит содержимое
+    строк (включая тяжёлые metrics_json/result_json) в память вообще,
+    с промежуточными commit после каждого батча.
     """
     from datetime import timedelta
+
+    from sqlmodel import delete as sql_delete
 
     from app.models import (
         AgentRun,
@@ -1321,11 +1331,26 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False) -> dict[str, in
 
         cutoff = now - timedelta(days=RETENTION_DAYS[name])
         column = getattr(model, time_field)
-        rows = session.exec(select(model).where(column < cutoff)).all()
-        deleted[name] = len(rows)
-        if not dry_run:
-            for row in rows:
-                session.delete(row)
-    if not dry_run:
-        session.commit()
+        pk = model.__table__.primary_key.columns.values()[0]
+
+        if dry_run:
+            count = session.exec(select(pk).where(column < cutoff)).all()
+            deleted[name] = len(count)
+            continue
+
+        total = 0
+        while True:
+            # ID пачки без загрузки полных строк, потом bulk DELETE по ID --
+            # ни одна строка целиком в память не попадает.
+            batch_ids = session.exec(
+                select(pk).where(column < cutoff).limit(batch_size)
+            ).all()
+            if not batch_ids:
+                break
+            session.exec(sql_delete(model).where(pk.in_(batch_ids)))
+            session.commit()
+            total += len(batch_ids)
+            if len(batch_ids) < batch_size:
+                break
+        deleted[name] = total
     return deleted

@@ -1351,7 +1351,7 @@ def _growth_loop_board_state(payment_path: dict | None):
             if running is not None:
                 progress = growth_loop.experiment_progress(running, payment_path)
                 markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Отменить эксперимент", callback_data=f"gl_cancel:{running.id}"),
+                    InlineKeyboardButton("Отменить эксперимент", callback_data=f"gl_cancel_ask:{running.id}"),
                 ]])
                 return build_experiment_block(running, progress), markup
 
@@ -1401,13 +1401,38 @@ async def _handle_growth_loop_button(query, action: str, rec_or_exp_id: int) -> 
     from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
 
     with get_session() as session:
-        if action == "gl_cancel":
+        if action == "gl_cancel_ask":
+            # Урок 2026-07-14: кнопка отмены срабатывала с одного тапа --
+            # случайное нажатие на телефоне стирало неделю накопленного
+            # прогресса эксперимента без возможности отменить. Теперь --
+            # обязательное подтверждение вторым тапом.
             from app.models import GrowthExperiment
             exp = session.get(GrowthExperiment, rec_or_exp_id)
             if exp is None:
                 await query.edit_message_text("Эксперимент не найден.")
                 return True
-            growth_loop.cancel_experiment(session, exp, reason="отменён владельцем с доски")
+            confirm_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Да, отменить (прогресс сотрётся)", callback_data=f"gl_cancel_do:{exp.id}"),
+                InlineKeyboardButton("Нет, продолжить", callback_data=f"gl_cancel_no:{exp.id}"),
+            ]])
+            await query.edit_message_reply_markup(reply_markup=confirm_markup)
+            return True
+
+        if action == "gl_cancel_no":
+            # Возвращаем обычную кнопку отмены -- ничего не тронуто
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Отменить эксперимент", callback_data=f"gl_cancel_ask:{rec_or_exp_id}"),
+            ]])
+            await query.edit_message_reply_markup(reply_markup=markup)
+            return True
+
+        if action == "gl_cancel_do":
+            from app.models import GrowthExperiment
+            exp = session.get(GrowthExperiment, rec_or_exp_id)
+            if exp is None:
+                await query.edit_message_text("Эксперимент не найден.")
+                return True
+            growth_loop.cancel_experiment(session, exp, reason="отменён владельцем с доски (подтверждено)")
             await query.edit_message_text(
                 f"{query.message.text}\n\n✕ Эксперимент отменён. Изменение можно откатить. Доска: /board"
             )
