@@ -1,7 +1,23 @@
-[build]
-builder = "NIXPACKS"
+# Секреты — никогда не коммитить
+.env
+.env.local
 
-[deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# База данных (локальная разработка)
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

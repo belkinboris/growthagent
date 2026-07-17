@@ -1,248 +1,193 @@
-# Growth Agent Watchtower — контракт и структура (v1)
+"""Тесты разговорного слоя (app/ask.py)."""
+import asyncio
 
-## Принцип универсальности (важно прочитать первым)
+import pytest
+from sqlmodel import Session, SQLModel, create_engine
 
-Growth Agent — универсальный сервис, который подключается к любому проекту,
-отдающему метрики в нормализованном формате. TruePost/АвтоПост — первый
-подключённый проект и первый connector, а не основа архитектуры.
-
-В ядре (models.py, analyzer.py, rules.py, llm.py, telegram_bot.py, static/)
-не должно быть слов "TruePost" или "АвтоПост" — только "project", "connector",
-"Growth Agent". Слово "TruePost" допускается только внутри connectors/truepost.py
-и examples/.
-
-Это не значит "строить идеальную абстракцию под воображаемые будущие проекты".
-Это значит: называть вещи универсально и держать mapping воронки в данных
-(Project.settings_json), а не в коде. Сама форма нормализованной воронки может
-и будет меняться, когда появится второй реальный проект — сейчас фиксируем
-достаточно общую схему, не более.
-
-### Нормализованная воронка (universal funnel keys)
-
-```
-traffic            -- визиты / клики из рекламы
-signup              -- регистрация / создание аккаунта
-activation_1          -- первый шаг вовлечения (для АвтоПоста: создан канал)
-activation_2            -- второй шаг вовлечения (для АвтоПоста: пост сгенерирован)
-payment_started            -- начата оплата
-payment_success               -- оплата прошла
-revenue                          -- выручка за период
-```
-
-Список не закрытый — если у будущего проекта 4 шага активации, добавляются
-activation_3, activation_4. Schema MetricSnapshot хранит metrics_json как
-свободный dict, нормализованные ключи — это соглашение на уровне analyzer.py,
-не жёсткая колонка в БД.
-
-### Mapping для TruePost (хранится в Project.settings_json как JSON, не в коде)
-
-```json
-{
-  "funnel_mapping": {
-    "signup": "users_created",
-    "activation_1": "channels_created",
-    "activation_2": "posts_generated",
-    "payment_started": "payments_started",
-    "payment_success": "payments_success",
-    "revenue": "revenue_rub"
-  },
-  "metrika_goal_mapping": {
-    "signup": "register_success",
-    "activation_1": "channel_created",
-    "activation_2": "post_generated",
-    "payment_started": "payment_started",
-    "payment_success": "payment_success"
-  }
-}
-```
-
-В v1 это редактируется руками в БД при настройке проекта, без UI-конструктора —
-строить интерфейс для редактирования mapping под единственный реальный проект
-не нужно, это будущая работа, когда появится второй клиент.
+from app import ask
+from app.models import Project
 
 
-## Структура репозитория
+def _factory():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    return lambda: Session(engine)
 
-```
-growth-agent-watchtower/
-  app/
-    main.py              # FastAPI app, роуты /health /status /run /api/*
-    config.py             # чтение .env, Settings (pydantic-settings)
-    db.py                  # engine, session, init_db()
-    models.py              # SQLModel: Project, FunnelStep, Integration,
-                            #   MetricSnapshot, MetricBaseline, Alert,
-                            #   Recommendation, AgentRun
-    scheduler.py            # APScheduler, run_cycle() каждые N секунд
-    telegram_bot.py          # команды + кнопки + notifier
-    analyzer.py               # ТОЛЬКО детерминированные правила -> Alert
-    rules.py                   # таблица правил отдельно от движка анализа
-    confidence.py                # расчёт confidence по sample size
-    llm.py                         # ТОЛЬКО объяснение, не принятие решений
-    health_score.py                 # расчёт Growth Health 0-100
-    connectors/
-      base.py                        # абстрактный Connector, общий контракт
-      truepost.py                     # HTTP-клиент к TruePost internal API
-      metrika.py                       # Яндекс.Метрика API
-      direct.py                         # Яндекс.Директ API
-      yookassa.py                       # YooKassa (read-only)
-    static/
-      index.html
-      app.js
-      styles.css
-  examples/
-    truepost_internal_metrics_patch.py  # что добавить в TruePost
-  README_RU.md
-  .env.example
-  requirements.txt
-  Procfile
-  railway.toml
-```
 
-## Контракт: Growth Agent <-> Project Metrics API
+class _Settings:
+    anthropic_api_key = "sk-test"
+    anthropic_model = "claude-sonnet-4-6"
+    llm_provider = "anthropic"
 
-Growth Agent НЕ имеет прямого доступа к БД проекта. Только HTTP. Ниже —
-обобщённый контракт; TruePost — первая конкретная реализация этого контракта
-(см. connectors/truepost.py и examples/).
 
-### Запрос
+class TestBuildContext:
 
-```
-GET /api/internal/metrics?period_hours={3|24|168}
-Authorization: Bearer {PROJECT_INTERNAL_API_TOKEN}
-```
+    def test_context_survives_empty_project(self):
+        f = _factory()
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "Доска" in ctx           # доска строится даже без данных
+        assert len(ctx) <= ask.MAX_CONTEXT_CHARS
 
-Growth Agent всегда запрашивает все три окна (3h / 24h / 7d = 168h) за один прогон,
-но как три отдельных запроса — TruePost ничего не должен знать про "окна анализа",
-это знание принадлежит Growth Agent.
+    def test_context_includes_experiment_and_numbers(self):
+        from app.growth_loop import accept_recommendation, propose_if_needed
+        from app.truepost_playbook import truepost_playbook
+        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
+        f = _factory()
+        pp = dict(registrations=20, channels_created=16, first_post_feedback_good=7,
+                  first_post_feedback_bad=3, pricing_viewed=2, payment_started=0,
+                  payment_success=0, queue_offer_shown=4, queue_offer_clicked=1)
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "test", pp)
+            rec = propose_if_needed(s, p.id, pp, truepost_playbook)
+            accept_recommendation(s, rec, pp)
+            ctx = ask.build_context(s, p)
+        assert "АКТИВНЫЙ ЭКСПЕРИМЕНТ" in ctx
+        assert "queue_offer_shown=4" in ctx
+        assert "registrations=20" in ctx
 
-### Ответ (Project Metrics API)
 
-```json
-{
-  "period_hours": 3,
-  "as_of": "2026-06-19T15:00:00Z",
-  "users_created": 3,
-  "channels_created": 1,
-  "channels_verified": 1,
-  "posts_generated": 4,
-  "posts_published": 2,
-  "payments_started": 1,
-  "payments_success": 0,
-  "revenue_rub": 0,
-  "pending_payments": 1
-}
-```
+class TestAnswerQuestion:
 
-`as_of` — обязательное поле. Это момент, на который TruePost насчитал агрегаты
-(не момент ответа на запрос). Growth Agent использует его для:
-- проверки свежести данных (если as_of старше N минут — алерт "интеграция не отвечает свежими данными", не "проблема в продукте")
-- защиты от дублирования снэпшотов при ручных перезапросах через /run
+    def _run(self, coro):
+        return asyncio.run(coro)
 
-### Соответствие ключей БД <-> целей Метрики
+    def test_happy_path_and_context_in_system(self):
+        ask._last_call_ts = 0.0
+        captured = {}
 
-Это соответствие — общий словарь, который используют и analyzer.py (правило 8),
-и health_score.py. Фиксируется в config.py как константа, не как магические строки
-внутри функций:
+        async def fake_post(payload, headers):
+            captured["payload"] = payload
+            return {"content": [{"type": "text", "text": "Ответ по данным."}]}
 
-| TruePost (БД)        | Метрика (цель)     |
-|-----------------------|---------------------|
-| users_created         | register_success     |
-| channels_created        | channel_created        |
-| posts_generated           | post_generated           |
-| payments_started            | payment_started            |
-| payments_success               | payment_success               |
+        out = self._run(ask.answer_question("почему нет оплат?", "КОНТЕКСТ-ДАННЫЕ", _Settings(), _post=fake_post))
+        assert out == "Ответ по данным."
+        assert "КОНТЕКСТ-ДАННЫЕ" in captured["payload"]["system"]
+        assert "Данные важнее мнений" in captured["payload"]["system"]
+        assert captured["payload"]["messages"][0]["content"] == "почему нет оплат?"
 
-### Ошибки и недоступность
+    def test_none_on_api_failure(self):
+        ask._last_call_ts = 0.0
 
-Подключённый проект может быть недоступен или не отдавать internal API
-(старая версия, или connector настроен неправильно). Growth Agent в этом случае:
-- помечает Integration.status = "error", Integration.last_error = текст
-- НЕ создаёт Alert о проблемах в продукте на основе отсутствующих данных
-- создаёт отдельный системный Alert категории "integration_down", который
-  не путается с бизнес-алертами (P1/P2) — это инфраструктурная проблема,
-  а не сигнал "бизнес теряет деньги"
+        async def failing_post(payload, headers):
+            raise RuntimeError("boom")
 
-## Окна анализа (period_key)
+        out = self._run(ask.answer_question("вопрос", "ctx", _Settings(), _post=failing_post))
+        assert out is None
 
-MetricSnapshot.period_key всегда один из: "3h", "24h", "7d".
-Каждый прогон scheduler создаёт ДО трёх снэпшотов (по одному на каждое окно),
-если соответствующий источник данных доступен.
+    def test_cooldown(self):
+        ask._last_call_ts = 0.0
 
-analyzer.py применяет правила к каждому окну отдельно, но финальное сообщение
-в Telegram выбирает ОДНО окно как основное для "главного сигнала" — то, где
-confidence выше. Если 3h окно даёт "low confidence", а 24h — "medium", в Telegram
-идёт вывод по 24h, а 3h упоминается только в контексте ("за 3 часа данных мало,
-но за 24 часа уже видно...").
+        async def fake_post(payload, headers):
+            return {"content": [{"type": "text", "text": "ok"}]}
 
-## Confidence — единые правила (confidence.py)
+        first = self._run(ask.answer_question("q1", "ctx", _Settings(), _post=fake_post))
+        second = self._run(ask.answer_question("q2", "ctx", _Settings(), _post=fake_post))
+        assert first == "ok"
+        assert "не чаще" in second
 
-Confidence не привязан к LLM, это детерминированная функция от sample size:
+    def test_question_truncated(self):
+        ask._last_call_ts = 0.0
+        captured = {}
 
-```python
-def compute_confidence(sample_size: int, metric_type: str) -> str:
-    # пороги различаются для кликов и для конверсионных событий,
-    # т.к. клики численно больше, а конверсии (оплаты) редки и
-    # значимы уже на малых числах
-    ...
-    return "low" | "medium" | "high"
-```
+        async def fake_post(payload, headers):
+            captured["payload"] = payload
+            return {"content": [{"type": "text", "text": "ok"}]}
 
-Эта функция вызывается analyzer.py при создании Alert. LLM получает confidence
-как готовое поле и обязан его озвучить, а не пересчитывать.
+        self._run(ask.answer_question("х" * 5000, "ctx", _Settings(), _post=fake_post))
+        assert len(captured["payload"]["messages"][0]["content"]) <= ask.MAX_QUESTION_CHARS
 
-## Зона ответственности llm.py
 
-LLM вызывается ПОСЛЕ analyzer.py и получает:
-- список Alert (уже созданных, с fingerprint/confidence/status)
-- метрики по всем трём окнам
-- предыдущие 2-3 AgentRun для контекста "что менялось"
+class TestIsConfigured:
 
-LLM возвращает строго структурированный текст по фиксированному шаблону
-(см. формат сообщения ниже), не свободную форму. Это нужно, чтобы:
-- бот не "уплывал" в стиль и не начинал советовать опасные действия
-- одно и то же сообщение можно было собрать и без LLM (LLM_PROVIDER=none),
-  просто менее живым языком, по тем же полям
+    def test_configured(self):
+        assert ask.is_configured(_Settings()) is True
 
-## Формат Telegram-сообщения (с LLM и без LLM — одна структура)
+    def test_not_configured(self):
+        class NoKey:
+            anthropic_api_key = None
+            llm_provider = "anthropic"
+        assert ask.is_configured(NoKey()) is False
+        class WrongProvider:
+            anthropic_api_key = "sk"
+            llm_provider = "none"
+        assert ask.is_configured(WrongProvider()) is False
 
-```
-Growth Agent — watch-only
-Проект: {project.name}
 
-Главный сигнал:
-{alert.title}, confidence: {confidence_ru}
+class TestExperimentLegend:
 
-Где вероятно проблема:
-{hypothesis}
+    def test_legend_present_when_experiment_running(self):
+        from app.growth_loop import accept_recommendation, propose_if_needed
+        from app.truepost_playbook import truepost_playbook
+        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
+        f = _factory()
+        pp = dict(registrations=20, channels_created=16, first_post_feedback_good=3,
+                  first_post_feedback_bad=9, pricing_viewed=6, payment_started=0, payment_success=0)
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "test", pp)
+            rec = propose_if_needed(s, p.id, pp, truepost_playbook)
+            accept_recommendation(s, rec, pp)
+            ctx = ask.build_context(s, p)
+        assert "КАК ЧИТАТЬ ЭКСПЕРИМЕНТ" in ctx
+        assert "не только успешные" in ctx
+        assert "ДО старта эксперимента" in ctx
 
-Что проверить:
-{check_action}
 
-Что НЕ делать:
-{do_not_action}
+class TestContextGapsClosed:
+    """Дыры, найденные прогоном по сценариям владельца 2026-07-07."""
 
-Метрики (24ч):
-Реклама: {spend} ₽ / {clicks} кликов / CTR {ctr}%
-Продукт: {signup} регистраций / {activation_1} / {activation_2} / {payment_success} оплат
-```
+    def _project_with_pp(self, s, pp):
+        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
+        p = Project(name="АвтоПост", type="t", is_active=True)
+        s.add(p); s.commit(); s.refresh(p)
+        save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "t", pp)
+        return p
 
-Без LLM (LLM_PROVIDER=none) поля hypothesis/check_action/do_not_action заполняются
-шаблонными строками из rules.py, привязанными к конкретному правилу — то есть
-каждое правило в rules.py хранит не только условие, но и три заготовленных фразы.
+    def test_ad_spend_in_context(self):
+        from datetime import datetime, timezone
+        from app.models import MetricSnapshot
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            s.add(MetricSnapshot(
+                project_id=p.id, period_key="7d", source="combined",
+                period_start=now, period_end=now,
+                metrics_json={"product": {"signup": 16}, "direct": {"spend": 4124, "clicks": 136}},
+            ))
+            s.commit()
+            ctx = ask.build_context(s, p)
+        assert "расход 4124 ₽" in ctx
+        assert "кликов 136" in ctx
+        assert "цена регистрации ≈ 258 ₽" in ctx
 
-## Что НЕ входит в v1 (явный список, чтобы не расползалось)
+    def test_project_facts_and_price_honesty(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            ctx = ask.build_context(s, p)
+        assert "ФАКТЫ О ПРОЕКТЕ" in ctx
+        assert "актуальных цен в" in ctx and "НЕТ" in ctx  # честность про цены
+        assert "ПАУЗУ" in ctx  # статус Telegram Ads
 
-- нет прямого доступа к БД проекта (только HTTP к Project Metrics API)
-- нет изменения рекламы/ставок/бюджетов
-- нет изменения лендинга или продукта
-- нет автоматических действий — даже в режимах recommend_only/approval_required/
-  autopilot_limited (они есть в UI как заглушки disabled)
-- нет UI-конструктора для multi-project и для редактирования funnel_mapping —
-  Project как модель универсальна, но в v1 активен один проект (АвтоПост),
-  а mapping редактируется руками в БД
-- нет MetricBaseline-логики кроме самой таблицы (заполняется вручную или не
-  заполняется вообще в v1)
-- analyzer.py работает с нормализованными ключами воронки (signup, activation_1,
-  ...), а не напрямую с полями TruePost — перевод "поле TruePost -> нормализованный
-  ключ" происходит в connectors/truepost.py при помощи funnel_mapping, до того как
-  данные попадают в analyzer
+    def test_how_to_read_numbers(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16, "channels_created": 18})
+            ctx = ask.build_context(s, p)
+        assert "КАК ЧИТАТЬ ЦИФРЫ" in ctx
+        assert "превышать registrations" in ctx
+        assert "автогенерация" in ctx
+
+    def test_context_still_under_limit(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_pp(s, {"registrations": 16})
+            ctx = ask.build_context(s, p)
+        assert len(ctx) <= ask.MAX_CONTEXT_CHARS
