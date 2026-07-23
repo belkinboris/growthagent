@@ -153,11 +153,34 @@ class Settings(BaseSettings):
     bot_admin_chat_ids: str = ""  # список через запятую, парсится в telegram_bot.py
 
     # --- LLM (опционально) ---
-    llm_provider: str = "none"  # none | openai | anthropic
+    llm_provider: str = "none"  # none | openai | anthropic | yandex
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-sonnet-4-6"
+
+    # --- LLM: Yandex Cloud (для работы с серверов в РФ) ---
+    # Два режима, как в АвтоПосте (generator.py):
+    #   native -- YandexGPT через Foundation Models completion API;
+    #   openai -- открытые модели (DeepSeek/Qwen) через AI Studio Responses API.
+    yandex_api_key: Optional[str] = None
+    yandex_folder_id: Optional[str] = None
+    yandex_api_mode: str = "openai"  # native | openai
+    yandex_model_uri: Optional[str] = None  # дефолт: gpt://{folder_id}/yandexgpt/latest
+    yandex_model: str = "deepseek-v4-flash/latest"  # для режима openai
+
+    # --- Веб-платформа (аналитик как сайт, а не ТГ-чат) ---
+    # PLATFORM_ADMIN_PASSWORD обязателен, чтобы платформа вообще пускала
+    # внутрь: без него все /growth/api/* отвечают 503. Сырую аналитику
+    # не должен видеть никто, кроме владельца.
+    platform_admin_password: Optional[str] = None
+    # Ключ подписи сессионных токенов. Если не задан -- сессии живут до
+    # рестарта процесса (ключ генерируется случайно при старте).
+    platform_secret_key: Optional[str] = None
+    platform_session_ttl_hours: int = 720  # 30 дней
+    # secure-флаг сессионной cookie. True для прода (HTTPS). Ставить False
+    # только для локальной разработки по http.
+    platform_cookie_secure: bool = True
 
     # --- Текущий подключённый проект ---
     # В v1 сервис обслуживает один активный проект. Project как модель в БД

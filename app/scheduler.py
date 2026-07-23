@@ -75,6 +75,18 @@ from app.service import (
 logger = logging.getLogger("growth_agent.scheduler")
 _RUN_CONTEXT: ContextVar[str] = ContextVar("growth_agent_run_context", default="scheduled_or_api")
 
+def _project_token(project) -> str | None:
+    """Токен внутреннего API проекта: из настроек самого проекта (создан
+    через веб-платформу), иначе из env -- legacy-путь единственного
+    проекта v1. Дубликат логики platform_api.project_internal_api_token
+    без импорта, чтобы не создавать цикл scheduler <-> platform_api."""
+    token = (getattr(project, "settings_json", None) or {}).get("internal_api_token")
+    if token:
+        return token
+    return get_settings().project_internal_api_token
+
+
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -168,7 +180,7 @@ async def _fetch_product_metrics(project: Project, period_hours: int) -> tuple[d
     интеграция отсутствует, и в sources_ok "product" не попадёт.
     """
     settings = get_settings()
-    if not project.base_url or not settings.project_internal_api_token:
+    if not project.base_url or not _project_token(project):
         return None, None, None  # not configured, не ошибка
 
     funnel_mapping = project.settings_json.get("funnel_mapping", truepost_connector.DEFAULT_FUNNEL_MAPPING)
@@ -177,7 +189,7 @@ async def _fetch_product_metrics(project: Project, period_hours: int) -> tuple[d
         result = await _run_with_timeout(
             truepost_connector.fetch_metrics(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_hours=period_hours,
                 funnel_mapping=funnel_mapping,
             ),
@@ -566,7 +578,7 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # достаточный объём кликов для MIN_CLICKS_FOR_DEEP_DIAGNOSTICS.
         settings = get_settings()
         direct_configured = bool(settings.effective_direct_oauth_token and settings.direct_client_login)
-        product_configured = bool(project.base_url and settings.project_internal_api_token)
+        product_configured = bool(project.base_url and _project_token(project))
         metrics_7d = metrics_by_window.get("7d")
 
         # Флаги показа кнопок считаются ВСЕГДА, независимо от того, что
@@ -1207,14 +1219,14 @@ async def run_onboarding_diagnostics_for_project(project: Project, settings, per
     "error": "..."|None} -- единый формат для scheduler.py/telegram_bot.py,
     не бросает исключения наружу.
     """
-    if not project.base_url or not settings.project_internal_api_token:
+    if not project.base_url or not _project_token(project):
         return {"status": "not_available", "result": None, "error": None}
 
     try:
         connector_result = await _run_with_timeout(
             onboarding_connector.fetch_onboarding_diagnostics(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_hours=period_hours,
             ),
             CONNECTOR_CALL_TIMEOUT_SECONDS,
@@ -1295,14 +1307,14 @@ async def run_landing_funnel_diagnostics_for_project(
     обязан запрашивать оба за один и тот же period_hours -- не передавать
     сюда клики за другое окно, даже если оно "более показательное".
     """
-    if not project.base_url or not settings.project_internal_api_token:
+    if not project.base_url or not _project_token(project):
         return {"status": "not_configured", "result": None, "error": None}
 
     try:
         connector_result = await _run_with_timeout(
             landing_connector.fetch_landing_funnel_diagnostics(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_hours=period_hours,
             ),
             CONNECTOR_CALL_TIMEOUT_SECONDS,
@@ -1390,12 +1402,12 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
         return
 
     # Уровень 1: discrete user-events (Founder Live Feed)
-    if project.base_url and settings.project_internal_api_token:
+    if project.base_url and _project_token(project):
         try:
             from app.connectors.user_events import fetch_user_events
             events_result = await fetch_user_events(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_minutes=120,
                 limit=200,
             )
@@ -1416,12 +1428,12 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
             )
 
     journeys_result = None
-    if project.base_url and settings.project_internal_api_token:
+    if project.base_url and _project_token(project):
         try:
             from app.connectors.user_journeys import fetch_user_journeys
             journeys_result = await fetch_user_journeys(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_hours=24,
                 limit=100,
             )
@@ -1672,14 +1684,14 @@ async def run_payment_path_diagnostics_for_project(
     даёт достаточно данных о попытках оплаты для вывода. Не 24h, потому что
     у малого проекта в сутки может быть 0 событий оплаты -- это не сигнал.
     """
-    if not project.base_url or not settings.project_internal_api_token:
+    if not project.base_url or not _project_token(project):
         return {"status": "not_configured", "result": None, "error": None}
 
     try:
         connector_result = await _run_with_timeout(
             payment_path_connector.fetch_payment_path_diagnostics(
                 base_url=project.base_url,
-                api_token=settings.project_internal_api_token,
+                api_token=_project_token(project),
                 period_hours=period_hours,
             ),
             CONNECTOR_CALL_TIMEOUT_SECONDS,
