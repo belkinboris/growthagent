@@ -47,20 +47,35 @@
 
 ## Чеклист прогресса
 
-- [ ] 1. Этот план закоммичен и запушен (growthagent)
-- [ ] 2. Бэкенд платформы: `app/platform_auth.py`, `app/platform_api.py`,
+- [x] 1. Этот план закоммичен и запушен (growthagent)
+- [x] 2. Бэкенд платформы: `app/platform_auth.py`, `app/platform_api.py`,
         монтирование в `app/main.py` под `/growth`, projects CRUD,
-        test-connection с автообнаружением endpoints
-- [ ] 3. LLM-роутер в `app/ask.py`: провайдер `yandex` (native + openai-режим),
-        новые env в `app/config.py`, обновлён `.env.example`
-- [ ] 4. Веб-UI: `app/static/platform/` — логин, доска, проекты (мастер
-        подключения), чат с аналитиком
-- [ ] 5. Восстановлены повреждённые корневые `Procfile`, `requirements.txt`
-        (битые после загрузки через GitHub UI)
-- [ ] 6. AutoPost: `robots.txt`/`sitemap.xml` → projectautopost.ru,
-        подключён `user_events_router` в `main.py`
-- [ ] 7. `COMPASS_INTEGRATION.md` — как смонтировать платформу в Compass
+        test-connection с автообнаружением endpoints (проверено smoke-тестами
+        и мок-сервером internal API — вход/выход/создание/активация работают)
+- [x] 3. LLM-роутер в `app/ask.py`: провайдер `yandex` (native + openai-режим),
+        новые env в `app/config.py`, обновлён `.env.example` (unit-тест обоих
+        режимов пройден)
+- [x] 4. Веб-UI: `app/static/platform/index.html` — логин, обзор
+        (воронка/интеграции/сигналы), проекты (мастер подключения), чат
+- [x] 5. Восстановлены повреждённые корневые `Procfile`, `requirements.txt`,
+        `railway.toml` (битые после загрузки через GitHub UI)
+- [x] 6. AutoPost: `robots.txt`/`sitemap.xml` → projectautopost.ru,
+        подключён `user_events_router` в `main.py` (9/9 интеграционных
+        тестов test_user_events.py прошли)
+- [x] 7. `COMPASS_INTEGRATION.md` — как смонтировать платформу в Compass
         на одном домене; финальный пуш всех трёх репо
+
+## Что дальше (следующая сессия)
+
+- [ ] Деплой growthagent на Timeweb (см. раздел «Деплой» ниже) и проверка
+      `/growth` на живом сервере.
+- [ ] Ротация internal-токена: сгенерировать новый, поставить в env АвтоПоста
+      (`TRUEPOST_INTERNAL_API_TOKEN`) и в проект на платформе (старый засветился в чате).
+- [ ] Прогнать чат с аналитиком на реальном YANDEX_API_KEY (режим openai/DeepSeek).
+- [ ] Опционально: перенести Метрику/Директ-ключи на уровень проекта
+      (сейчас OAuth-токены Яндекса общие, из env).
+- [ ] При появлении аккаунтов в Compass — заменить require_admin на роль
+      Compass (одна точка, см. COMPASS_INTEGRATION.md, п.5).
 
 ## Деплой (когда код готов)
 
