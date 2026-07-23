@@ -86,8 +86,14 @@
 ## Деплой (когда код готов)
 
 1. growthagent деплоится на любой РФ-хостинг как отдельное приложение; логично —
-   Timeweb-аккаунт Создателя (будущий общий домен projectsozdatel.ru/growth):
-   `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+   Timeweb-аккаунт Создателя: `uvicorn app.main:app --host 0.0.0.0 --port 8080`
+   (Timeweb не прокидывает $PORT; Python 3.12; healthcheck /health — уроки
+   деплоя Создателя из его README).
+   Домен: бесплатный поддомен Создателя, новый покупать не нужно —
+   на reg.ru в зоне projectsozdatel.ru добавить A-запись
+   (например, `analitik` → публичный IP Timeweb-приложения аналитика),
+   привязать analitik.projectsozdatel.ru в Timeweb, платформа будет на
+   https://analitik.projectsozdatel.ru/growth без изменений кода.
 2. Env: `DATABASE_URL`, `PLATFORM_ADMIN_PASSWORD`, `SECRET_KEY`,
    `LLM_PROVIDER=yandex`, `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`,
    `PROJECT_BASE_URL=https://projectautopost.ru`, `PROJECT_INTERNAL_API_TOKEN=<новый>`;
