@@ -27,6 +27,7 @@ from telegram import Update
 from app.config import BUILD_MARKER, RUN_CYCLE_TIMEOUT_SECONDS, get_settings
 from app.db import get_session, init_db
 from app.models import Alert, Integration, MetricSnapshot, Project
+from app.platform_api import router as platform_router
 from app.scheduler import run_cycle_once_sync_with_timeout, start_scheduler, stop_scheduler
 from app.telegram_bot import build_application, send_cycle_notification
 
@@ -34,6 +35,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("growth_agent.main")
 
 app = FastAPI(title="Growth Agent Watchtower")
+
+# Веб-платформа Аналитика Воронки. Живёт целиком под /growth, чтобы её можно
+# было смонтировать в другое приложение (Compass) на одном домене -- см.
+# COMPASS_INTEGRATION.md. Доступ только по паролю владельца (platform_auth.py).
+app.include_router(platform_router, prefix="/growth")
 
 _telegram_app = None  # инициализируется в startup, если BOT_TOKEN задан
 

@@ -26,6 +26,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+# Yandex Cloud: два режима, как в generator.py АвтоПоста.
+YANDEX_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_RESPONSES_URL = "https://ai.api.cloud.yandex.net/v1/responses"
+# Невидимые reasoning-токены DeepSeek съедают лимит вывода -- запас как в АвтоПосте.
+YANDEX_REASONING_TOKENS_MARGIN = 8000
 MAX_QUESTION_CHARS = 1000
 MAX_CONTEXT_CHARS = 9000     # доска+воронка+оплата+эксперимент обычно ~3-5k
 MAX_ANSWER_TOKENS = 700
@@ -211,6 +216,10 @@ async def answer_question(
     if not question:
         return None
 
+    provider = getattr(settings, "llm_provider", "none")
+    if provider == "yandex":
+        return await _answer_yandex(question, context_text, settings, _post=_post)
+
     payload = {
         "model": settings.anthropic_model,
         "max_tokens": MAX_ANSWER_TOKENS,
@@ -240,8 +249,87 @@ async def answer_question(
         return None
 
 
+async def _answer_yandex(
+    question: str,
+    context_text: str,
+    settings,
+    *,
+    _post=None,
+) -> str | None:
+    """
+    Вызов LLM через Yandex Cloud -- работает с серверов в РФ, в отличие от
+    Anthropic API. Режимы (YANDEX_API_MODE):
+      native -- YandexGPT, Foundation Models completion API;
+      openai -- DeepSeek/Qwen и др. открытые модели, AI Studio Responses API.
+    """
+    system_text = SYSTEM_PROMPT + "\n\n=== ТЕКУЩИЕ ДАННЫЕ ПРОЕКТА ===\n" + context_text
+    mode = getattr(settings, "yandex_api_mode", "openai")
+    headers = {
+        "Authorization": f"Api-Key {settings.yandex_api_key}",
+        "content-type": "application/json",
+    }
+
+    if mode == "native":
+        model_uri = settings.yandex_model_uri or f"gpt://{settings.yandex_folder_id}/yandexgpt/latest"
+        url = YANDEX_COMPLETION_URL
+        payload = {
+            "modelUri": model_uri,
+            "completionOptions": {"stream": False, "maxTokens": str(MAX_ANSWER_TOKENS)},
+            "messages": [
+                {"role": "system", "text": system_text},
+                {"role": "user", "text": question},
+            ],
+        }
+    else:
+        url = YANDEX_RESPONSES_URL
+        payload = {
+            "model": f"{settings.yandex_folder_id}/{settings.yandex_model}",
+            "instructions": system_text,
+            "input": question,
+            "max_output_tokens": MAX_ANSWER_TOKENS + YANDEX_REASONING_TOKENS_MARGIN,
+            "thinking": {"type": "disabled"},
+        }
+
+    try:
+        if _post is not None:
+            data = await _post(payload, headers)
+        else:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code != 200:
+                    logger.warning("ask: yandex HTTP %s: %s", resp.status_code, resp.text[:300])
+                    return None
+                data = resp.json()
+        return _extract_yandex_text(data, mode)
+    except Exception:
+        logger.exception("ask: yandex call failed")
+        return None
+
+
+def _extract_yandex_text(data: dict, mode: str) -> str | None:
+    if mode == "native":
+        try:
+            text = data["result"]["alternatives"][0]["message"]["text"].strip()
+            return text or None
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return None
+    # Responses API: output -- список блоков, текст в output[].content[].text
+    parts: list[str] = []
+    for item in data.get("output") or []:
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("text"):
+                parts.append(block["text"])
+    text = "\n".join(parts).strip()
+    return text or None
+
+
 def is_configured(settings) -> bool:
-    return bool(
-        getattr(settings, "anthropic_api_key", None)
-        and getattr(settings, "llm_provider", "none") == "anthropic"
-    )
+    provider = getattr(settings, "llm_provider", "none")
+    if provider == "anthropic":
+        return bool(getattr(settings, "anthropic_api_key", None))
+    if provider == "yandex":
+        return bool(
+            getattr(settings, "yandex_api_key", None)
+            and getattr(settings, "yandex_folder_id", None)
+        )
+    return False

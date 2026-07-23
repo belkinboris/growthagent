@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Аналитик Воронки</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --border:#2a2f3a;
+    --text:#e8eaf0; --muted:#8b93a3; --accent:#6ea8fe; --ok:#4ade80;
+    --warn:#fbbf24; --bad:#f87171; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.55 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+  a{color:var(--accent)}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+    border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .spacer{flex:1}
+  nav button{background:none;border:none;color:var(--muted);font-size:14px;
+    padding:8px 12px;cursor:pointer;border-radius:8px}
+  nav button.active{color:var(--text);background:var(--panel2)}
+  main{max-width:960px;margin:0 auto;padding:20px}
+  .card{background:var(--panel);border:1px solid var(--border);
+    border-radius:var(--radius);padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 12px;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.04em}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:500}
+  tr:last-child td{border-bottom:none}
+  .badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;
+    border:1px solid var(--border);color:var(--muted)}
+  .badge.ok{color:var(--ok);border-color:var(--ok)}
+  .badge.error,.badge.P0,.badge.P1{color:var(--bad);border-color:var(--bad)}
+  .badge.stale,.badge.P2{color:var(--warn);border-color:var(--warn)}
+  input,select,textarea{width:100%;background:var(--panel2);color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:9px 12px;
+    font:inherit;margin:4px 0 12px}
+  label{font-size:13px;color:var(--muted)}
+  button.primary{background:var(--accent);color:#0b1020;border:none;
+    border-radius:8px;padding:10px 18px;font:600 14px/1 inherit;cursor:pointer}
+  button.secondary{background:var(--panel2);color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:9px 16px;
+    font:inherit;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .muted{color:var(--muted);font-size:13px}
+  .error-text{color:var(--bad);font-size:13px;margin:6px 0}
+  .ok-text{color:var(--ok);font-size:13px;margin:6px 0}
+  #login-view{max-width:360px;margin:12vh auto 0}
+  .hidden{display:none !important}
+  /* Чат */
+  #chat-log{display:flex;flex-direction:column;gap:10px;max-height:55vh;
+    overflow-y:auto;padding:4px 0;margin-bottom:12px}
+  .msg{padding:10px 14px;border-radius:12px;max-width:85%;white-space:pre-wrap}
+  .msg.user{align-self:flex-end;background:#243b63}
+  .msg.bot{align-self:flex-start;background:var(--panel2)}
+  .chat-row{display:flex;gap:10px}
+  .chat-row textarea{flex:1;margin:0;resize:vertical;min-height:44px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+  @media(max-width:640px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📊 Аналитик Воронки</h1>
+  <div class="spacer"></div>
+  <nav id="tabs" class="hidden">
+    <button data-tab="overview" class="active">Обзор</button>
+    <button data-tab="projects">Проекты</button>
+    <button data-tab="chat">Чат</button>
+    <button id="logout-btn" title="Выйти">Выйти</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Логин -->
+  <div id="login-view">
+    <div class="card">
+      <h2>Вход для владельца</h2>
+      <p class="muted">Сырая аналитика доступна только владельцу проекта.</p>
+      <label>Пароль</label>
+      <input type="password" id="login-password" autocomplete="current-password">
+      <div id="login-error" class="error-text hidden"></div>
+      <button class="primary" id="login-btn">Войти</button>
+    </div>
+  </div>
+
+  <!-- Обзор -->
+  <div id="view-overview" class="hidden">
+    <div class="card">
+      <h2>Проект</h2>
+      <div id="overview-project" class="muted">Загрузка…</div>
+      <div style="margin-top:12px">
+        <button class="secondary" id="run-btn">Проверить сейчас</button>
+        <span id="run-result" class="muted" style="margin-left:10px"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Воронка</h2>
+      <table id="funnel-table"><tbody></tbody></table>
+      <p class="muted" id="funnel-note"></p>
+    </div>
+    <div class="card">
+      <h2>Интеграции</h2>
+      <table id="integrations-table"><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Сигналы</h2>
+      <table id="alerts-table"><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- Проекты -->
+  <div id="view-projects" class="hidden">
+    <div class="card">
+      <h2>Подключённые проекты</h2>
+      <table id="projects-table"><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Подключить новый проект</h2>
+      <p class="muted">
+        Обязательных поля три. Всё остальное аналитик определит сам:
+        проверит связь, найдёт доступные endpoints и поставит стандартную
+        разметку воронки. Проект должен реализовать внутренний API
+        (минимум <code>/api/internal/metrics</code> c Bearer-токеном) —
+        см. CONTRACT.md в репозитории.
+      </p>
+      <div class="grid2">
+        <div>
+          <label>Название проекта *</label>
+          <input id="np-name" placeholder="АвтоПост">
+        </div>
+        <div>
+          <label>Тип</label>
+          <select id="np-type">
+            <option value="telegram_saas">Telegram SaaS</option>
+            <option value="web_app">Веб-приложение</option>
+            <option value="mobile_app">Мобильное приложение</option>
+          </select>
+        </div>
+      </div>
+      <label>Адрес проекта (base URL) *</label>
+      <input id="np-url" placeholder="https://projectautopost.ru">
+      <label>Токен внутреннего API *</label>
+      <input id="np-token" placeholder="значение TRUEPOST_INTERNAL_API_TOKEN на стороне проекта">
+      <details style="margin-bottom:12px">
+        <summary class="muted" style="cursor:pointer">Необязательно: внешние источники</summary>
+        <div class="grid2" style="margin-top:10px">
+          <div>
+            <label>Счётчик Яндекс.Метрики</label>
+            <input id="np-metrika" placeholder="12345678">
+          </div>
+          <div>
+            <label>Логин Яндекс.Директа</label>
+            <input id="np-direct" placeholder="client-login">
+          </div>
+        </div>
+        <p class="muted">OAuth-токены Яндекса задаются в переменных окружения сервера аналитика.</p>
+      </details>
+      <button class="secondary" id="np-test">Проверить подключение</button>
+      <button class="primary" id="np-create" disabled>Подключить</button>
+      <div id="np-result" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <!-- Чат -->
+  <div id="view-chat" class="hidden">
+    <div class="card">
+      <h2>Чат с аналитиком</h2>
+      <div id="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input" placeholder="Почему упали регистрации?"></textarea>
+        <button class="primary" id="chat-send">→</button>
+      </div>
+      <p class="muted">Аналитик отвечает по своим данным (воронка, оплата,
+        эксперименты). Решений сам не принимает.</p>
+    </div>
+  </div>
+</main>
+
+<script>
+const BASE = location.pathname.replace(/\/$/, ''); // работает и как /growth, и в составе другого приложения
+
+async function api(path, opts = {}) {
+  const resp = await fetch(BASE + path, {
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'same-origin',
+    ...opts,
+  });
+  if (resp.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const d = data.detail;
+    throw new Error(typeof d === 'string' ? d : (d && d.message) || 'Ошибка ' + resp.status);
+  }
+  return data;
+}
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function showLogin() {
+  $('login-view').classList.remove('hidden');
+  $('tabs').classList.add('hidden');
+  ['overview','projects','chat'].forEach(t => $('view-'+t).classList.add('hidden'));
+}
+function showApp() {
+  $('login-view').classList.add('hidden');
+  $('tabs').classList.remove('hidden');
+  switchTab('overview');
+}
+function switchTab(tab) {
+  ['overview','projects','chat'].forEach(t => {
+    $('view-'+t).classList.toggle('hidden', t !== tab);
+  });
+  document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab));
+  if (tab === 'overview') loadOverview();
+  if (tab === 'projects') loadProjects();
+}
+
+// --- Логин ---
+$('login-btn').onclick = async () => {
+  $('login-error').classList.add('hidden');
+  try {
+    await api('/api/login', {method:'POST',
+      body: JSON.stringify({password: $('login-password').value})});
+    $('login-password').value = '';
+    showApp();
+  } catch (e) {
+    $('login-error').textContent = e.message;
+    $('login-error').classList.remove('hidden');
+  }
+};
+$('login-password').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('login-btn').click();
+});
+$('logout-btn').onclick = async () => {
+  try { await api('/api/logout', {method:'POST'}); } catch(e) {}
+  showLogin();
+};
+document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
+  b.onclick = () => switchTab(b.dataset.tab));
+
+// --- Обзор ---
+const FUNNEL_TITLES = {
+  traffic:'Трафик', signup:'Регистрации', activation_1:'Активация 1',
+  activation_2:'Активация 2', payment_started:'Оплата начата',
+  payment_success:'Оплата успешна', revenue:'Выручка, ₽',
+};
+async function loadOverview() {
+  try {
+    const o = await api('/api/overview');
+    if (!o.project) {
+      $('overview-project').textContent = 'Нет активного проекта — подключите его на вкладке «Проекты».';
+    } else {
+      $('overview-project').innerHTML =
+        `<b>${esc(o.project.name)}</b> · ${esc(o.project.base_url || '—')} · ` +
+        `режим: ${esc(o.project.mode)} · открытых сигналов: ${o.open_alerts_count} ` +
+        `<span class="muted">· сборка ${esc(o.build_marker)}</span>`;
+      const it = $('integrations-table').tBodies[0];
+      it.innerHTML = o.integrations.map(i =>
+        `<tr><td>${esc(i.type)}</td>
+         <td><span class="badge ${esc(i.status)}">${esc(i.status)}</span></td>
+         <td class="muted">${i.last_sync_at ? esc(i.last_sync_at.slice(0,16).replace('T',' ')) : '—'}</td>
+         <td class="muted">${esc(i.last_error || '')}</td></tr>`).join('');
+    }
+    const f = await api('/api/funnel');
+    const windows = ['3h','24h','7d'];
+    const tb = $('funnel-table').tBodies[0];
+    let rows = `<tr><th></th>${windows.map(w=>`<th>${w}</th>`).join('')}</tr>`;
+    for (const key of Object.keys(FUNNEL_TITLES)) {
+      rows += `<tr><td>${FUNNEL_TITLES[key]}</td>` + windows.map(w => {
+        const v = f.windows[w] && f.windows[w].funnel[key];
+        return `<td>${v == null ? '<span class="muted">—</span>' : esc(v)}</td>`;
+      }).join('') + '</tr>';
+    }
+    tb.innerHTML = rows;
+    const last = windows.map(w => f.windows[w]).filter(Boolean).pop();
+    $('funnel-note').textContent = last
+      ? `Источник: ${last.source}, данные на ${last.as_of ? last.as_of.slice(0,16).replace('T',' ') : '—'} UTC`
+      : 'Снимков ещё нет — нажмите «Проверить сейчас».';
+    const alerts = await api('/api/alerts?limit=15');
+    $('alerts-table').tBodies[0].innerHTML = alerts.length ? alerts.map(a =>
+      `<tr><td><span class="badge ${esc(a.severity)}">${esc(a.severity)}</span></td>
+       <td>${esc(a.title)}<div class="muted">${esc(a.message).slice(0,300)}</div></td>
+       <td class="muted">${esc(a.status)} ×${a.occurrence_count}</td>
+       <td class="muted">${esc(a.last_seen_at.slice(0,16).replace('T',' '))}</td></tr>`).join('')
+      : '<tr><td class="muted">Сигналов нет — это хорошо.</td></tr>';
+  } catch (e) {
+    if (e.message !== 'unauthorized') console.error(e);
+  }
+}
+$('run-btn').onclick = async () => {
+  $('run-btn').disabled = true;
+  $('run-result').textContent = 'Проверяю…';
+  try {
+    const r = await api('/api/run', {method:'POST'});
+    $('run-result').textContent = r.primary
+      ? `Главный сигнал: ${r.primary.title}`
+      : 'Проверка завершена, новых проблем не найдено.';
+    loadOverview();
+  } catch (e) {
+    $('run-result').textContent = e.message;
+  } finally {
+    $('run-btn').disabled = false;
+  }
+};
+
+// --- Проекты ---
+async function loadProjects() {
+  try {
+    const list = await api('/api/projects');
+    $('projects-table').tBodies[0].innerHTML = list.length ? list.map(p =>
+      `<tr><td><b>${esc(p.name)}</b><div class="muted">${esc(p.base_url || '—')}</div></td>
+       <td>${p.is_active ? '<span class="badge ok">активный</span>'
+                          : `<button class="secondary" onclick="activate(${p.id})">сделать активным</button>`}</td>
+       <td class="muted">${(p.available_endpoints || []).length} endpoints</td>
+       <td><button class="secondary" onclick="retest(${p.id})">перепроверить</button></td></tr>`).join('')
+      : '<tr><td class="muted">Проектов пока нет.</td></tr>';
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+window.activate = async id => { await api(`/api/projects/${id}/activate`, {method:'POST'}); loadProjects(); };
+window.retest = async id => {
+  const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
+  alert(r.ok ? 'Связь есть. Доступно endpoints: ' + r.available_endpoints.join(', ')
+             : 'Проблема: ' + (r.hint || JSON.stringify(r.errors)));
+  loadProjects();
+};
+
+function newProjectPayload() {
+  return {
+    name: $('np-name').value.trim(),
+    type: $('np-type').value,
+    base_url: $('np-url').value.trim(),
+    internal_api_token: $('np-token').value.trim(),
+    metrika_counter_id: $('np-metrika').value.trim() || null,
+    direct_client_login: $('np-direct').value.trim() || null,
+  };
+}
+$('np-test').onclick = async () => {
+  const p = newProjectPayload();
+  const box = $('np-result');
+  if (!p.base_url || !p.internal_api_token) {
+    box.innerHTML = '<div class="error-text">Заполните адрес и токен.</div>'; return;
+  }
+  box.innerHTML = '<div class="muted">Проверяю…</div>';
+  try {
+    const r = await api('/api/connection-test', {method:'POST',
+      body: JSON.stringify({base_url: p.base_url, internal_api_token: p.internal_api_token})});
+    if (r.ok) {
+      box.innerHTML = `<div class="ok-text">Связь есть. Найдены endpoints: ${r.available_endpoints.map(esc).join(', ')}</div>`;
+      $('np-create').disabled = false;
+    } else {
+      box.innerHTML = `<div class="error-text">${esc(r.hint || 'Подключение не удалось')}</div>` +
+        `<div class="muted">${esc(JSON.stringify(r.errors))}</div>`;
+      $('np-create').disabled = true;
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="error-text">${esc(e.message)}</div>`;
+  }
+};
+$('np-create').onclick = async () => {
+  const box = $('np-result');
+  try {
+    const r = await api('/api/projects', {method:'POST', body: JSON.stringify(newProjectPayload())});
+    box.innerHTML = `<div class="ok-text">Проект «${esc(r.project.name)}» подключён.</div>`;
+    ['np-name','np-url','np-token','np-metrika','np-direct'].forEach(id => $(id).value = '');
+    $('np-create').disabled = true;
+    loadProjects();
+  } catch (e) {
+    box.innerHTML = `<div class="error-text">${esc(e.message)}</div>`;
+  }
+};
+
+// --- Чат ---
+function addMsg(text, who) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + who;
+  div.textContent = text;
+  $('chat-log').appendChild(div);
+  $('chat-log').scrollTop = $('chat-log').scrollHeight;
+  return div;
+}
+$('chat-send').onclick = async () => {
+  const q = $('chat-input').value.trim();
+  if (!q) return;
+  $('chat-input').value = '';
+  addMsg(q, 'user');
+  const pending = addMsg('…', 'bot');
+  try {
+    const r = await api('/api/ask', {method:'POST', body: JSON.stringify({question: q})});
+    pending.textContent = r.answer;
+  } catch (e) {
+    pending.textContent = '⚠️ ' + e.message;
+  }
+};
+$('chat-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('chat-send').click(); }
+});
+
+// --- Старт: если сессия жива, /api/overview ответит 200 ---
+(async () => {
+  try { await api('/api/overview'); showApp(); }
+  catch (e) { showLogin(); }
+})();
+</script>
+</body>
+</html>
