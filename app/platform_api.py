@@ -235,11 +235,20 @@ async def funnel():
                 result[period_key] = None
                 continue
             metrics = snapshot.metrics_json or {}
+            # combined-снэпшот хранит вложенную структуру
+            # {"product": {нормализованные ключи}, "direct": {...}} --
+            # см. service.extract_normalized_metrics_from_snapshot.
+            # Флэт-структура -- запасной путь для чисто продуктовых снэпшотов.
+            product = metrics.get("product") if isinstance(metrics.get("product"), dict) else metrics
+            direct = metrics.get("direct") if isinstance(metrics.get("direct"), dict) else {}
+            funnel_values = {k: product.get(k) for k in CORE_FUNNEL_KEYS}
+            if funnel_values.get("traffic") is None and direct.get("clicks") is not None:
+                funnel_values["traffic"] = direct.get("clicks")
             result[period_key] = {
                 "source": snapshot.source,
                 "as_of": snapshot.as_of.isoformat() if snapshot.as_of else None,
                 "created_at": snapshot.created_at.isoformat(),
-                "funnel": {k: metrics.get(k) for k in CORE_FUNNEL_KEYS},
+                "funnel": funnel_values,
             }
         return {"project_id": project.id, "windows": result}
 
@@ -252,23 +261,45 @@ async def alerts(limit: int = 30):
             select(Alert)
             .where(Alert.project_id == project.id)
             .order_by(Alert.last_seen_at.desc())
-            .limit(limit)
+            .limit(limit * 3)  # запас: дубли по окнам схлопнутся ниже
         ).all()
-        return [
-            {
-                "id": a.id,
-                "title": a.title,
-                "message": a.message,
-                "category": a.category.value,
-                "severity": a.severity.value,
-                "confidence": a.confidence.value,
-                "status": a.status.value,
-                "occurrence_count": a.occurrence_count,
-                "first_seen_at": a.first_seen_at.isoformat(),
-                "last_seen_at": a.last_seen_at.isoformat(),
-            }
-            for a in rows
-        ]
+
+        # Одно и то же правило срабатывает отдельно в каждом окне (3h/24h/7d),
+        # fingerprint = project/rule/period/step -- это осознанный дизайн ядра
+        # (см. rules.py). Но владельцу в списке нужен один сигнал с пометкой,
+        # в каких окнах он виден, а не три одинаковые строки.
+        grouped: dict[str, dict] = {}
+        for a in rows:
+            parts = a.fingerprint.split("/")
+            period = parts[2] if len(parts) == 4 else None
+            group_key = f"{parts[1]}/{parts[3]}" if len(parts) == 4 else f"{a.category.value}/{a.title}"
+            g = grouped.get(group_key)
+            if g is None:
+                grouped[group_key] = {
+                    "id": a.id,
+                    "title": a.title,
+                    "message": a.message,
+                    "category": a.category.value,
+                    "severity": a.severity.value,
+                    "confidence": a.confidence.value,
+                    "status": a.status.value,
+                    "occurrence_count": a.occurrence_count,
+                    "first_seen_at": a.first_seen_at.isoformat(),
+                    "last_seen_at": a.last_seen_at.isoformat(),
+                    "periods": [period] if period else [],
+                }
+            else:
+                if period and period not in g["periods"]:
+                    g["periods"].append(period)
+                # показываем худшую severity из окон ("P0" < "P1" лексикографически)
+                if a.severity.value < g["severity"]:
+                    g["severity"] = a.severity.value
+                g["occurrence_count"] = max(g["occurrence_count"], a.occurrence_count)
+        window_order = {"3h": 0, "24h": 1, "7d": 2}
+        out = list(grouped.values())[:limit]
+        for g in out:
+            g["periods"].sort(key=lambda p: window_order.get(p, 9))
+        return out
 
 
 @router.post("/api/run", dependencies=[Depends(require_admin)])

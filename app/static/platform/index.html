@@ -289,6 +289,7 @@ async function loadOverview() {
     $('alerts-table').tBodies[0].innerHTML = alerts.length ? alerts.map(a =>
       `<tr><td><span class="badge ${esc(a.severity)}">${esc(a.severity)}</span></td>
        <td>${esc(a.title)}<div class="muted">${esc(a.message).slice(0,300)}</div></td>
+       <td class="muted">${(a.periods||[]).map(esc).join(', ') || '—'}</td>
        <td class="muted">${esc(a.status)} ×${a.occurrence_count}</td>
        <td class="muted">${esc(a.last_seen_at.slice(0,16).replace('T',' '))}</td></tr>`).join('')
       : '<tr><td class="muted">Сигналов нет — это хорошо.</td></tr>';
