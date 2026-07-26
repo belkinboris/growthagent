@@ -151,6 +151,10 @@ class Settings(BaseSettings):
     # --- Telegram ---
     bot_token: Optional[str] = None
     bot_admin_chat_ids: str = ""  # список через запятую, парсится в telegram_bot.py
+    # Релей Telegram Bot API (Cloudflare Worker), как TELEGRAM_API_BASE в
+    # АвтоПосте: с серверов Timeweb прямой путь к api.telegram.org ненадёжен.
+    # Пусто -- прямое подключение.
+    telegram_api_base: Optional[str] = None
 
     # --- LLM (опционально) ---
     llm_provider: str = "none"  # none | openai | anthropic | yandex
