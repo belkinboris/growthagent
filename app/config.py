@@ -298,4 +298,4 @@ STATUS_COMMAND_DB_TIMEOUT_SECONDS = 1.5
 # просто текстовая метка последнего значимого изменения. Видна через
 # /status и /start, чтобы быстро проверить, какая версия кода реально
 # запущена на сервере, не гадая по поведению.
-BUILD_MARKER = "growth-agent-peak-ratchet-2026-07-16"
+BUILD_MARKER = "growth-agent-platform-2026-07-26"

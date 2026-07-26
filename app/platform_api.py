@@ -179,6 +179,11 @@ async def overview():
         integrations = session.exec(
             select(Integration).where(Integration.project_id == project.id)
         ).all()
+        # Статусы telegram и llm никто не обновляет в цикле сбора (эти
+        # интеграции не источники метрик), поэтому в БД они навсегда
+        # not_configured -- даже когда бот шлёт сообщения. Считаем их
+        # состояние по конфигурации, чтобы список не врал владельцу.
+        live_status = _config_based_statuses(settings=get_settings())
         open_alerts = session.exec(
             select(Alert).where(
                 Alert.project_id == project.id,
@@ -198,7 +203,7 @@ async def overview():
             "integrations": [
                 {
                     "type": i.type.value,
-                    "status": i.status.value,
+                    "status": live_status.get(i.type.value, i.status.value),
                     "last_sync_at": i.last_sync_at.isoformat() if i.last_sync_at else None,
                     "last_error": i.last_error,
                 }
@@ -206,6 +211,17 @@ async def overview():
             ],
             "open_alerts_count": len(open_alerts),
         }
+
+
+def _config_based_statuses(settings) -> dict[str, str]:
+    """Статусы интеграций, которые определяются конфигурацией, а не сбором
+    данных: Telegram (канал уведомлений) и LLM (чат с аналитиком)."""
+    from app import ask as ask_module
+
+    return {
+        "telegram": "ok" if settings.bot_token else "not_configured",
+        "llm": "ok" if ask_module.is_configured(settings) else "not_configured",
+    }
 
 
 @router.get("/api/funnel", dependencies=[Depends(require_admin)])
