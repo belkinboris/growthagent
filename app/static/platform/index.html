@@ -50,6 +50,10 @@
     letter-spacing:.05em;margin-bottom:14px;display:flex;align-items:center;gap:10px}
   .card > h2 .spacer{flex:1}
   .muted{color:var(--muted);font-size:13px}
+  .purpose{color:var(--text-2);font-size:13px;line-height:1.5;margin:0 0 14px;
+    padding:10px 14px;background:var(--surface);border:1px solid var(--border);
+    border-left:3px solid var(--series-1);border-radius:8px}
+  .card .purpose{background:var(--surface-2);border-left-color:var(--series-1)}
   .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 
   /* KPI-плитки */
@@ -137,7 +141,9 @@
   <div class="spacer"></div>
   <nav id="tabs" class="hidden">
     <button data-tab="overview" class="active">Обзор</button>
+    <button data-tab="ads">Реклама</button>
     <button data-tab="live">Лента</button>
+    <button data-tab="history">История</button>
     <button data-tab="reports">Отчёты</button>
     <button data-tab="chat">Чат</button>
     <button data-tab="projects">Проекты</button>
@@ -165,10 +171,17 @@
       <span id="run-result" class="muted"></span>
     </div>
 
+    <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
+      и что делать дальше. Сверху — числа за неделю, ниже — единственное решение, которое
+      аналитик предлагает принять сейчас, затем где отваливаются люди и что сломалось.</p>
+
     <div class="kpis" id="kpis" style="margin-bottom:16px"></div>
 
     <div class="card" id="decision-card">
       <h2>Решение<span class="spacer"></span><span class="muted" id="decision-hint"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: одна проверка за раз. Аналитик предлагает
+        изменение, фиксирует базовый уровень и сам выносит вердикт, когда наберётся выборка —
+        поэтому во время проверки остальное трогать нельзя, иначе результат ничего не докажет.</p>
       <div id="decision-body" class="muted">Загрузка…</div>
     </div>
 
@@ -181,6 +194,8 @@
           <option value="3h">3 часа</option>
         </select>
       </h2>
+      <p class="purpose" style="margin-top:0">Зачем: найти шаг, где теряется больше всего людей.
+        Проценты — доля дошедших от предыдущего шага.</p>
       <div id="funnel-body"></div>
       <p class="muted" id="funnel-note" style="margin:12px 0 0"></p>
     </div>
@@ -192,12 +207,50 @@
 
     <div class="card">
       <h2>Сигналы<span class="spacer"></span><span class="muted" id="alerts-count"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: аналитик проверяет правила на каждом цикле
+        и показывает только то, что выбилось из нормы. «Понял» убирает сигнал, пока проблема
+        не повторится; задачу можно сразу отправить в разработку.</p>
       <div id="alerts-body"></div>
     </div>
 
     <div class="card">
       <h2>Источники данных</h2>
       <div class="row" id="integrations-body"></div>
+    </div>
+  </div>
+
+  <!-- РЕКЛАМА -->
+  <div id="view-ads" class="hidden">
+    <p class="purpose">Зачем: понять, окупается ли реклама. Слева — сколько денег ушло,
+      справа — что из этих людей выросло. Если источник даёт регистрации, но не даёт
+      оплат, проблема не в рекламе, а в продукте после регистрации.</p>
+    <div class="kpis" id="ads-kpis" style="margin-bottom:16px"></div>
+    <div class="card">
+      <h2>Откуда приходят и что из этого выходит<span class="spacer"></span>
+        <span class="muted">7 дней</span></h2>
+      <div class="chart-wrap"><table id="ads-table"><tbody></tbody></table></div>
+      <p class="muted" id="ads-note" style="margin:12px 0 0"></p>
+    </div>
+    <div class="card">
+      <h2>Глубокая проверка Директа</h2>
+      <p class="purpose" style="margin-top:0">Зачем: найти, какие поисковые запросы и площадки
+        тратят бюджет, не давая регистраций. Отчёт тяжёлый (до минуты), поэтому только по кнопке —
+        в обычном цикле аналитик его не запрашивает.</p>
+      <div class="row">
+        <button class="btn" id="deep-btn">Проверить глубже</button>
+        <span class="muted" id="deep-status"></span>
+      </div>
+      <div class="report" id="deep-body" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <!-- ИСТОРИЯ -->
+  <div id="view-history" class="hidden">
+    <p class="purpose">Зачем: помнить, что уже проверяли. Это защита от хождения по кругу —
+      видно, какие гипотезы подтвердились, какие нет, и что вы решили не делать.</p>
+    <div class="card">
+      <h2>История решений</h2>
+      <div id="history-body">Загрузка…</div>
     </div>
   </div>
 
@@ -214,6 +267,8 @@
         </select>
         <button class="btn sm" id="live-refresh">Обновить</button>
       </h2>
+      <p class="purpose" style="margin-top:0">Зачем: увидеть путь конкретного человека, а не
+        средние числа. Где обрывается цепочка — там и стоит искать проблему.</p>
       <div id="live-body">Загрузка…</div>
     </div>
   </div>
@@ -251,6 +306,20 @@
       <h2>Подключённые проекты</h2>
       <table id="projects-table"><tbody></tbody></table>
     </div>
+    <div class="card">
+      <h2>Названия этапов воронки<span class="spacer"></span>
+        <button class="btn sm" id="stages-ai">Предложить названия по сайту</button></h2>
+      <p class="purpose" style="margin-top:0">Зачем: внутри аналитик считает шаги
+        универсально (signup, activation_1…), но смотреть на это неудобно. У чужого проекта
+        шаги называются «Этап 1/2», пока их не назовут по-человечески — руками или
+        кнопкой слева: ИИ откроет сайт проекта и предложит названия.</p>
+      <div id="stages-body">Загрузка…</div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary sm" id="stages-save">Сохранить названия</button>
+        <span class="muted" id="stages-status"></span>
+      </div>
+    </div>
+
     <div class="card">
       <h2>Подключить проект</h2>
       <p class="muted">Заполните три поля — остальное аналитик определит сам: проверит
@@ -327,7 +396,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const VIEWS = ['overview','live','reports','chat','projects'];
+const VIEWS = ['overview','ads','live','history','reports','chat','projects'];
 function showLogin() {
   $('login-view').classList.remove('hidden');
   $('tabs').classList.add('hidden');
@@ -344,7 +413,9 @@ function switchTab(tab) {
   document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === tab));
   if (tab === 'overview') loadOverview();
+  if (tab === 'ads') loadAds();
   if (tab === 'live') loadLive();
+  if (tab === 'history') loadHistory();
   if (tab === 'reports') loadReport(currentReport);
   if (tab === 'projects') loadProjects();
 }
@@ -366,11 +437,11 @@ $('logout-btn').onclick = async () => { try { await api('/api/logout', {method:'
 document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 
 /* ---------------- Обзор ---------------- */
-const FUNNEL_STEPS = [
-  ['traffic','Клики рекламы'], ['signup','Регистрации'], ['activation_1','Канал создан'],
-  ['activation_2','Пост сгенерирован'], ['payment_started','Оплата начата'],
-  ['payment_success','Оплата успешна'],
-];
+// Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
+// у чужих проектов это «Этап 1/2», пока их не переименуют (вкладка «Проекты»).
+let STAGE_TITLES = {};
+let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_started','payment_success'];
+const stageTitle = k => STAGE_TITLES[k] || k;
 
 async function loadOverview() {
   try {
@@ -379,6 +450,8 @@ async function loadOverview() {
       api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
     ]);
     window._funnel = f.windows;
+    STAGE_TITLES = f.stage_titles || {};
+    STAGE_ORDER = (f.stage_order || STAGE_ORDER).filter(k => k !== 'revenue');
 
     if (o.project) {
       $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
@@ -404,15 +477,15 @@ function renderKpis(win) {
   const fu = (win && win.funnel) || {};
   const cpa = (fu.traffic && fu.signup) ? null : null;
   const tiles = [
-    {label:'Регистрации', value: fu.signup, sub:'за 7 дней'},
-    {label:'Канал создан', value: fu.activation_1,
+    {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней'},
+    {label: stageTitle('activation_1'), value: fu.activation_1,
      sub: pct(fu.activation_1, fu.signup, 'от регистраций')},
-    {label:'Оплата начата', value: fu.payment_started,
+    {label: stageTitle('payment_started'), value: fu.payment_started,
      sub: pct(fu.payment_started, fu.signup, 'от регистраций')},
-    {label:'Оплачено', value: fu.payment_success,
+    {label: stageTitle('payment_success'), value: fu.payment_success,
      sub: pct(fu.payment_success, fu.payment_started, 'от начатых')},
-    {label:'Выручка', value: fu.revenue, sub:'₽ за 7 дней'},
-    {label:'Клики рекламы', value: fu.traffic, sub:'Яндекс.Директ'},
+    {label: stageTitle('revenue'), value: fu.revenue, sub:'₽ за 7 дней'},
+    {label: stageTitle('traffic'), value: fu.traffic, sub:'Яндекс.Директ'},
   ];
   $('kpis').innerHTML = tiles.map(t =>
     `<div class="kpi"><div class="label">${esc(t.label)}</div>
@@ -433,11 +506,12 @@ function renderFunnel(winKey) {
     return;
   }
   const fu = win.funnel || {};
-  const values = FUNNEL_STEPS.map(([k]) => fu[k]).filter(v => v != null);
+  const values = STAGE_ORDER.map(k => fu[k]).filter(v => v != null);
   const max = Math.max(1, ...values);
   let html = '';
   let prevVal = null;
-  for (const [key, label] of FUNNEL_STEPS) {
+  for (const key of STAGE_ORDER) {
+    const label = stageTitle(key);
     const v = fu[key];
     if (v == null) continue;
     if (prevVal != null && prevVal > 0) {
@@ -599,6 +673,8 @@ function renderAlerts(alerts) {
     <div class="row" style="margin-top:9px">
       <button class="btn sm" onclick="alertAction(${a.id},'ack')">Понял</button>
       <button class="btn sm" onclick="alertAction(${a.id},'snooze')">Отложить на сутки</button>
+      <button class="btn sm" onclick="sendToDev(${JSON.stringify(a.title)}, ${JSON.stringify(
+        a.message + '\n\nИсточник: Аналитик Воронки, сигнал ' + a.severity + '.')})">В разработку</button>
       <span class="muted">${esc(a.last_seen_at.slice(0,16).replace('T',' '))}</span>
     </div></div>`).join('');
 }
@@ -616,6 +692,146 @@ $('run-btn').onclick = async () => {
     loadOverview();
   } catch (e) { $('run-result').textContent = e.message; }
   finally { $('run-btn').disabled = false; }
+};
+
+
+
+/* ---------------- Этапы воронки ---------------- */
+async function loadStages(projectId) {
+  try {
+    const r = await api(`/api/projects/${projectId}/stages`);
+    $('stages-body').innerHTML = r.stages.map(st => `<div class="row" style="margin-bottom:8px">
+      <code class="muted" style="min-width:130px">${esc(st.key)}</code>
+      <input data-stage="${esc(st.key)}" value="${esc(st.title)}" style="flex:1;margin:0;max-width:320px">
+      <span class="muted">${st.source_metric ? 'метрика: ' + esc(st.source_metric)
+        : (st.is_custom ? '' : 'название по умолчанию')}</span></div>`).join('');
+  } catch (e) { if (e.message !== 'unauthorized') $('stages-body').innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+$('stages-save').onclick = async () => {
+  const id = window._activeProjectId;
+  if (!id) return;
+  const titles = {};
+  document.querySelectorAll('#stages-body input[data-stage]').forEach(i => {
+    titles[i.dataset.stage] = i.value.trim();
+  });
+  $('stages-status').textContent = 'Сохраняю…';
+  try {
+    await api(`/api/projects/${id}/stages`, {method:'PUT', body: JSON.stringify({titles})});
+    $('stages-status').textContent = 'Сохранено — названия применились везде.';
+    loadStages(id);
+  } catch (e) { $('stages-status').textContent = e.message; }
+};
+$('stages-ai').onclick = async () => {
+  const id = window._activeProjectId;
+  if (!id) return;
+  $('stages-status').textContent = 'ИИ смотрит сайт проекта…';
+  try {
+    const r = await api(`/api/projects/${id}/stages/autoname`, {method:'POST'});
+    let applied = 0;
+    Object.entries(r.proposed || {}).forEach(([key, title]) => {
+      const input = document.querySelector(`#stages-body input[data-stage="${key}"]`);
+      if (input) { input.value = title; applied++; }
+    });
+    $('stages-status').textContent = applied
+      ? `Предложено ${applied} названий${r.site_used ? ' по тексту сайта' : ' (сайт недоступен, по метрикам)'} — проверьте и сохраните.`
+      : 'ИИ не смог предложить названия.';
+  } catch (e) { $('stages-status').textContent = e.message; }
+};
+
+/* ---------------- Реклама ---------------- */
+async function loadAds() {
+  try {
+    const a = await api('/api/ads');
+    const t = a.totals || {};
+    $('ads-kpis').innerHTML = [
+      {label:'Расход', value: t.spend, sub:'₽ за 7 дней'},
+      {label:'Клики', value: t.clicks, sub:'Яндекс.Директ'},
+      {label:'Регистрации', value: t.registrations, sub:'все источники'},
+      {label:'Цена регистрации', value: t.cpa, sub:'₽ · ' + (t.cpa_basis || 'Директ')},
+      {label:'Оплат', value: t.payment_success, sub:'за 7 дней'},
+    ].map(x => `<div class="kpi"><div class="label">${esc(x.label)}</div>
+      <div class="value">${nf(x.value)}</div><div class="sub">${esc(x.sub)}</div></div>`).join('');
+
+    const st = a.stage_titles || {};
+    const rows = a.by_source || [];
+    const head = `<tr><th>Источник</th><th>Расход</th><th>Клики</th>
+      <th>${esc(st.signup || 'Регистрации')}</th><th>${esc(st.activation_1 || 'Активация')}</th>
+      <th>Тарифы</th><th>${esc(st.payment_started || 'Оплата начата')}</th>
+      <th>${esc(st.payment_success || 'Оплачено')}</th><th>Цена рег.</th></tr>`;
+    $('ads-table').tBodies[0].innerHTML = rows.length ? head + rows.map(r => `<tr>
+      <td><b>${esc(r.source)}</b></td>
+      <td>${r.spend == null ? '<span class="muted">—</span>' : nf(r.spend) + ' ₽'}</td>
+      <td>${nf(r.clicks)}</td><td>${nf(r.registrations)}</td><td>${nf(r.activation)}</td>
+      <td>${nf(r.pricing_viewed)}</td><td>${nf(r.payment_started)}</td>
+      <td>${nf(r.payment_success)}</td>
+      <td>${r.cpa == null ? '<span class="muted">—</span>' : nf(r.cpa) + ' ₽'}</td></tr>`).join('')
+      : '<tr><td class="muted">Разреза по источникам пока нет — продукт не отдаёт source_breakdown '
+        + 'либо событий слишком мало.</td></tr>';
+    $('ads-note').textContent = 'Расход известен только по Директу, поэтому цена регистрации '
+      + 'считается для него. Прочерк в расходе не значит «бесплатно» — значит «мы этого не знаем».'
+      + (a.as_of ? ' Данные на ' + a.as_of.slice(0,16).replace('T',' ') + '.' : '');
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+$('deep-btn').onclick = async () => {
+  $('deep-btn').disabled = true;
+  $('deep-status').textContent = 'Директ готовит отчёт, это до минуты…';
+  $('deep-body').innerHTML = '';
+  try {
+    const r = await api('/api/ads/deep-check', {method:'POST'});
+    $('deep-status').textContent = r.ok ? 'Готово' : (r.timeout ? 'Директ не успел ответить' : 'Не получилось');
+    $('deep-body').innerHTML = r.text ? renderReport(r.text)
+      : `<span class="muted">${esc(r.error || 'Отчёт пуст')}</span>`;
+  } catch (e) {
+    $('deep-status').textContent = e.message;
+  } finally { $('deep-btn').disabled = false; }
+};
+
+/* ---------------- История решений ---------------- */
+const REC_STATUS = {proposed:'ждёт решения', accepted:'принято', rejected:'отклонено',
+  deferred:'отложено', superseded:'заменено новым'};
+const EXP_STATUS = {running:'идёт', enough_data:'данных достаточно', won:'сработало',
+  lost:'не сработало', inconclusive:'без вывода', cancelled:'отменено'};
+async function loadHistory() {
+  const box = $('history-body');
+  try {
+    const h = await api('/api/history');
+    if (!h.items.length) {
+      box.innerHTML = '<p class="muted">Пока пусто. Здесь будут все предложения аналитика '
+        + 'и чем они закончились.</p>';
+      return;
+    }
+    box.innerHTML = h.items.map(i => {
+      const e = i.experiment;
+      const verdict = e ? (e.verdict || e.result_summary || (e.status === 'running'
+        ? `идёт: ${e.current_sample}/${e.target_sample}` : (EXP_STATUS[e.status] || e.status))) : null;
+      return `<div class="item">
+        <div class="row" style="margin-bottom:4px">
+          <h3 style="margin:0">${esc(i.title)}</h3>
+          <span class="tag">${esc(REC_STATUS[i.status] || i.status)}</span>
+          <span class="tag">${esc(i.area)}</span>
+          <div style="flex:1"></div>
+          <span class="muted">${esc(i.created_at.slice(0,10))}</span>
+        </div>
+        <div class="body">${esc(i.action)}</div>
+        ${i.hypothesis ? `<p class="muted" style="margin:6px 0 0">Гипотеза: ${esc(i.hypothesis)}</p>` : ''}
+        ${i.reject_reason ? `<p class="muted" style="margin:6px 0 0">Причина отказа: ${esc(i.reject_reason)}</p>` : ''}
+        ${verdict ? `<p style="margin:8px 0 0;color:${
+          e && e.status === 'won' ? 'var(--good)' :
+          (e && e.status === 'lost' ? 'var(--serious)' : 'var(--text-2)')
+        }">Итог: ${esc(verdict)}</p>` : ''}
+      </div>`;
+    }).join('');
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+/* ---------------- Задача в разработку (Claude Code) ---------------- */
+window.sendToDev = async (title, body) => {
+  if (!confirm('Создать задачу в GitHub? Если в репозитории настроен Claude Code, он возьмёт её в работу.')) return;
+  try {
+    const r = await api('/api/dev-task', {method:'POST', body: JSON.stringify({title, body})});
+    if (confirm('Задача создана: ' + r.url + '\n\nОткрыть?')) window.open(r.url, '_blank');
+  } catch (e) { alert(e.message); }
 };
 
 /* ---------------- Живая лента ---------------- */
@@ -645,6 +861,7 @@ async function loadLive() {
   box.innerHTML = '<span class="muted">Загрузка…</span>';
   try {
     const r = await api('/api/live?period_minutes=' + $('live-period').value);
+    const custom = r.event_labels || {};
     if (!r.ok) {
       box.innerHTML = `<p class="error-text">${esc(r.hint || 'Лента недоступна')}</p>
         <p class="muted">${esc(r.error || '')}</p>`;
@@ -672,8 +889,9 @@ async function loadLive() {
           </div>
           <div class="row" style="gap:6px">${evs.slice().reverse().map(e => {
             const m = EVENT_META[e.event_type] || {icon:'•', label:e.event_type, color:'var(--muted)'};
+            const label = custom[e.event_type] || m.label;
             return `<span class="tag" style="border-color:${m.color};color:${m.color}"
-              title="${esc(e.created_at || '')}">${m.icon} ${esc(m.label)}</span>`;
+              title="${esc(e.created_at || '')}">${m.icon} ${esc(label)}</span>`;
           }).join('<span class="muted">→</span>')}</div></div>`;
       }).join('');
   } catch (e) {
@@ -727,6 +945,10 @@ $('chat-input').addEventListener('keydown', e => {
 async function loadProjects() {
   try {
     const list = await api('/api/projects');
+    const active = list.find(p => p.is_active);
+    window._activeProjectId = active ? active.id : null;
+    if (active) loadStages(active.id); else $('stages-body').innerHTML =
+      '<p class="muted">Сначала подключите проект и сделайте его активным.</p>';
     $('projects-table').tBodies[0].innerHTML = list.length ? list.map(p =>
       `<tr><td><b>${esc(p.name)}</b><div class="muted">${esc(p.base_url || '—')}</div></td>
        <td>${p.is_active ? '<span class="tag good">✓ активный</span>'
