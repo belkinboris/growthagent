@@ -450,6 +450,42 @@ async def dynamics(days: int = 14):
     return {"history": history, "text": text}
 
 
+@router.get("/api/live", dependencies=[Depends(require_admin)])
+async def live_feed(period_minutes: int = 720, limit: int = 100):
+    """
+    Живая лента: дискретные события пользователей продукта (регистрация,
+    канал, отзыв о первом посте, открытие тарифов, оплата) в порядке
+    от свежих к старым. Данные анонимные -- продукт отдаёт user_key
+    (необратимый хэш), никаких email и id.
+
+    В отличие от остальных панелей это НЕ кэш: лента должна быть живой,
+    поэтому дёргаем продукт напрямую. Ошибку не прячем -- владельцу важно
+    отличать «событий нет» от «источник не отвечает».
+    """
+    from app.connectors.user_events import fetch_user_events
+
+    with get_session() as session:
+        project = _active_project(session)
+        base_url = project.base_url
+        token = project_internal_api_token(project)
+
+    result = await fetch_user_events(base_url, token, period_minutes=period_minutes, limit=limit)
+    events = result.get("events") or []
+    events.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+
+    if not result.get("ok"):
+        hint = {
+            "not_configured": "У проекта не задан адрес или токен внутреннего API.",
+            "not_found": "Продукт не отдаёт /api/internal/user-events — обновите его до версии с этим endpoint.",
+            "timeout": "Продукт не ответил вовремя.",
+        }.get(result.get("status"))
+        return {
+            "ok": False, "status": result.get("status"), "error": result.get("error"),
+            "hint": hint, "events": [], "period_minutes": period_minutes,
+        }
+    return {"ok": True, "events": events, "period_minutes": period_minutes}
+
+
 # ---------------------------------------------------------------------------
 # Growth Loop: рекомендация → эксперимент → вердикт (кнопки владельца)
 # ---------------------------------------------------------------------------

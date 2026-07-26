@@ -137,6 +137,7 @@
   <div class="spacer"></div>
   <nav id="tabs" class="hidden">
     <button data-tab="overview" class="active">Обзор</button>
+    <button data-tab="live">Лента</button>
     <button data-tab="reports">Отчёты</button>
     <button data-tab="chat">Чат</button>
     <button data-tab="projects">Проекты</button>
@@ -197,6 +198,23 @@
     <div class="card">
       <h2>Источники данных</h2>
       <div class="row" id="integrations-body"></div>
+    </div>
+  </div>
+
+  <!-- ЛЕНТА -->
+  <div id="view-live" class="hidden">
+    <div class="card">
+      <h2>Живая лента
+        <span class="spacer"></span>
+        <select id="live-period" style="width:auto;margin:0;padding:4px 8px;font-size:13px">
+          <option value="120">2 часа</option>
+          <option value="720" selected>12 часов</option>
+          <option value="1440">сутки</option>
+          <option value="4320">3 дня</option>
+        </select>
+        <button class="btn sm" id="live-refresh">Обновить</button>
+      </h2>
+      <div id="live-body">Загрузка…</div>
     </div>
   </div>
 
@@ -309,7 +327,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const VIEWS = ['overview','reports','chat','projects'];
+const VIEWS = ['overview','live','reports','chat','projects'];
 function showLogin() {
   $('login-view').classList.remove('hidden');
   $('tabs').classList.add('hidden');
@@ -326,6 +344,7 @@ function switchTab(tab) {
   document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === tab));
   if (tab === 'overview') loadOverview();
+  if (tab === 'live') loadLive();
   if (tab === 'reports') loadReport(currentReport);
   if (tab === 'projects') loadProjects();
 }
@@ -598,6 +617,71 @@ $('run-btn').onclick = async () => {
   } catch (e) { $('run-result').textContent = e.message; }
   finally { $('run-btn').disabled = false; }
 };
+
+/* ---------------- Живая лента ---------------- */
+const EVENT_META = {
+  user_registered:      {icon:'👤', label:'Регистрация',            color:'var(--series-1)'},
+  channel_created:      {icon:'📢', label:'Создан канал',           color:'var(--series-1)'},
+  onboarding_choice:    {icon:'🧭', label:'Выбор в онбординге',     color:'var(--muted)'},
+  first_post_feedback_good:{icon:'👍', label:'Первый пост: нравится', color:'var(--good)'},
+  first_post_feedback_bad: {icon:'👎', label:'Первый пост: не нравится', color:'var(--serious)'},
+  pricing_viewed:       {icon:'🏷', label:'Открыл тарифы',          color:'var(--series-2)'},
+  payment_cta_clicked:  {icon:'🖱', label:'Нажал «оплатить»',       color:'var(--series-2)'},
+  payment_started:      {icon:'💳', label:'Начал оплату',           color:'var(--series-2)'},
+  payment_success:      {icon:'✅', label:'Оплатил',                 color:'var(--good)'},
+  payment_failed:       {icon:'⚠️', label:'Оплата не прошла',       color:'var(--critical)'},
+};
+function timeAgo(iso) {
+  if (!iso) return '';
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return 'только что';
+  if (mins < 60) return mins + ' мин назад';
+  const h = Math.round(mins / 60);
+  if (h < 24) return h + ' ч назад';
+  return Math.round(h / 24) + ' дн назад';
+}
+async function loadLive() {
+  const box = $('live-body');
+  box.innerHTML = '<span class="muted">Загрузка…</span>';
+  try {
+    const r = await api('/api/live?period_minutes=' + $('live-period').value);
+    if (!r.ok) {
+      box.innerHTML = `<p class="error-text">${esc(r.hint || 'Лента недоступна')}</p>
+        <p class="muted">${esc(r.error || '')}</p>`;
+      return;
+    }
+    if (!r.events.length) {
+      box.innerHTML = '<p class="muted">За этот период событий не было.</p>';
+      return;
+    }
+    // Группируем по пользователю: важнее видеть путь человека, а не поток строк
+    const byUser = {};
+    r.events.forEach(e => { (byUser[e.user_key] = byUser[e.user_key] || []).push(e); });
+    const users = Object.entries(byUser).sort((a, b) =>
+      (b[1][0].created_at || '').localeCompare(a[1][0].created_at || ''));
+    box.innerHTML = `<p class="muted" style="margin-top:0">${r.events.length} событий у
+      ${users.length} пользователей. Данные анонимные: продукт отдаёт только необратимый ключ.</p>`
+      + users.map(([key, evs]) => {
+        const src = evs.find(e => e.source || e.utm_source);
+        return `<div class="item">
+          <div class="row" style="margin-bottom:6px">
+            <b>${esc(key)}</b>
+            ${src ? `<span class="tag">${esc(src.utm_source || src.source)}</span>` : ''}
+            <div style="flex:1"></div>
+            <span class="muted">${esc(timeAgo(evs[0].created_at))}</span>
+          </div>
+          <div class="row" style="gap:6px">${evs.slice().reverse().map(e => {
+            const m = EVENT_META[e.event_type] || {icon:'•', label:e.event_type, color:'var(--muted)'};
+            return `<span class="tag" style="border-color:${m.color};color:${m.color}"
+              title="${esc(e.created_at || '')}">${m.icon} ${esc(m.label)}</span>`;
+          }).join('<span class="muted">→</span>')}</div></div>`;
+      }).join('');
+  } catch (e) {
+    if (e.message !== 'unauthorized') box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+  }
+}
+$('live-refresh').onclick = loadLive;
+$('live-period').onchange = loadLive;
 
 /* ---------------- Отчёты ---------------- */
 let currentReport = 'board';
