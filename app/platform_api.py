@@ -318,6 +318,301 @@ async def alerts(limit: int = 30):
         return out
 
 
+# ---------------------------------------------------------------------------
+# Отчёты аналитика (то, что раньше жило в командах Telegram-бота)
+# ---------------------------------------------------------------------------
+
+
+def _report_context(session, project):
+    """
+    Общий контекст для всех отчётов: последний combined-снэпшот за 7 дней →
+    NormalizedMetrics, кэш диагностики пути к оплате, кэш путей пользователей.
+    Ровно те же данные, на которых строит отчёты Telegram-бот (без внешних
+    вызовов -- всё из кэша, страница должна открываться быстро).
+    """
+    from app.rules import NormalizedMetrics
+    from app.service import (
+        PAYMENT_PATH_CACHE_PERIOD_KEY,
+        USER_JOURNEYS_CACHE_PERIOD_KEY,
+        extract_normalized_metrics_from_snapshot,
+        get_cached_diagnostics,
+    )
+
+    snapshot = session.exec(
+        select(MetricSnapshot)
+        .where(
+            MetricSnapshot.project_id == project.id,
+            MetricSnapshot.period_key == "7d",
+            MetricSnapshot.source == "combined",
+        )
+        .order_by(MetricSnapshot.created_at.desc())
+        .limit(1)
+    ).first()
+
+    metrics_obj = None
+    snapshot_dt = None
+    if snapshot is not None:
+        raw = extract_normalized_metrics_from_snapshot(snapshot)
+        sources_ok = {
+            name for name in ("product", "metrika", "direct", "yookassa")
+            if (snapshot.metrics_json or {}).get(name) is not None
+        }
+        metrics_obj = NormalizedMetrics(
+            period_key="7d",
+            signup=raw.get("signup"),
+            activation_1=raw.get("activation_1"),
+            activation_2=raw.get("activation_2"),
+            payment_started=raw.get("payment_started"),
+            payment_success=raw.get("payment_success"),
+            spend=raw.get("spend"),
+            clicks=raw.get("clicks"),
+            sources_ok=sources_ok,
+        )
+        snapshot_dt = snapshot.created_at
+
+    pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+    payment_path = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+    j_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
+    journeys = (j_cached.result_json or {}).get("journeys") if (j_cached and j_cached.ok) else None
+
+    return {
+        "project_name": project.name,
+        "metrics": metrics_obj,
+        "payment_path": payment_path,
+        "journeys": journeys,
+        "snapshot_dt": snapshot_dt,
+    }
+
+
+# Какие отчёты доступны на дашборде. Порядок = порядок вкладок в UI.
+REPORT_KINDS = ["board", "funnel", "pay", "ads", "checks", "journeys", "experiments"]
+
+
+@router.get("/api/reports/{kind}", dependencies=[Depends(require_admin)])
+async def report(kind: str):
+    """
+    Текстовый отчёт аналитика. Формулировки (гипотезы, «что не менять»,
+    честные слова про малые выборки) -- главная ценность, поэтому берём
+    ровно те же builder'ы, что и Telegram-бот, а не пересобираем заново.
+    """
+    if kind not in REPORT_KINDS:
+        raise HTTPException(status_code=404, detail="Неизвестный отчёт")
+
+    from app import commercial_report as cr
+
+    with get_session() as session:
+        project = _active_project(session)
+        ctx = _report_context(session, project)
+
+    name = ctx["project_name"]
+    pp = ctx["payment_path"]
+    metrics = ctx["metrics"]
+    registrations = (pp or {}).get("registrations")
+
+    if kind == "board":
+        text = cr.build_board_report(
+            name, metrics, payment_path=pp,
+            new_registrations_since_deploy=registrations,
+            skip_decision=True,  # решение показываем отдельным блоком Growth Loop
+        )
+    elif kind == "funnel":
+        text = cr.build_funnel_report(name, metrics, payment_path=pp, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "pay":
+        text = cr.build_pay_report(name, payment_path=pp, metrics=metrics, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "ads":
+        text = cr.build_ads_report(name, metrics=metrics, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "checks":
+        text = cr.build_checks_report(name, payment_path=pp)
+    elif kind == "journeys":
+        text = cr.build_journeys_report(name, ctx["journeys"])
+    else:  # experiments
+        text = cr.build_experiments_report(
+            name, payment_path=pp,
+            new_registrations_since_deploy=registrations,
+            recent_journeys=ctx["journeys"],
+        )
+    return {"kind": kind, "text": text}
+
+
+@router.get("/api/dynamics", dependencies=[Depends(require_admin)])
+async def dynamics(days: int = 14):
+    """Динамика по дням: и сырые точки для графика, и текстовый блок
+    аналитика (он умеет честно говорить «данных мало»)."""
+    from app.commercial_report import build_dynamics_block
+    from app.service import load_daily_counters_history
+
+    with get_session() as session:
+        project = _active_project(session)
+        history = load_daily_counters_history(session, project.id, days=days)
+
+    text = build_dynamics_block(history) if len(history) >= 2 else None
+    return {"history": history, "text": text}
+
+
+# ---------------------------------------------------------------------------
+# Growth Loop: рекомендация → эксперимент → вердикт (кнопки владельца)
+# ---------------------------------------------------------------------------
+
+
+def _rec_to_dict(rec) -> dict:
+    return {
+        "id": rec.id,
+        "area": rec.area,
+        "title": rec.title,
+        "action": rec.action,
+        "hypothesis": rec.hypothesis,
+        "evidence": rec.evidence_json or [],
+        "confidence": rec.confidence,
+        "expected_effect": rec.expected_effect,
+        "risk": rec.risk,
+        "change_set": rec.change_set_json or [],
+        "measure": rec.measure,
+        "locked_variables": rec.locked_variables_json or [],
+        "success_criterion": rec.success_criterion,
+        "failure_criterion": rec.failure_criterion,
+        "created_at": rec.created_at.isoformat(),
+    }
+
+
+@router.get("/api/growth", dependencies=[Depends(require_admin)])
+async def growth_state():
+    """Состояние цикла роста: что предложено, что идёт, чем закончилось."""
+    from app import growth_loop
+    from app.commercial_report import build_experiment_block, build_verdict_block
+
+    with get_session() as session:
+        project = _active_project(session)
+        ctx = _report_context(session, project)
+        pp = ctx["payment_path"]
+
+        rec = growth_loop.get_active_recommendation(session, project.id)
+        running = growth_loop.get_running_experiment(session, project.id)
+        last = growth_loop.get_last_finished_experiment(session, project.id)
+
+        out: dict = {"recommendation": None, "experiment": None, "last_verdict": None}
+
+        if rec is not None:
+            out["recommendation"] = _rec_to_dict(rec)
+        if running is not None:
+            progress = growth_loop.experiment_progress(running, pp)
+            out["experiment"] = {
+                "id": running.id,
+                "title": running.title,
+                "area": running.area,
+                "hypothesis": running.hypothesis,
+                "primary_metric": running.primary_metric,
+                "sample_metric": running.sample_metric,
+                "target_sample": running.target_sample,
+                "locked_variables": running.locked_variables_json or [],
+                "success_criterion": running.success_criterion,
+                "failure_criterion": running.failure_criterion,
+                "started_at": running.started_at.isoformat(),
+                "progress": progress,
+                "text": build_experiment_block(running, progress),
+            }
+        if last is not None:
+            out["last_verdict"] = {
+                "id": last.id,
+                "title": last.title,
+                "status": last.status.value,
+                "verdict": last.verdict,
+                "result_summary": last.result_summary,
+                "ended_at": last.ended_at.isoformat() if last.ended_at else None,
+                "text": build_verdict_block(last),
+            }
+        return out
+
+
+@router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
+async def growth_why(rec_id: int):
+    from app import growth_loop
+    from app.commercial_report import build_recommendation_why
+    from app.models import GrowthRecommendation
+
+    with get_session() as session:
+        rec = session.get(GrowthRecommendation, rec_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Рекомендация не найдена")
+        return {"text": build_recommendation_why(rec)}
+
+
+class GrowthDecision(BaseModel):
+    reason: str = ""
+    days: int = 7
+
+
+@router.post("/api/growth/recommendation/{rec_id}/{action}", dependencies=[Depends(require_admin)])
+async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = None):
+    """Решение владельца по рекомендации: принять (стартует эксперимент
+    с зафиксированным baseline), отложить или отклонить."""
+    from app import growth_loop
+    from app.models import GrowthRecommendation
+
+    if action not in ("accept", "defer", "reject"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+
+    body = body or GrowthDecision()
+    with get_session() as session:
+        rec = session.get(GrowthRecommendation, rec_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Рекомендация не найдена")
+        project = _active_project(session)
+        pp = _report_context(session, project)["payment_path"]
+
+        if action == "accept":
+            exp = growth_loop.accept_recommendation(session, rec, pp)
+            return {"ok": True, "experiment_id": exp.id if exp else None}
+        if action == "defer":
+            growth_loop.defer_recommendation(session, rec, days=body.days)
+            return {"ok": True}
+        growth_loop.reject_recommendation(session, rec, reason=body.reason)
+        return {"ok": True}
+
+
+@router.post("/api/growth/experiment/{exp_id}/cancel", dependencies=[Depends(require_admin)])
+async def growth_cancel(exp_id: int, body: GrowthDecision | None = None):
+    from app import growth_loop
+    from app.models import GrowthExperiment
+
+    with get_session() as session:
+        exp = session.get(GrowthExperiment, exp_id)
+        if exp is None:
+            raise HTTPException(status_code=404, detail="Проверка не найдена")
+        growth_loop.cancel_experiment(session, exp, reason=(body.reason if body else ""))
+        return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Действия по сигналам
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/alerts/{alert_id}/{action}", dependencies=[Depends(require_admin)])
+async def alert_action(alert_id: int, action: str):
+    """«Понял» (acknowledged) и «Отложить» (snoozed на сутки) -- то же, что
+    кнопки под сигналом в Telegram."""
+    from datetime import timedelta
+
+    from app.models import AlertStatus, utcnow
+
+    if action not in ("ack", "snooze"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+
+    with get_session() as session:
+        alert = session.get(Alert, alert_id)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Сигнал не найден")
+        if action == "ack":
+            alert.status = AlertStatus.acknowledged
+        else:
+            alert.status = AlertStatus.snoozed
+            alert.snooze_until = utcnow() + timedelta(hours=24)
+        session.add(alert)
+        session.commit()
+        return {"ok": True, "status": alert.status.value}
+
+
 @router.post("/api/run", dependencies=[Depends(require_admin)])
 async def run_cycle():
     from app.scheduler import run_cycle_once_sync_with_timeout
