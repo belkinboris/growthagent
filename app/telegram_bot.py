@@ -3593,7 +3593,13 @@ def build_application() -> Application:
         except Exception:
             logger.exception("set_my_commands failed (non-fatal)")
 
-    app = Application.builder().token(settings.bot_token).post_init(_register_command_menu).build()
+    builder = Application.builder().token(settings.bot_token).post_init(_register_command_menu)
+    # Релей Bot API (Cloudflare Worker) -- тот же приём, что TELEGRAM_API_BASE
+    # в АвтоПосте: с Timeweb прямой путь к api.telegram.org ненадёжен.
+    if settings.telegram_api_base:
+        base = settings.telegram_api_base.rstrip("/")
+        builder = builder.base_url(f"{base}/bot")
+    app = builder.build()
 
     # Заполняем dispatch для reply-keyboard кнопок (объявлен раньше функций,
     # заполняем здесь когда все cmd_* уже определены)

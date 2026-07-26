@@ -52,6 +52,13 @@ def _ensure_default_project() -> None:
     """
     from app.connectors.truepost import DEFAULT_FUNNEL_MAPPING
 
+    # Env-переменные PROJECT_* -- legacy-путь v1 (один проект из .env).
+    # Основной путь теперь -- мастер подключения на веб-платформе (/growth),
+    # где проект сохраняется в БД. Если env-проект не задан, ничего не
+    # создаём -- иначе в списке проектов висела бы пустая заглушка "Проект".
+    if not settings.project_base_url:
+        return
+
     with get_session() as session:
         existing = session.exec(
             select(Project).where(Project.name == settings.project_name)
