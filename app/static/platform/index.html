@@ -29,9 +29,17 @@
   header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
     padding:12px 20px;background:var(--surface);border-bottom:1px solid var(--border)}
   header .logo{font-size:15px;font-weight:600;white-space:nowrap}
-  header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;flex:1 1 0;min-width:0}
   header .spacer{flex:1}
-  nav{display:flex;gap:2px;overflow-x:auto}
+  /* Вкладок больше, чем влезает на телефон. Прокрутка есть, но о ней надо
+     сообщить — иначе половина разделов выглядит несуществующей. */
+  .nav-wrap{position:relative;min-width:0;flex:0 1 auto;display:flex;justify-content:flex-end}
+  .nav-wrap::after{content:'';position:absolute;right:0;top:0;bottom:0;width:24px;
+    pointer-events:none;background:linear-gradient(to right,transparent,var(--surface))}
+  .nav-wrap.at-end::after{opacity:0}
+  nav{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
   nav button{background:none;border:none;color:var(--muted);font-size:14px;
     padding:8px 13px;border-radius:8px;white-space:nowrap}
   nav button:hover{color:var(--text)}
@@ -103,6 +111,13 @@
   .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Строка настройки этапа: ключ — поле — пояснение */
+  .stage-row{display:grid;grid-template-columns:130px minmax(0,1fr) minmax(0,200px);
+    gap:10px;align-items:center;margin-bottom:8px}
+  .stage-row input{margin:0}
+  .stage-row .stage-key{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)}
+  .stage-row .stage-note{font-size:12px;color:var(--muted)}
+
   /* Подсказка «откуда это число». Клик, а не наведение: с телефона
      наведения нет, а смотрят с телефона чаще всего. */
   .hint{background:none;border:1px solid var(--border);color:var(--muted);
@@ -149,19 +164,38 @@
   .chat-row{display:flex;gap:10px}
   .chat-row textarea{flex:1;margin:0;resize:vertical;min-height:46px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+  @media(max-width:1000px){
+    header .proj{display:none}
+  }
   @media(max-width:700px){
     .grid2{grid-template-columns:1fr}
     .funnel-row{grid-template-columns:110px 1fr 52px}
+    .stage-row{grid-template-columns:1fr;gap:4px;padding:10px 0;margin-bottom:0;
+      border-top:1px solid var(--border)}
     header .proj{display:none}
+    /* Слово «Аналитик» съедало треть шапки, а вкладки из-за этого не влезали. */
+    header .logo-text{display:none}
+    header{gap:8px;padding:12px 14px}
+    nav button{padding:8px 10px}
+    main{padding:16px 14px 60px}
+    .card{padding:16px 14px}
+
+    /* Таблицы на телефоне не помещаются никогда: 4 колонки в 390px
+       превращаются в горизонтальную прокрутку всей страницы. Разворачиваем
+       строку в карточку — каждая ячейка отдельной строкой. */
+    table.stack, table.stack tbody, table.stack tr, table.stack td{display:block;width:100%}
+    table.stack tr{border-bottom:1px solid var(--border);padding:12px 0}
+    table.stack tr:last-child{border-bottom:none}
+    table.stack td{border:none;padding:3px 0}
   }
 </style>
 </head>
 <body>
 
 <header>
-  <span class="logo">📊 Аналитик</span>
+  <span class="logo">📊<span class="logo-text"> Аналитик</span></span>
   <span class="proj" id="hdr-project"></span>
-  <div class="spacer"></div>
+  <div class="nav-wrap" id="nav-wrap">
   <nav id="tabs" class="hidden">
     <button data-tab="overview" class="active">Обзор</button>
     <button data-tab="ads">Реклама</button>
@@ -172,6 +206,7 @@
     <button data-tab="projects">Проекты</button>
     <button id="logout-btn">Выйти</button>
   </nav>
+  </div>
 </header>
 
 <main>
@@ -373,7 +408,7 @@
   <div id="view-projects" class="hidden">
     <div class="card">
       <h2>Подключённые проекты</h2>
-      <table id="projects-table"><tbody></tbody></table>
+      <table id="projects-table" class="stack"><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Названия этапов воронки<span class="spacer"></span>
@@ -504,6 +539,15 @@ $('login-btn').onclick = async () => {
 $('login-password').addEventListener('keydown', e => { if (e.key === 'Enter') $('login-btn').click(); });
 $('logout-btn').onclick = async () => { try { await api('/api/logout', {method:'POST'}); } catch(e){} showLogin(); };
 document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+// Градиент у края вкладок — подсказка «здесь есть ещё». Докрутили до конца — убираем.
+(() => {
+  const nav = $('tabs'), wrap = $('nav-wrap');
+  const sync = () => wrap.classList.toggle('at-end',
+    nav.scrollLeft + nav.clientWidth >= nav.scrollWidth - 2);
+  nav.addEventListener('scroll', sync);
+  window.addEventListener('resize', sync);
+  sync();
+})();
 
 /* ---------------- Обзор ---------------- */
 // Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
@@ -831,10 +875,10 @@ $('run-btn').onclick = async () => {
 async function loadStages(projectId) {
   try {
     const r = await api(`/api/projects/${projectId}/stages`);
-    $('stages-body').innerHTML = r.stages.map(st => `<div class="row" style="margin-bottom:8px">
-      <code class="muted" style="min-width:130px">${esc(st.key)}</code>
-      <input data-stage="${esc(st.key)}" value="${esc(st.title)}" style="flex:1;margin:0;max-width:320px">
-      <span class="muted">${st.source_metric ? 'метрика: ' + esc(st.source_metric)
+    $('stages-body').innerHTML = r.stages.map(st => `<div class="stage-row">
+      <span class="stage-key">${esc(st.key)}</span>
+      <input data-stage="${esc(st.key)}" value="${esc(st.title)}">
+      <span class="stage-note">${st.source_metric ? 'метрика: ' + esc(st.source_metric)
         : (st.is_custom ? '' : 'название по умолчанию')}</span></div>`).join('');
   } catch (e) { if (e.message !== 'unauthorized') $('stages-body').innerHTML =
     `<p class="error-text">${esc(e.message)}</p>`; }
