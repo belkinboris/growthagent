@@ -35,7 +35,7 @@ from app.config import (
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
 )
-from app import accounts
+from app import accounts, connect_snippets
 from app.db import get_session, _ensure_integrations
 from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
@@ -1308,6 +1308,16 @@ async def _probe_internal_api(base_url: str, token: str) -> dict:
             "адрес проекта и токен (на стороне проекта это TRUEPOST_INTERNAL_API_TOKEN "
             "или аналогичная переменная)."
         ),
+    }
+
+
+@router.get("/api/connect-snippet", dependencies=[Depends(require_admin)])
+async def connect_snippet(stack: str = connect_snippets.DEFAULT_STACK):
+    """Готовый код endpoint'а под стек клиента. Самый дорогой шаг
+    подключения -- написать его самому по документу; здесь он выдан кодом."""
+    return {
+        "stacks": connect_snippets.available_stacks(),
+        **connect_snippets.build_snippet(stack),
     }
 
 

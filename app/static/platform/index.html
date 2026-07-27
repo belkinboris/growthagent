@@ -172,6 +172,14 @@
   th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
   tr:last-child td{border-bottom:none}
   #login-view{max-width:380px;margin:14vh auto 0}
+  /* Код для вставки к себе. Перенос строк выключен намеренно: сломанный
+     переносом отступ в питоне -- это код, который не заработает. */
+  pre.code{background:#0e1116;border:1px solid var(--border);border-radius:8px;
+    padding:12px 14px;overflow-x:auto;font-size:12.5px;line-height:1.5;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    white-space:pre;max-height:420px;overflow-y:auto}
+  ol.plain{margin:10px 0;padding-left:20px;font-size:13px;color:var(--text-2)}
+  ol.plain li{margin:4px 0}
   /* Короткое сообщение о том, что платформа только что сделала сама
      (например, закрепила проект за новым аккаунтом). Само гаснет:
      это уведомление о факте, а не то, что нужно закрывать руками. */
@@ -513,7 +521,7 @@
       <label>Адрес проекта *</label>
       <input id="np-url" placeholder="https://projectautopost.ru">
       <label>Токен внутреннего API *</label>
-      <input id="np-token" placeholder="значение TRUEPOST_INTERNAL_API_TOKEN на стороне проекта">
+      <input id="np-token" placeholder="секретный токен, который вы задали у себя на сервере">
       <details style="margin-bottom:12px">
         <summary class="muted" style="cursor:pointer">Необязательно: реклама и внешний трафик</summary>
         <p class="muted" style="margin:10px 0 0">Эти источники добавляют ровно одно — деньги:
@@ -526,6 +534,26 @@
         </div>
         <p class="muted">OAuth-токены Яндекса задаются в переменных окружения сервера аналитика.</p>
       </details>
+      <!-- Самый дорогой шаг подключения -- написать endpoint у себя. Раньше
+           клиент читал CONTRACT.md и писал код сам; здесь тот же контракт
+           выдан готовым кодом под его стек. -->
+      <details id="snippet-box" style="margin-bottom:12px">
+        <summary class="muted" style="cursor:pointer">У продукта ещё нет нужного endpoint’а — покажите код</summary>
+        <p class="muted" style="margin:10px 0 0">Аналитик читает у продукта один адрес:
+          <code>GET /api/internal/metrics</code>. Вот готовый код — скопируйте к себе
+          и подставьте свои запросы к базе там, где помечено. Свою схему базы аналитик
+          не знает и угадывать не станет: выдуманный запрос вернул бы неверные числа.</p>
+        <label>Стек продукта</label>
+        <select id="snippet-stack"></select>
+        <ol class="plain" id="snippet-steps" style="margin:0 0 10px"></ol>
+        <div class="row" style="margin-bottom:6px">
+          <span class="muted" id="snippet-filename"></span>
+          <span class="spacer"></span>
+          <button class="btn sm" id="snippet-copy">Скопировать код</button>
+        </div>
+        <pre class="code" id="snippet-code">Загрузка…</pre>
+      </details>
+
       <div class="row">
         <button class="btn" id="np-test">Проверить подключение</button>
         <button class="btn primary" id="np-create" disabled>Подключить</button>
@@ -1469,6 +1497,45 @@ window.retest = async id => {
              : 'Проблема: ' + (r.hint || JSON.stringify(r.errors)));
   loadProjects();
 };
+/* ---- Готовый код endpoint'а для стороны продукта ---- */
+// Грузим по первому раскрытию, а не при загрузке вкладки: у большинства
+// endpoint уже есть, и лишний запрос им незачем.
+let snippetLoaded = false;
+$('snippet-box').addEventListener('toggle', () => {
+  if ($('snippet-box').open && !snippetLoaded) { snippetLoaded = true; loadSnippet(); }
+});
+$('snippet-stack').onchange = () => loadSnippet($('snippet-stack').value);
+
+async function loadSnippet(stack) {
+  try {
+    const d = await api('/api/connect-snippet' + (stack ? `?stack=${encodeURIComponent(stack)}` : ''));
+    if (!$('snippet-stack').options.length) {
+      $('snippet-stack').innerHTML = d.stacks.map(s =>
+        `<option value="${esc(s.key)}">${esc(s.title)}</option>`).join('');
+    }
+    $('snippet-stack').value = d.stack;
+    $('snippet-steps').innerHTML = d.steps.map(t => `<li>${esc(t)}</li>`).join('');
+    $('snippet-filename').textContent = d.filename ? `Файл: ${d.filename}` : '';
+    $('snippet-code').textContent = d.code;
+  } catch (e) {
+    if (e.message !== 'unauthorized') $('snippet-code').textContent = 'Не удалось загрузить код: ' + e.message;
+  }
+}
+
+$('snippet-copy').onclick = async () => {
+  const text = $('snippet-code').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Код скопирован.');
+  } catch (e) {
+    // Буфер обмена доступен не везде (http без TLS, старые браузеры).
+    // Молча «скопировать» и не скопировать -- хуже, чем выделить текст.
+    const r = document.createRange(); r.selectNodeContents($('snippet-code'));
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    toast('Браузер не дал доступ к буферу — код выделен, скопируйте вручную.');
+  }
+};
+
 function newProjectPayload() {
   return {
     name: $('np-name').value.trim(), type: $('np-type').value,
