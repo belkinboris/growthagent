@@ -831,6 +831,49 @@ def was_notified(session: Session, project_id: int, event_key: str) -> bool:
     return existing is not None
 
 
+def claim_notification(session: Session, project_id: int, event_key: str) -> bool:
+    """
+    Пытается застолбить отправку уведомления. True -- заявка наша, шлём;
+    False -- её уже поставил другой процесс, молчим.
+
+    Вставка с уникальным индексом (project_id, event_key) атомарна на уровне
+    БД: даже если два процесса вызовут это одновременно, вставка удастся
+    ровно одному. Именно этим заявка отличается от проверки was_notified,
+    между которой и отправкой есть окно в несколько секунд.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.models import NotificationClaim
+
+    claim = NotificationClaim(project_id=project_id, event_key=event_key)
+    session.add(claim)
+    try:
+        session.commit()
+        return True
+    except IntegrityError:
+        session.rollback()
+        return False
+
+
+def release_notification_claim(session: Session, project_id: int, event_key: str) -> None:
+    """
+    Снимает заявку -- вызывается, если отправка не удалась: иначе уведомление
+    не уйдёт уже никогда, ведь заявка навсегда осталась бы занятой.
+    """
+    from app.models import NotificationClaim
+
+    rows = session.exec(
+        select(NotificationClaim).where(
+            NotificationClaim.project_id == project_id,
+            NotificationClaim.event_key == event_key,
+        )
+    ).all()
+    for row in rows:
+        session.delete(row)
+    if rows:
+        session.commit()
+
+
 def mark_notified(
     session: Session,
     project_id: int,

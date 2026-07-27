@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel, JSON, Column
 
 
@@ -536,3 +537,30 @@ class NotificationLog(SQLModel, table=True):
 
     sent_at: datetime = Field(default_factory=utcnow)
     payload_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+class NotificationClaim(SQLModel, table=True):
+    """
+    Заявка на отправку уведомления. Решает гонку между процессами.
+
+    NotificationLog пишется ПОСЛЕ успешной отправки (осознанно: если отправка
+    упала, следующий цикл повторит). Но проверка «уже отправляли?» и запись
+    разнесены на всё время сборки отчёта и запроса в Telegram — секунды.
+    Планировщик живёт внутри веб-процесса, поэтому при двух воркерах или во
+    время наложения деплоя оба процесса успевают пройти проверку и оба шлют:
+    владелец получает два одинаковых письма (случай 27.07.2026).
+
+    Здесь заявка ставится ДО отправки, а уникальный индекс не даёт второму
+    процессу её продублировать: кто вставил — тот и шлёт. Если отправка
+    провалилась, заявка снимается, и следующий цикл попробует снова.
+
+    Новая таблица, а не колонка в существующей: ALTER TABLE на живой базе
+    в этом проекте запрещён (правило пришло из прод-инцидентов).
+    """
+
+    __table_args__ = (UniqueConstraint("project_id", "event_key", name="uq_claim_project_event"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    event_key: str = Field(index=True)
+    claimed_at: datetime = Field(default_factory=utcnow)
