@@ -827,6 +827,16 @@ async def ads_overview():
         project = _active_project(session)
         ctx = _report_context(session, project)
         stage_titles = load_stage_titles(session, project.id)
+        # Статусы необязательных источников: без них аналитик работает,
+        # просто не знает про деньги и трафик. Интерфейс должен объяснять
+        # это точно, а не догадываться по отсутствию чисел.
+        optional_sources = {
+            i.type.value: {"status": i.status.value, "last_error": i.last_error}
+            for i in session.exec(
+                select(Integration).where(Integration.project_id == project.id)
+            ).all()
+            if i.type.value in ("direct", "metrika", "yookassa")
+        }
 
     metrics = ctx["metrics"]
     pp = ctx["payment_path"]
@@ -872,6 +882,7 @@ async def ads_overview():
         },
         "by_source": rows,
         "stage_titles": stage_titles,
+        "sources": optional_sources,
         "as_of": ctx["snapshot_dt"].isoformat() if ctx["snapshot_dt"] else None,
     }
 

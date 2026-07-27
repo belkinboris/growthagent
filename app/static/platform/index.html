@@ -328,6 +328,7 @@
     <p class="purpose">Зачем: понять, окупается ли реклама. Слева — сколько денег ушло,
       справа — что из этих людей выросло. Если источник даёт регистрации, но не даёт
       оплат, проблема не в рекламе, а в продукте после регистрации.</p>
+    <div id="ads-optional" class="hidden"></div>
     <div class="kpis" id="ads-kpis" style="margin-bottom:16px"></div>
     <div class="card">
       <h2>Откуда приходят и что из этого выходит<span class="spacer"></span>
@@ -427,7 +428,9 @@
     <div class="card">
       <h2>Подключить проект</h2>
       <p class="muted">Заполните три поля — остальное аналитик определит сам: проверит
-        связь, найдёт доступные endpoints, поставит разметку воронки.</p>
+        связь, найдёт доступные endpoints, поставит разметку воронки.
+        Больше ничего подключать не нужно: Яндекс.Директ, Метрика и ЮKassa
+        необязательны, без них работают и воронка, и сигналы, и проверки.</p>
       <div class="grid2">
         <div>
           <label>Название *</label>
@@ -447,11 +450,16 @@
       <label>Токен внутреннего API *</label>
       <input id="np-token" placeholder="значение TRUEPOST_INTERNAL_API_TOKEN на стороне проекта">
       <details style="margin-bottom:12px">
-        <summary class="muted" style="cursor:pointer">Необязательно: внешние источники</summary>
+        <summary class="muted" style="cursor:pointer">Необязательно: реклама и внешний трафик</summary>
+        <p class="muted" style="margin:10px 0 0">Эти источники добавляют ровно одно — деньги:
+          сколько потрачено на рекламу и во сколько обошлась регистрация. Всё остальное
+          аналитик считает по данным самого продукта. Добавить их можно когда угодно позже —
+          подключение проекта от этого не зависит.</p>
         <div class="grid2" style="margin-top:10px">
           <div><label>Счётчик Метрики</label><input id="np-metrika" placeholder="12345678"></div>
           <div><label>Логин Директа</label><input id="np-direct" placeholder="client-login"></div>
         </div>
+        <p class="muted">OAuth-токены Яндекса задаются в переменных окружения сервера аналитика.</p>
       </details>
       <div class="row">
         <button class="btn" id="np-test">Проверить подключение</button>
@@ -550,6 +558,28 @@ document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () 
 })();
 
 /* ---------------- Обзор ---------------- */
+// Обязателен один источник — внутренний API продукта. Остальные добавляют
+// данных, но их отсутствие не поломка: значок «·» без пояснения читался
+// как «что-то не настроено и надо чинить».
+const SOURCE_TITLES = {
+  project_metrics_api: 'Данные продукта',
+  metrika: 'Яндекс.Метрика', direct: 'Яндекс.Директ', yookassa: 'ЮKassa',
+  telegram: 'Telegram', llm: 'Ответы аналитика',
+};
+const REQUIRED_SOURCES = ['project_metrics_api'];
+function renderIntegrations(list) {
+  $('integrations-body').innerHTML = list.map(i => {
+    const required = REQUIRED_SOURCES.includes(i.type);
+    const title = SOURCE_TITLES[i.type] || i.type;
+    if (i.status === 'ok') return `<span class="tag good">✓ ${esc(title)}</span>`;
+    if (i.status === 'error') return `<span class="tag critical" title="${esc(i.last_error || '')}">✕ ${esc(title)}</span>`;
+    if (i.status === 'stale') return `<span class="tag warning">! ${esc(title)}: данные устарели</span>`;
+    return required
+      ? `<span class="tag critical">✕ ${esc(title)}: без этого источника аналитик слеп</span>`
+      : `<span class="tag">○ ${esc(title)}: не подключён, необязательно</span>`;
+  }).join('');
+}
+
 // Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
 // у чужих проектов это «Этап 1/2», пока их не переименуют (вкладка «Проекты»).
 let STAGE_TITLES = {};
@@ -591,13 +621,7 @@ async function loadOverview() {
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
     renderAlerts(alerts, hasSnapshots);
     renderFirstRun(o, hasSnapshots);
-    $('integrations-body').innerHTML = (o.integrations || []).map(i => {
-      const cls = i.status === 'ok' ? 'good' : (i.status === 'error' ? 'critical'
-                : (i.status === 'stale' ? 'warning' : ''));
-      const icon = i.status === 'ok' ? '✓' : (i.status === 'error' ? '✕'
-                 : (i.status === 'stale' ? '!' : '·'));
-      return `<span class="tag ${cls}">${icon} ${esc(i.type)}</span>`;
-    }).join('');
+    renderIntegrations(o.integrations || []);
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -915,10 +939,59 @@ $('stages-ai').onclick = async () => {
 };
 
 /* ---------------- Реклама ---------------- */
+// Директ и Метрика — необязательные источники. Без них аналитик работает,
+// просто не знает про деньги и внешний трафик. Показать таблицу прочерков
+// и промолчать — значит оставить человека думать, что продукт сломан или
+// что без настройки Яндекса им пользоваться нельзя.
+const OPTIONAL_SOURCES = {
+  direct: {
+    name: 'Яндекс.Директ',
+    gives: 'расход, клики и цену регистрации',
+    without: 'воронка, сигналы, проверки и лента работают полностью — не видно только денег на рекламу',
+  },
+  metrika: {
+    name: 'Яндекс.Метрика',
+    gives: 'внешний трафик и цели сайта',
+    without: 'продуктовая воронка считается по данным самого продукта и без Метрики',
+  },
+  yookassa: {
+    name: 'ЮKassa',
+    gives: 'сверку платежей на стороне платёжной системы',
+    without: 'оплаты берутся из самого продукта',
+  },
+};
+function renderOptionalSources(sources, hasDirectData) {
+  const box = $('ads-optional');
+  // Эта вкладка про рекламные деньги, поэтому объясняем только Директ.
+  // Метрика и ЮKassa к расходу на рекламу отношения не имеют — их состояние
+  // видно в «Источниках данных» на обзоре.
+  const missing = (sources.direct && sources.direct.status !== 'ok' && !hasDirectData)
+    ? [{key: 'direct', meta: OPTIONAL_SOURCES.direct,
+        status: sources.direct.status, error: sources.direct.last_error}]
+    : [];
+  if (!missing.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = missing.map(m => {
+    const broken = m.status === 'error';
+    return `<div class="card" style="border-left:3px solid var(--${broken ? 'serious' : 'series-1'})">
+      <h2>${esc(m.meta.name)}: ${broken ? 'источник отвечает с ошибкой' : 'не подключён — это нормально'}</h2>
+      <p style="margin:0">${broken
+        ? 'Аналитик не смог получить данные: ' + esc(m.error || 'источник не ответил') + '.'
+        : 'Подключать не обязательно. С ним видно ' + esc(m.meta.gives) + '.'}</p>
+      <p class="muted" style="margin:8px 0 0">Без него ${esc(m.meta.without)}.</p>
+    </div>`;
+  }).join('');
+}
+
 async function loadAds() {
   try {
     const a = await api('/api/ads');
     const t = a.totals || {};
+    // Смотрим и на статус, и на сами данные: строка статуса обновляется
+    // только циклом сбора, и после ручного импорта или сразу после рестарта
+    // она может врать. Если расход и клики пришли — Директ работает,
+    // что бы ни было записано в статусе.
+    renderOptionalSources(a.sources || {}, t.spend != null || t.clicks != null);
     $('ads-kpis').innerHTML = [
       {label:'Расход', value: t.spend, sub:'₽ за 7 дней'},
       {label:'Клики', value: t.clicks, sub:'Яндекс.Директ'},
