@@ -153,3 +153,55 @@ def get_metric_explain(normalized_key: str, vocabulary: dict[str, MetricMeta] = 
     vocabulary = vocabulary or FUNNEL_METRIC_VOCABULARY
     meta = vocabulary.get(normalized_key)
     return meta.explain if meta else None
+
+
+# Причины отрицательного отзыва о первом посте. Продукт присылает их
+# английскими ключами (и разными: и too_promotional, и too_salesy), а в
+# тексте владельцу они появлялись как есть -- «Главная причина: wrong_style».
+# Этот словарь -- единственное место перевода, чтобы формулировка правилась
+# один раз. Незнакомый ключ не выдумываем: возвращаем как есть, но в тексте
+# он хотя бы окажется в кавычках рядом с честной пометкой.
+FEEDBACK_REASON_LABELS = {
+    "too_generic": "слишком общий",
+    "wrong_style": "не тот стиль",
+    "wrong_topic": "не про тему",
+    "too_dry": "слишком сухо",
+    "too_promotional": "слишком рекламно",
+    "too_salesy": "слишком рекламно",
+    "not_my_style": "не тот стиль",
+    "off_topic": "не про тему",
+    "too_formal": "слишком сухо",
+    "other": "другое",
+}
+
+
+def feedback_reason_label(key: str) -> str:
+    """Русское название причины отзыва. Незнакомый ключ отдаём как есть --
+    выдумывать перевод хуже, чем показать исходный код причины."""
+    return FEEDBACK_REASON_LABELS.get(str(key), str(key))
+
+
+def format_feedback_reasons(reasons: dict | None) -> str:
+    """
+    Причины отзывов человеческой строкой: «не тот стиль — 1, другое — 1».
+    Раньше сюда попадал питоновский словарь целиком, включая нулевые причины:
+    «{'too_generic': 0, 'wrong_style': 1, ...}» -- владельцу это читать нельзя.
+    Нулевые причины не показываем: они ничего не сообщают.
+    """
+    if not isinstance(reasons, dict) or not reasons:
+        return ""
+    # несколько ключей могут переводиться в одну метку -- складываем
+    merged: dict[str, int] = {}
+    for key, count in reasons.items():
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        label = feedback_reason_label(key)
+        merged[label] = merged.get(label, 0) + count
+    if not merged:
+        return ""
+    parts = sorted(merged.items(), key=lambda kv: -kv[1])
+    return ", ".join(f"{label} — {count}" for label, count in parts)

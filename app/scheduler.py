@@ -1879,8 +1879,10 @@ async def send_daily_board(
         experiment_one_liner,
     )
     from app.service import (
+        claim_notification,
         load_daily_counters_history,
         mark_notified,
+        release_notification_claim,
         save_daily_counters,
         was_notified,
     )
@@ -1908,6 +1910,15 @@ async def send_daily_board(
                 return False
 
             if not force and was_notified(session, project.id, event_key):
+                return False
+
+            # Заявка ДО отправки: между was_notified и mark_notified проходят
+            # секунды (сборка отчёта + запрос в Telegram), и второй процесс
+            # успевал проскочить проверку — владелец получал два одинаковых
+            # письма. Вставка с уникальным индексом атомарна: шлёт тот, кто
+            # её выиграл.
+            if not force and not claim_notification(session, project.id, event_key):
+                logger.info("Daily board: заявку уже взял другой процесс, молчим")
                 return False
 
             pp_cached = get_cached_diagnostics(
@@ -1949,12 +1960,16 @@ async def send_daily_board(
             project_id = project.id
 
         sent_ok = await send(settings, text)
-        if sent_ok and not force:
-            with session_factory() as session:
+        with session_factory() as session:
+            if sent_ok and not force:
                 mark_notified(
                     session, project_id, event_key, DAILY_BOARD_EVENT_TYPE,
                     payload={"day": day},
                 )
+            elif not sent_ok and not force:
+                # Отправка не удалась — заявку отпускаем, иначе сводка за этот
+                # день не уйдёт уже никогда.
+                release_notification_claim(session, project_id, event_key)
         return bool(sent_ok)
     except Exception:
         logger.exception("Daily board failed")

@@ -66,13 +66,13 @@ def _collect_data(pp: dict, t: dict) -> dict:
         ],
         "expected_effect": f"с {regs} до ≥ {need} регистраций в недельном окне",
         "risk": "низкий: продукт и ставки не меняются",
-        "measure": "registrations и разбивка по источникам в /ads",
+        "measure": "регистрации и разбивка по источникам — на вкладке «Реклама»",
         "primary_metric": "channels_created",
         "sample_metric": "registrations",
         "target_sample": max(need - regs, 10),
         "min_runtime_days": 3,
         "max_runtime_days": 14,
-        "success_criterion": f"registrations в окне ≥ {need}",
+        "success_criterion": f"регистраций за окно не меньше {need}",
         "failure_criterion": "за 14 дней выборка не набрана — пересматриваем источники",
         "locked_variables": ["ставки Директа", "бюджет", "тарифы", "цены", "лендинг", "генератор"],
         "confidence": "данных мало — это шаг сбора, не продуктовый вывод",
@@ -94,11 +94,11 @@ def _collect_feedback(pp: dict, t: dict) -> dict:
         "change_set": [
             "TruePost: ничего не менять",
             "рекламу не трогать",
-            "ежедневно смотреть live feed: где пользователи останавливаются до отзыва",
+            "ежедневно смотреть ленту событий: где люди останавливаются, не доходя до отзыва",
         ],
         "expected_effect": f"с {fb} до ≥ {need} отзывов",
         "risk": "низкий",
-        "measure": "first_post_feedback_good/bad в /board",
+        "measure": "сколько хороших и плохих отзывов о первом посте — видно на доске",
         "primary_metric": "pricing_viewed",
         "sample_metric": "registrations",
         "target_sample": 14,
@@ -106,7 +106,7 @@ def _collect_feedback(pp: dict, t: dict) -> dict:
         "max_runtime_days": 14,
         "success_criterion": f"отзывов ≥ {need}",
         "failure_criterion": "отзывы не собираются при росте регистраций — чинить сам блок отзыва",
-        "locked_variables": ["генератор", "onboarding", "тарифы", "цены", "реклама"],
+        "locked_variables": ["генератор", "первые шаги в продукте", "тарифы", "цены", "реклама"],
         "confidence": "данных недостаточно — шаг сбора",
     }
 
@@ -115,7 +115,7 @@ def _onboarding(pp: dict, t: dict) -> dict:
     regs = _n(pp.get("registrations"))
     channels = _n(pp.get("channels_created"))
     return {
-        "title": "Чиним onboarding до создания канала",
+        "title": "Чиним первые шаги до создания канала",
         "action": (
             "Пройти путь нового пользователя от регистрации до создания "
             "канала самому и по /journeys найти шаг, где уходят. Затем — "
@@ -130,7 +130,7 @@ def _onboarding(pp: dict, t: dict) -> dict:
         ],
         "expected_effect": f"создание канала с {channels}/{regs} к ≥ {t['low_channel_rate']:.0%}",
         "risk": "средний: правка UX первого шага",
-        "measure": "channels_created / registrations",
+        "measure": "доля зарегистрировавшихся, которые создали канал",
         "primary_metric": "channels_created",
         "sample_metric": "registrations",
         "target_sample": 14,
@@ -143,35 +143,48 @@ def _onboarding(pp: dict, t: dict) -> dict:
 
 
 def _first_post(pp: dict, t: dict) -> dict:
+    # Текст читает владелец, а не разработчик: английские ключи продукта
+    # (wrong_style, too_generic) и слова bad/good переводим здесь, у самого
+    # источника. Словарь — в vocabulary.py, единственном месте переводов.
+    from app.vocabulary import feedback_reason_label, format_feedback_reasons
+
     good = _n(pp.get("first_post_feedback_good"))
     bad = _n(pp.get("first_post_feedback_bad"))
     reasons = pp.get("first_post_feedback_reasons") or {}
-    top_reason = max(reasons, key=reasons.get) if reasons else "нет данных по причинам"
+    # Причины с нулём ничего не сообщают — топом считаем только ненулевые.
+    nonzero = {k: _n(v) for k, v in reasons.items() if _n(v) > 0}
+    top_key = max(nonzero, key=nonzero.get) if nonzero else None
+    top_reason = feedback_reason_label(top_key) if top_key else "причина не указана"
+    reasons_line = format_feedback_reasons(reasons)
     return {
         "title": "Чиним качество первого поста",
         "action": (
-            f"Отзывы подтверждают проблему первого результата (bad {bad} из {good + bad}). "
-            f"Главная причина: «{top_reason}». Снимаем запрет с генератора и делаем "
-            "ОДНУ итерацию промпта под эту причину. Больше ничего не менять."
+            f"Отзывы подтверждают проблему первого результата: "
+            f"{bad} плохих из {good + bad}. "
+            f"Главная причина — {top_reason}. Снимаем запрет с генератора и делаем "
+            "ОДНУ правку промпта под эту причину. Больше ничего не менять."
         ),
-        "hypothesis": "Одна адресная правка промпта под топ-причину снизит долю bad.",
+        "hypothesis": "Одна адресная правка промпта под главную причину снизит долю плохих отзывов.",
         "change_set": [
-            f"одна итерация промпта генератора под причину «{top_reason}»",
-            "остальные причины не трогать в этой итерации",
-            "onboarding, тарифы, рекламу не менять",
+            f"одна правка промпта генератора под причину «{top_reason}»",
+            "остальные причины не трогать в этой правке",
+            "первые шаги в продукте, тарифы и рекламу не менять",
         ],
-        "expected_effect": "доля bad ниже порога на следующих отзывах",
+        "expected_effect": "доля плохих отзывов ниже порога на следующих отзывах",
         "risk": "средний: правка генератора, откат = вернуть прежний промпт",
-        "measure": "доля good среди НОВЫХ отзывов (после правки)",
+        "measure": "доля хороших отзывов среди НОВЫХ (после правки)",
         "primary_metric": "first_post_feedback_good",
         "sample_metric": "first_post_feedback_total",
         "target_sample": 10,
         "min_runtime_days": 3,
         "max_runtime_days": 14,
-        "success_criterion": f"bad < {t['bad_feedback_share']:.0%} на новых отзывах",
-        "failure_criterion": "bad не снизился — откатить промпт, разбирать причину глубже",
-        "locked_variables": ["onboarding", "тарифы", "цены", "реклама", "лендинг"],
-        "extra_evidence": [f"причины bad: {reasons}" if reasons else "причины bad не заполнены"],
+        "success_criterion": f"плохих меньше {t['bad_feedback_share']:.0%} на новых отзывах",
+        "failure_criterion": "доля плохих не снизилась — откатить промпт, разбирать причину глубже",
+        "locked_variables": ["первые шаги в продукте", "тарифы", "цены", "реклама", "лендинг"],
+        "extra_evidence": [
+            f"почему так оценили: {reasons_line}" if reasons_line
+            else "причины отзывов продукт не прислал"
+        ],
     }
 
 
@@ -194,22 +207,22 @@ def _commercial_bridge(pp: dict, t: dict) -> dict:
             "Мост «очередь на неделю» поднимет переход к тарифам."
         ),
         "change_set": [
-            "TruePost: блок «Собрать очередь на неделю» после good feedback (по спецификации)",
+            "TruePost: блок «Собрать очередь на неделю» после хорошего отзыва (по спецификации)",
             "генератор первого поста не менять",
             "тарифы и цены не менять",
             "рекламу не менять",
         ],
         "expected_effect": f"переход к тарифам с {base_rate:.0%} к ≥ {max(t['min_pricing_rate'], base_rate * 2):.0%}",
         "risk": "низкий: добавление блока, откат = скрыть блок",
-        "measure": "pricing_viewed и payment_started на новых пользователях",
+        "measure": "открытия тарифов и начатые оплаты у новых пользователей",
         "primary_metric": "pricing_viewed",
         "sample_metric": "registrations",
         "target_sample": 14,
         "min_runtime_days": 3,
         "max_runtime_days": 14,
-        "success_criterion": f"pricing_viewed на новых пользователях заметно выше {base_rate:.0%}",
+        "success_criterion": f"доля открывших тарифы заметно выше {base_rate:.0%}",
         "failure_criterion": "переход к тарифам не вырос — мост другой, блок убрать",
-        "locked_variables": ["реклама", "цены", "тарифы", "генератор первого поста", "onboarding"],
+        "locked_variables": ["реклама", "цены", "тарифы", "генератор первого поста", "первые шаги в продукте"],
         "extra_evidence": [f"отзывы: {good} из {fb} положительные"],
     }
 
@@ -224,24 +237,24 @@ def _pricing_screen(pp: dict, t: dict) -> dict:
             "(«канал ведётся сам N постов в месяц», не «N постов»); проверить, "
             "что кнопка оплаты работает."
         ),
-        "hypothesis": "Ценность на тарифном экране не считывается — правка формулировки даст первые payment_started.",
+        "hypothesis": "Ценность на тарифном экране не считывается — правка формулировки даст первые начатые оплаты.",
         "change_set": [
             "пройти тарифный экран вручную (телефон)",
             "переписать заголовок ценности одного экрана",
             "цены и состав тарифов НЕ менять",
             "рекламу и генератор не трогать",
         ],
-        "expected_effect": "первые payment_started",
+        "expected_effect": "первые начатые оплаты",
         "risk": "низкий: текстовая правка",
-        "measure": "payment_started / pricing_viewed",
+        "measure": "доля открывших тарифы, которые начали оплату",
         "primary_metric": "payment_started",
         "sample_metric": "pricing_viewed",
         "target_sample": 10,
         "min_runtime_days": 3,
         "max_runtime_days": 14,
-        "success_criterion": "payment_started ≥ 1 на следующих 10 открытиях тарифов",
+        "success_criterion": "хотя бы одна начатая оплата на следующих 10 открытиях тарифов",
         "failure_criterion": "0 стартов оплаты — проблема глубже формулировки (цена/доверие)",
-        "locked_variables": ["цены", "состав тарифов", "реклама", "генератор", "onboarding"],
+        "locked_variables": ["цены", "состав тарифов", "реклама", "генератор", "первые шаги в продукте"],
     }
 
 
