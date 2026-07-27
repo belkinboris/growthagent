@@ -117,6 +117,18 @@ def _parse_tsv(text: str) -> tuple[list, list]:
     бывает у кампании без показов за выбранную дату.
     """
     lines = [line for line in text.strip().split("\n") if line.strip()]
+    # Страховка OOM (2026-07-17): granular-отчёт с неожиданно большим числом
+    # строк не должен убивать процесс. Потолок настраивается через env.
+    # (Восстановлено 2026-07-27: потерялось при загрузке через веб-интерфейс
+    # GitHub -- в рабочей копии защиты не было, а падения по памяти уже были.)
+    import os as _os
+    _max_rows = int(_os.getenv("DIRECT_TSV_MAX_ROWS", "20000"))
+    if len(lines) > _max_rows + 1:  # +1 -- заголовок
+        logger.warning(
+            "Direct TSV: %s строк, обрезаю до %s (DIRECT_TSV_MAX_ROWS)",
+            len(lines) - 1, _max_rows,
+        )
+        lines = lines[: _max_rows + 1]
 
     if not lines:
         return [], []

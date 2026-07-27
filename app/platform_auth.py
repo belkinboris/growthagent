@@ -47,7 +47,13 @@ def verify_password(password: str) -> bool:
     settings = get_settings()
     if not settings.platform_admin_password:
         return False
-    return hmac.compare_digest(password or "", settings.platform_admin_password)
+    # Сравниваем хэши, а не строки: hmac.compare_digest на не-ASCII строках
+    # бросает TypeError, и пароль с кириллицей ронял вход в 500 вместо
+    # честного «неверный пароль». Хэши ещё и уравнивают длину, так что
+    # время сравнения не зависит от длины введённого пароля.
+    given = hashlib.sha256((password or "").encode("utf-8")).digest()
+    expected = hashlib.sha256(settings.platform_admin_password.encode("utf-8")).digest()
+    return hmac.compare_digest(given, expected)
 
 
 def issue_session_token() -> str:

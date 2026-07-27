@@ -29,9 +29,17 @@
   header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
     padding:12px 20px;background:var(--surface);border-bottom:1px solid var(--border)}
   header .logo{font-size:15px;font-weight:600;white-space:nowrap}
-  header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;flex:1 1 0;min-width:0}
   header .spacer{flex:1}
-  nav{display:flex;gap:2px;overflow-x:auto}
+  /* Вкладок больше, чем влезает на телефон. Прокрутка есть, но о ней надо
+     сообщить — иначе половина разделов выглядит несуществующей. */
+  .nav-wrap{position:relative;min-width:0;flex:0 1 auto;display:flex;justify-content:flex-end}
+  .nav-wrap::after{content:'';position:absolute;right:0;top:0;bottom:0;width:24px;
+    pointer-events:none;background:linear-gradient(to right,transparent,var(--surface))}
+  .nav-wrap.at-end::after{opacity:0}
+  nav{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
   nav button{background:none;border:none;color:var(--muted);font-size:14px;
     padding:8px 13px;border-radius:8px;white-space:nowrap}
   nav button:hover{color:var(--text)}
@@ -103,6 +111,49 @@
   .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Скелетоны загрузки. Это ФОРМА будущего содержимого, а не данные:
+     ни одной цифры до ответа сервера не показываем — иначе нарушили бы
+     принцип честности. Пустой экран, наоборот, читается как поломка. */
+  .skel{background:var(--surface-2);border-radius:6px;height:12px;
+    animation:skel-pulse 1.4s ease-in-out infinite}
+  .skel + .skel{margin-top:8px}
+  .skel.w40{width:40%} .skel.w60{width:60%} .skel.w80{width:80%}
+  .skel.tall{height:24px}
+  @keyframes skel-pulse{0%,100%{opacity:.45}50%{opacity:.85}}
+  @media (prefers-reduced-motion: reduce){
+    .skel{animation:none;opacity:.6}
+  }
+
+  /* Строка настройки этапа: ключ — поле — пояснение */
+  .stage-row{display:grid;grid-template-columns:130px minmax(0,1fr) minmax(0,200px);
+    gap:10px;align-items:center;margin-bottom:8px}
+  .stage-row input{margin:0}
+  .stage-row .stage-key{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)}
+  .stage-row .stage-note{font-size:12px;color:var(--muted)}
+
+  /* Подсказка «откуда это число». Клик, а не наведение: с телефона
+     наведения нет, а смотрят с телефона чаще всего. */
+  .hint{background:none;border:1px solid var(--border);color:var(--muted);
+    width:17px;height:17px;border-radius:50%;font-size:11px;line-height:1;
+    padding:0;margin-left:6px;vertical-align:middle}
+  .hint:hover{color:var(--text);border-color:var(--muted)}
+  .hint-pop{margin-top:8px;padding:9px 11px;background:var(--surface-2);
+    border:1px solid var(--border);border-left:3px solid var(--series-1);
+    border-radius:8px;font-size:12px;line-height:1.5;color:var(--text-2)}
+
+  /* Шаги первого запуска */
+  .step{display:flex;gap:12px;align-items:flex-start;padding:11px 0;
+    border-top:1px solid var(--border)}
+  .step:first-child{border-top:none;padding-top:0}
+  .step .mark{flex:0 0 22px;height:22px;border-radius:50%;display:flex;
+    align-items:center;justify-content:center;font-size:12px;font-weight:600;
+    background:var(--surface-2);color:var(--muted);border:1px solid var(--border)}
+  .step.done .mark{background:var(--good);border-color:var(--good);color:#04210a}
+  .step.now .mark{background:var(--series-1);border-color:var(--series-1);color:#08111c}
+  .step .text{flex:1}
+  .step .text b{display:block;margin-bottom:2px}
+  .step .text span{color:var(--muted);font-size:13px}
+
   /* Отчёты */
   .report{white-space:pre-wrap;font-size:14px;line-height:1.6;color:var(--text-2)}
   .report b{color:var(--text)}
@@ -126,19 +177,38 @@
   .chat-row{display:flex;gap:10px}
   .chat-row textarea{flex:1;margin:0;resize:vertical;min-height:46px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+  @media(max-width:1000px){
+    header .proj{display:none}
+  }
   @media(max-width:700px){
     .grid2{grid-template-columns:1fr}
     .funnel-row{grid-template-columns:110px 1fr 52px}
+    .stage-row{grid-template-columns:1fr;gap:4px;padding:10px 0;margin-bottom:0;
+      border-top:1px solid var(--border)}
     header .proj{display:none}
+    /* Слово «Аналитик» съедало треть шапки, а вкладки из-за этого не влезали. */
+    header .logo-text{display:none}
+    header{gap:8px;padding:12px 14px}
+    nav button{padding:8px 10px}
+    main{padding:16px 14px 60px}
+    .card{padding:16px 14px}
+
+    /* Таблицы на телефоне не помещаются никогда: 4 колонки в 390px
+       превращаются в горизонтальную прокрутку всей страницы. Разворачиваем
+       строку в карточку — каждая ячейка отдельной строкой. */
+    table.stack, table.stack tbody, table.stack tr, table.stack td{display:block;width:100%}
+    table.stack tr{border-bottom:1px solid var(--border);padding:12px 0}
+    table.stack tr:last-child{border-bottom:none}
+    table.stack td{border:none;padding:3px 0}
   }
 </style>
 </head>
 <body>
 
 <header>
-  <span class="logo">📊 Аналитик</span>
+  <span class="logo">📊<span class="logo-text"> Аналитик</span></span>
   <span class="proj" id="hdr-project"></span>
-  <div class="spacer"></div>
+  <div class="nav-wrap" id="nav-wrap">
   <nav id="tabs" class="hidden">
     <button data-tab="overview" class="active">Обзор</button>
     <button data-tab="ads">Реклама</button>
@@ -149,6 +219,7 @@
     <button data-tab="projects">Проекты</button>
     <button id="logout-btn">Выйти</button>
   </nav>
+  </div>
 </header>
 
 <main>
@@ -166,9 +237,39 @@
 
   <!-- ОБЗОР -->
   <div id="view-overview" class="hidden">
+    <!-- Первый экран, пока проект не подключён. Показывать вместо доски из
+         прочерков: пустые карточки не объясняют новому человеку ничего. -->
+    <div id="overview-empty" class="hidden">
+      <div class="card">
+        <h2>Проект ещё не подключён</h2>
+        <p>Аналитик подключается к вашему продукту по сети и раз в несколько часов
+          сам собирает данные. Ему нужны три вещи: название, адрес продукта и токен
+          его внутреннего API.</p>
+        <p class="muted">Когда проект подключится, здесь появится:</p>
+        <ul class="plain">
+          <li><b>Воронка</b> — сколько людей дошло до каждого шага и где теряется больше всего.</li>
+          <li><b>Решение</b> — одно предложение, что изменить, с кнопками «принять» и «отклонить».</li>
+          <li><b>Сигналы</b> — что выбилось из нормы: оплаты не проходят, регистрации встали.</li>
+          <li><b>Динамика и лента</b> — как меняется неделя и что делают конкретные люди.</li>
+        </ul>
+        <div class="row" style="margin-top:16px">
+          <button class="btn primary" onclick="switchTab('projects')">Подключить проект</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="overview-content">
     <div class="row" style="margin-bottom:14px">
       <button class="btn primary" id="run-btn">Проверить сейчас</button>
       <span id="run-result" class="muted"></span>
+    </div>
+
+    <!-- Путь первого запуска. Живёт только до первого снимка данных: дальше
+         это был бы постоянный шум на главном экране. -->
+    <div class="card hidden" id="first-run">
+      <h2>Первые шаги</h2>
+      <div id="first-run-steps"></div>
+      <p class="muted" id="first-run-note" style="margin:14px 0 0"></p>
     </div>
 
     <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
@@ -187,6 +288,7 @@
 
     <div class="card">
       <h2>Воронка
+        <button class="hint" data-hint="funnel" title="Как читать воронку">?</button>
         <span class="spacer"></span>
         <select id="funnel-window" style="width:auto;margin:0;padding:4px 8px;font-size:13px">
           <option value="7d">7 дней</option>
@@ -196,12 +298,26 @@
       </h2>
       <p class="purpose" style="margin-top:0">Зачем: найти шаг, где теряется больше всего людей.
         Проценты — доля дошедших от предыдущего шага.</p>
+      <div class="hint-pop hidden" id="hint-funnel">Проценты между строками — доля дошедших
+        от предыдущего шага, а не от начала воронки. Если на шаге написано «× 2,5 к предыдущему
+        шагу» вместо процента, значит на нём событий больше, чем на предыдущем: так бывает,
+        когда одно действие повторяют или его совершают люди, зарегистрированные раньше окна.
+        Длина полосы — доля от самого большого шага, поэтому короткая полоса не значит «мало»,
+        она значит «меньше верхнего шага». Окно (3 часа / 24 часа / 7 дней) переключается справа:
+        на коротких окнах числа маленькие и по ним нельзя делать выводы.</div>
       <div id="funnel-body"></div>
       <p class="muted" id="funnel-note" style="margin:12px 0 0"></p>
     </div>
 
     <div class="card">
-      <h2>Динамика<span class="spacer"></span><span class="muted">недельное окно на каждый день</span></h2>
+      <h2>Динамика
+        <button class="hint" data-hint="dyn" title="Что показывает график">?</button>
+        <span class="spacer"></span><span class="muted">недельное окно на каждый день</span></h2>
+      <div class="hint-pop hidden" id="hint-dyn">Каждая точка — это сумма за предыдущие 7 дней
+        на тот день, а не события одного дня. Так видно, растёт неделя или падает, без скачков
+        от «во вторник было двое, в среду ноль». Поэтому линия меняется плавно, а два соседних
+        дня почти всегда близки. График появляется с третьего дня наблюдений: по одной-двум
+        точкам направление не определяется.</div>
       <div id="dynamics-body"></div>
     </div>
 
@@ -217,6 +333,7 @@
       <h2>Источники данных</h2>
       <div class="row" id="integrations-body"></div>
     </div>
+    </div><!-- /overview-content -->
   </div>
 
   <!-- РЕКЛАМА -->
@@ -224,6 +341,7 @@
     <p class="purpose">Зачем: понять, окупается ли реклама. Слева — сколько денег ушло,
       справа — что из этих людей выросло. Если источник даёт регистрации, но не даёт
       оплат, проблема не в рекламе, а в продукте после регистрации.</p>
+    <div id="ads-optional" class="hidden"></div>
     <div class="kpis" id="ads-kpis" style="margin-bottom:16px"></div>
     <div class="card">
       <h2>Откуда приходят и что из этого выходит<span class="spacer"></span>
@@ -304,7 +422,7 @@
   <div id="view-projects" class="hidden">
     <div class="card">
       <h2>Подключённые проекты</h2>
-      <table id="projects-table"><tbody></tbody></table>
+      <table id="projects-table" class="stack"><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Названия этапов воронки<span class="spacer"></span>
@@ -323,7 +441,9 @@
     <div class="card">
       <h2>Подключить проект</h2>
       <p class="muted">Заполните три поля — остальное аналитик определит сам: проверит
-        связь, найдёт доступные endpoints, поставит разметку воронки.</p>
+        связь, найдёт доступные endpoints, поставит разметку воронки.
+        Больше ничего подключать не нужно: Яндекс.Директ, Метрика и ЮKassa
+        необязательны, без них работают и воронка, и сигналы, и проверки.</p>
       <div class="grid2">
         <div>
           <label>Название *</label>
@@ -343,11 +463,16 @@
       <label>Токен внутреннего API *</label>
       <input id="np-token" placeholder="значение TRUEPOST_INTERNAL_API_TOKEN на стороне проекта">
       <details style="margin-bottom:12px">
-        <summary class="muted" style="cursor:pointer">Необязательно: внешние источники</summary>
+        <summary class="muted" style="cursor:pointer">Необязательно: реклама и внешний трафик</summary>
+        <p class="muted" style="margin:10px 0 0">Эти источники добавляют ровно одно — деньги:
+          сколько потрачено на рекламу и во сколько обошлась регистрация. Всё остальное
+          аналитик считает по данным самого продукта. Добавить их можно когда угодно позже —
+          подключение проекта от этого не зависит.</p>
         <div class="grid2" style="margin-top:10px">
           <div><label>Счётчик Метрики</label><input id="np-metrika" placeholder="12345678"></div>
           <div><label>Логин Директа</label><input id="np-direct" placeholder="client-login"></div>
         </div>
+        <p class="muted">OAuth-токены Яндекса задаются в переменных окружения сервера аналитика.</p>
       </details>
       <div class="row">
         <button class="btn" id="np-test">Проверить подключение</button>
@@ -435,8 +560,57 @@ $('login-btn').onclick = async () => {
 $('login-password').addEventListener('keydown', e => { if (e.key === 'Enter') $('login-btn').click(); });
 $('logout-btn').onclick = async () => { try { await api('/api/logout', {method:'POST'}); } catch(e){} showLogin(); };
 document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+// Градиент у края вкладок — подсказка «здесь есть ещё». Докрутили до конца — убираем.
+(() => {
+  const nav = $('tabs'), wrap = $('nav-wrap');
+  const sync = () => wrap.classList.toggle('at-end',
+    nav.scrollLeft + nav.clientWidth >= nav.scrollWidth - 2);
+  nav.addEventListener('scroll', sync);
+  window.addEventListener('resize', sync);
+  sync();
+})();
+
+
+/* --- Скелетоны загрузки ------------------------------------------------
+   Показываем форму будущей панели, пока идёт запрос. Не «Загрузка…» текстом:
+   при пяти параллельных запросах экран из пяти надписей выглядит хуже, чем
+   контур того, что появится. Цифр в скелетоне нет принципиально. */
+const skelLines = (n = 3, cls = '') =>
+  Array.from({length: n}, (_, i) =>
+    `<div class="skel ${cls || (i % 3 === 0 ? 'w80' : (i % 3 === 1 ? 'w60' : 'w40'))}"></div>`).join('');
+const skelKpis = (n = 6) =>
+  Array.from({length: n}, () =>
+    `<div class="kpi"><div class="skel w60"></div>
+     <div class="skel tall w40" style="margin-top:10px"></div>
+     <div class="skel w80" style="margin-top:8px"></div></div>`).join('');
+function showSkeleton(id, html) {
+  const el = $(id);
+  if (el) el.innerHTML = html;
+}
 
 /* ---------------- Обзор ---------------- */
+// Обязателен один источник — внутренний API продукта. Остальные добавляют
+// данных, но их отсутствие не поломка: значок «·» без пояснения читался
+// как «что-то не настроено и надо чинить».
+const SOURCE_TITLES = {
+  project_metrics_api: 'Данные продукта',
+  metrika: 'Яндекс.Метрика', direct: 'Яндекс.Директ', yookassa: 'ЮKassa',
+  telegram: 'Telegram', llm: 'Ответы аналитика',
+};
+const REQUIRED_SOURCES = ['project_metrics_api'];
+function renderIntegrations(list) {
+  $('integrations-body').innerHTML = list.map(i => {
+    const required = REQUIRED_SOURCES.includes(i.type);
+    const title = SOURCE_TITLES[i.type] || i.type;
+    if (i.status === 'ok') return `<span class="tag good">✓ ${esc(title)}</span>`;
+    if (i.status === 'error') return `<span class="tag critical" title="${esc(i.last_error || '')}">✕ ${esc(title)}</span>`;
+    if (i.status === 'stale') return `<span class="tag warning">! ${esc(title)}: данные устарели</span>`;
+    return required
+      ? `<span class="tag critical">✕ ${esc(title)}: без этого источника аналитик слеп</span>`
+      : `<span class="tag">○ ${esc(title)}: не подключён, необязательно</span>`;
+  }).join('');
+}
+
 // Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
 // у чужих проектов это «Этап 1/2», пока их не переименуют (вкладка «Проекты»).
 let STAGE_TITLES = {};
@@ -444,54 +618,101 @@ let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_sta
 const stageTitle = k => STAGE_TITLES[k] || k;
 
 async function loadOverview() {
+  showSkeleton('kpis', skelKpis());
+  showSkeleton('decision-body', skelLines(3));
+  showSkeleton('funnel-body', skelLines(5, 'tall'));
+  showSkeleton('dynamics-body', skelLines(4));
+  showSkeleton('alerts-body', skelLines(2));
+  showSkeleton('integrations-body', skelLines(1, 'w60'));
   try {
-    const [o, f, g, d, alerts] = await Promise.all([
-      api('/api/overview'), api('/api/funnel'), api('/api/growth'),
-      api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
-    ]);
-    window._funnel = f.windows;
-    STAGE_TITLES = f.stage_titles || {};
-    STAGE_ORDER = (f.stage_order || STAGE_ORDER).filter(k => k !== 'revenue');
-
-    if (o.project) {
-      $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
-    } else {
-      $('hdr-project').textContent = 'нет активного проекта';
+    // Обзор грузим первым: пока проект не подключён, остальные panels
+    // отвечают 404, и одним Promise.all весь экран умирал на «Загрузка…».
+    const o = await api('/api/overview');
+    if (!o.project) {
+      $('hdr-project').textContent = 'проект не подключён';
+      $('overview-empty').classList.remove('hidden');
+      $('overview-content').classList.add('hidden');
+      return;
     }
-    renderKpis(f.windows['7d']);
+    $('overview-empty').classList.add('hidden');
+    $('overview-content').classList.remove('hidden');
+    $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
+
+    // allSettled, а не all: если один источник отвалился, остальные панели
+    // должны отрисоваться — каждая сама честно скажет, что данных нет.
+    const [f, g, d, alerts] = (await Promise.allSettled([
+      api('/api/funnel'), api('/api/growth'),
+      api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
+    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+
+    window._funnel = (f && f.windows) || {};
+    STAGE_TITLES = (f && f.stage_titles) || {};
+    STAGE_ORDER = ((f && f.stage_order) || STAGE_ORDER).filter(k => k !== 'revenue');
+
+    renderKpis(f && f.windows ? f.windows['7d'] : null);
     renderDecision(g);
     renderFunnel($('funnel-window').value);
     renderDynamics(d);
-    renderAlerts(alerts);
-    $('integrations-body').innerHTML = (o.integrations || []).map(i => {
-      const cls = i.status === 'ok' ? 'good' : (i.status === 'error' ? 'critical'
-                : (i.status === 'stale' ? 'warning' : ''));
-      const icon = i.status === 'ok' ? '✓' : (i.status === 'error' ? '✕'
-                 : (i.status === 'stale' ? '!' : '·'));
-      return `<span class="tag ${cls}">${icon} ${esc(i.type)}</span>`;
-    }).join('');
+    // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
+    // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
+    const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
+    renderAlerts(alerts, hasSnapshots);
+    renderFirstRun(o, hasSnapshots);
+    renderIntegrations(o.integrations || []);
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
 function renderKpis(win) {
   const fu = (win && win.funnel) || {};
-  const cpa = (fu.traffic && fu.signup) ? null : null;
+  // Пока цикл ни разу не отработал, снимка нет вовсе. Показать шесть
+  // прочерков и молчать — значит заставить человека гадать, сломалось
+  // что-то или просто рано.
+  const noData = !win;
+  // Откуда берётся число — часть самого числа. Без этого «40» на шаге,
+  // где на предыдущем «8», выглядит ошибкой, а прочерк читается как ноль.
+  const FROM_PRODUCT = 'Считает сам продукт и отдаёт по своему внутреннему API. '
+    + 'Какое именно его поле стоит за этим шагом — видно на вкладке «Проекты».';
   const tiles = [
-    {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней'},
+    {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней',
+     hint: 'Сколько человек зарегистрировалось за последние 7 дней. ' + FROM_PRODUCT},
     {label: stageTitle('activation_1'), value: fu.activation_1,
-     sub: pct(fu.activation_1, fu.signup, 'от регистраций')},
+     sub: pct(fu.activation_1, fu.signup, 'от регистраций'),
+     hint: 'Первое целевое действие после регистрации, за 7 дней. Может оказаться '
+       + 'больше числа регистраций: действие совершают и те, кто зарегистрировался '
+       + 'раньше этого окна. ' + FROM_PRODUCT},
     {label: stageTitle('payment_started'), value: fu.payment_started,
-     sub: pct(fu.payment_started, fu.signup, 'от регистраций')},
+     sub: pct(fu.payment_started, fu.signup, 'от регистраций'),
+     hint: 'Сколько раз человек начал оплату за 7 дней. Начатая оплата — ещё не деньги: '
+       + 'разрыв с «оплата прошла» и есть главный предмет разбора. ' + FROM_PRODUCT},
     {label: stageTitle('payment_success'), value: fu.payment_success,
-     sub: pct(fu.payment_success, fu.payment_started, 'от начатых')},
-    {label: stageTitle('revenue'), value: fu.revenue, sub:'₽ за 7 дней'},
-    {label: stageTitle('traffic'), value: fu.traffic, sub:'Яндекс.Директ'},
+     sub: pct(fu.payment_success, fu.payment_started, 'от начатых'),
+     hint: 'Успешные оплаты за 7 дней — подтверждённые продуктом, а не намерения. '
+       + FROM_PRODUCT},
+    {label: stageTitle('revenue'), value: fu.revenue, sub:'₽ за 7 дней',
+     hint: 'Выручка за 7 дней в рублях, как её считает сам продукт. Аналитик её '
+       + 'не пересчитывает и налоги с комиссиями не вычитает.'},
+    {label: stageTitle('traffic'), value: fu.traffic, sub:'Яндекс.Директ',
+     hint: 'Клики по рекламе за 7 дней из Яндекс.Директа. Директ подключать '
+       + 'не обязательно — без него здесь прочерк, и это не ноль, а «мы не знаем». '
+       + 'Остальная воронка работает и без рекламных источников.'},
   ];
-  $('kpis').innerHTML = tiles.map(t =>
-    `<div class="kpi"><div class="label">${esc(t.label)}</div>
+  $('kpis').innerHTML = tiles.map((t, i) =>
+    `<div class="kpi"><div class="label">${esc(t.label)}${
+       t.hint ? `<button class="hint" data-hint="kpi-${i}" title="Откуда это число">?</button>` : ''}</div>
      <div class="value">${nf(t.value)}</div>
-     <div class="sub">${esc(t.sub || '')}</div></div>`).join('');
+     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div>
+     ${t.hint ? `<div class="hint-pop hidden" id="hint-kpi-${i}">${esc(t.hint)}</div>` : ''}
+     </div>`).join('');
 }
+
+// Одна общая обработка кликов по подсказкам: пары кнопка → блок связаны
+// через data-hint, поэтому новые подсказки не требуют своего кода.
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.hint');
+  if (!btn) return;
+  const pop = document.getElementById('hint-' + btn.dataset.hint);
+  if (pop) pop.classList.toggle('hidden');
+});
 function pct(a, b, suffix) {
   if (a == null || !b) return '';
   return Math.round(a / b * 100) + '% ' + suffix;
@@ -501,7 +722,8 @@ function renderFunnel(winKey) {
   const win = (window._funnel || {})[winKey];
   const box = $('funnel-body');
   if (!win) {
-    box.innerHTML = '<p class="muted">Снимка за это окно ещё нет — нажмите «Проверить сейчас».</p>';
+    box.innerHTML = '<p class="muted">Снимка за это окно ещё нет. Аналитик собирает данные '
+      + 'сам раз в несколько часов — или нажмите «Проверить сейчас», чтобы не ждать.</p>';
     $('funnel-note').textContent = '';
     return;
   }
@@ -528,7 +750,9 @@ function renderFunnel(winKey) {
       <div class="funnel-value">${nf(v)}</div></div>`;
     prevVal = v;
   }
-  box.innerHTML = html || '<p class="muted">Данных по шагам нет.</p>';
+  box.innerHTML = html || '<p class="muted">Снимок есть, но продукт не вернул ни одного '
+    + 'шага воронки. Проверьте на вкладке «Проекты», что связь с продуктом жива '
+    + 'и разметка шагов совпадает с его метриками.</p>';
   $('funnel-note').textContent = `Источник: ${win.source}, данные на `
     + (win.as_of ? win.as_of.slice(0,16).replace('T',' ') + ' UTC' : '—');
 }
@@ -541,7 +765,7 @@ const DYN_SERIES = [
 ];
 function renderDynamics(d) {
   const box = $('dynamics-body');
-  const history = d.history || [];
+  const history = (d && d.history) || [];
   if (history.length < 2) {
     box.innerHTML = '<p class="muted">Появится после двух дней наблюдений — '
       + 'график из одной точки ничего не значит.</p>';
@@ -587,6 +811,12 @@ function renderDynamics(d) {
 function renderDecision(g) {
   const box = $('decision-body'), hint = $('decision-hint');
   hint.textContent = '';
+  if (!g) {
+    box.innerHTML = '<p class="muted">Не удалось получить состояние цикла роста. '
+      + 'Нажмите «Проверить сейчас» — если не поможет, смотрите вкладку «Проекты»: '
+      + 'возможно, продукт не отвечает.</p>';
+    return;
+  }
   if (g.recommendation) {
     const r = g.recommendation;
     hint.textContent = 'ждёт вашего решения';
@@ -655,10 +885,16 @@ window.why = async id => {
   $('why-box').innerHTML = renderReport(r.text);
 };
 
-function renderAlerts(alerts) {
+function renderAlerts(alerts, hasSnapshots) {
+  alerts = alerts || [];
   $('alerts-count').textContent = alerts.length ? `${alerts.length} открытых` : '';
   if (!alerts.length) {
-    $('alerts-body').innerHTML = '<p class="muted">Сигналов нет — по проверяемым правилам всё в норме.</p>';
+    // Честность: «всё в норме» можно говорить только если правила
+    // действительно прогонялись по данным.
+    $('alerts-body').innerHTML = hasSnapshots
+      ? '<p class="muted">Сигналов нет — по проверяемым правилам всё в норме.</p>'
+      : '<p class="muted">Проверок ещё не было: аналитик не собрал ни одного снимка данных. '
+        + 'Это не значит, что всё хорошо — просто пока не по чему судить.</p>';
     return;
   }
   const sevClass = s => ({P0:'critical', P1:'critical', P2:'warning', P3:'serious'})[s] || '';
@@ -698,12 +934,13 @@ $('run-btn').onclick = async () => {
 
 /* ---------------- Этапы воронки ---------------- */
 async function loadStages(projectId) {
+  showSkeleton('stages-body', skelLines(5, 'tall'));
   try {
     const r = await api(`/api/projects/${projectId}/stages`);
-    $('stages-body').innerHTML = r.stages.map(st => `<div class="row" style="margin-bottom:8px">
-      <code class="muted" style="min-width:130px">${esc(st.key)}</code>
-      <input data-stage="${esc(st.key)}" value="${esc(st.title)}" style="flex:1;margin:0;max-width:320px">
-      <span class="muted">${st.source_metric ? 'метрика: ' + esc(st.source_metric)
+    $('stages-body').innerHTML = r.stages.map(st => `<div class="stage-row">
+      <span class="stage-key">${esc(st.key)}</span>
+      <input data-stage="${esc(st.key)}" value="${esc(st.title)}">
+      <span class="stage-note">${st.source_metric ? 'метрика: ' + esc(st.source_metric)
         : (st.is_custom ? '' : 'название по умолчанию')}</span></div>`).join('');
   } catch (e) { if (e.message !== 'unauthorized') $('stages-body').innerHTML =
     `<p class="error-text">${esc(e.message)}</p>`; }
@@ -740,10 +977,61 @@ $('stages-ai').onclick = async () => {
 };
 
 /* ---------------- Реклама ---------------- */
+// Директ и Метрика — необязательные источники. Без них аналитик работает,
+// просто не знает про деньги и внешний трафик. Показать таблицу прочерков
+// и промолчать — значит оставить человека думать, что продукт сломан или
+// что без настройки Яндекса им пользоваться нельзя.
+const OPTIONAL_SOURCES = {
+  direct: {
+    name: 'Яндекс.Директ',
+    gives: 'расход, клики и цену регистрации',
+    without: 'воронка, сигналы, проверки и лента работают полностью — не видно только денег на рекламу',
+  },
+  metrika: {
+    name: 'Яндекс.Метрика',
+    gives: 'внешний трафик и цели сайта',
+    without: 'продуктовая воронка считается по данным самого продукта и без Метрики',
+  },
+  yookassa: {
+    name: 'ЮKassa',
+    gives: 'сверку платежей на стороне платёжной системы',
+    without: 'оплаты берутся из самого продукта',
+  },
+};
+function renderOptionalSources(sources, hasDirectData) {
+  const box = $('ads-optional');
+  // Эта вкладка про рекламные деньги, поэтому объясняем только Директ.
+  // Метрика и ЮKassa к расходу на рекламу отношения не имеют — их состояние
+  // видно в «Источниках данных» на обзоре.
+  const missing = (sources.direct && sources.direct.status !== 'ok' && !hasDirectData)
+    ? [{key: 'direct', meta: OPTIONAL_SOURCES.direct,
+        status: sources.direct.status, error: sources.direct.last_error}]
+    : [];
+  if (!missing.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = missing.map(m => {
+    const broken = m.status === 'error';
+    return `<div class="card" style="border-left:3px solid var(--${broken ? 'serious' : 'series-1'})">
+      <h2>${esc(m.meta.name)}: ${broken ? 'источник отвечает с ошибкой' : 'не подключён — это нормально'}</h2>
+      <p style="margin:0">${broken
+        ? 'Аналитик не смог получить данные: ' + esc(m.error || 'источник не ответил') + '.'
+        : 'Подключать не обязательно. С ним видно ' + esc(m.meta.gives) + '.'}</p>
+      <p class="muted" style="margin:8px 0 0">Без него ${esc(m.meta.without)}.</p>
+    </div>`;
+  }).join('');
+}
+
 async function loadAds() {
+  showSkeleton('ads-kpis', skelKpis(5));
+  $('ads-table').tBodies[0].innerHTML = `<tr><td>${skelLines(4)}</td></tr>`;
   try {
     const a = await api('/api/ads');
     const t = a.totals || {};
+    // Смотрим и на статус, и на сами данные: строка статуса обновляется
+    // только циклом сбора, и после ручного импорта или сразу после рестарта
+    // она может врать. Если расход и клики пришли — Директ работает,
+    // что бы ни было записано в статусе.
+    renderOptionalSources(a.sources || {}, t.spend != null || t.clicks != null);
     $('ads-kpis').innerHTML = [
       {label:'Расход', value: t.spend, sub:'₽ за 7 дней'},
       {label:'Клики', value: t.clicks, sub:'Яндекс.Директ'},
@@ -794,6 +1082,7 @@ const EXP_STATUS = {running:'идёт', enough_data:'данных достато
   lost:'не сработало', inconclusive:'без вывода', cancelled:'отменено'};
 async function loadHistory() {
   const box = $('history-body');
+  box.innerHTML = skelLines(4);
   try {
     const h = await api('/api/history');
     if (!h.items.length) {
@@ -834,6 +1123,65 @@ window.sendToDev = async (title, body) => {
   } catch (e) { alert(e.message); }
 };
 
+
+/* --- Путь первого запуска (виден только до первого снимка данных) --- */
+function renderFirstRun(o, hasSnapshots) {
+  const card = $('first-run');
+  if (hasSnapshots) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+
+  // Связь с продуктом: пока она не ok, запускать проверку бессмысленно --
+  // честнее сказать об этом сразу, чем дать нажать и получить пустоту.
+  const product = (o.integrations || []).find(i => i.type === 'project_metrics_api');
+  const linkOk = product && product.status === 'ok';
+  const linkFailed = product && product.status === 'error';
+
+  const steps = [
+    {
+      state: 'done',
+      title: `Проект подключён — ${o.project.name}`,
+      note: o.project.base_url || '',
+    },
+    {
+      // Три честных состояния, а не два: «ещё не проверяли» — это не «работает».
+      state: linkOk ? 'done' : (linkFailed ? 'now' : 'wait'),
+      title: linkOk ? 'Связь с продуктом есть'
+           : (linkFailed ? 'Связь с продуктом не работает'
+                         : 'Связь ещё не проверялась'),
+      note: linkFailed
+        ? (product.last_error || 'Продукт не отвечает на запросы аналитика.')
+          + ' Проверьте адрес и токен на вкладке «Проекты» — кнопка «перепроверить».'
+        : (linkOk ? 'Продукт отвечает на запросы аналитика.'
+                  : 'Аналитик проверит её при первом сборе данных. Проверить сразу '
+                    + 'можно на вкладке «Проекты» — кнопка «перепроверить».'),
+    },
+    {
+      state: linkFailed ? 'wait' : 'now',
+      title: 'Запустите первый сбор данных',
+      note: 'Кнопка «Проверить сейчас» вверху. Дальше аналитик собирает данные сам '
+            + 'раз в несколько часов — ждать у экрана не нужно.',
+    },
+    {
+      state: 'wait',
+      title: 'Через пару дней появится динамика',
+      note: 'По одному замеру нельзя сказать, растёт что-то или падает. '
+            + 'Воронка и сигналы появятся сразу после первого сбора, график — позже.',
+    },
+  ];
+
+  $('first-run-steps').innerHTML = steps.map((st, i) => {
+    const mark = st.state === 'done' ? '✓' : (i + 1);
+    return `<div class="step ${st.state === 'wait' ? '' : st.state}">
+      <div class="mark">${mark}</div>
+      <div class="text"><b>${esc(st.title)}</b><span>${esc(st.note)}</span></div>
+    </div>`;
+  }).join('');
+
+  $('first-run-note').textContent = linkFailed
+    ? 'Пока связь не восстановится, данных не будет — это не поломка аналитика.'
+    : 'Этот блок исчезнет сам, как только появится первый снимок данных.';
+}
+
 /* ---------------- Живая лента ---------------- */
 const EVENT_META = {
   user_registered:      {icon:'👤', label:'Регистрация',            color:'var(--series-1)'},
@@ -858,7 +1206,7 @@ function timeAgo(iso) {
 }
 async function loadLive() {
   const box = $('live-body');
-  box.innerHTML = '<span class="muted">Загрузка…</span>';
+  box.innerHTML = skelLines(4);
   try {
     const r = await api('/api/live?period_minutes=' + $('live-period').value);
     const custom = r.event_labels || {};
@@ -907,7 +1255,7 @@ async function loadReport(kind) {
   currentReport = kind;
   document.querySelectorAll('#report-nav button').forEach(b =>
     b.classList.toggle('active', b.dataset.kind === kind));
-  $('report-body').textContent = 'Загрузка…';
+  $('report-body').innerHTML = skelLines(6);
   try {
     const r = await api('/api/reports/' + kind);
     $('report-body').innerHTML = renderReport(r.text) || '<span class="muted">Отчёт пуст.</span>';
@@ -943,6 +1291,7 @@ $('chat-input').addEventListener('keydown', e => {
 
 /* ---------------- Проекты ---------------- */
 async function loadProjects() {
+  $('projects-table').tBodies[0].innerHTML = `<tr><td>${skelLines(2)}</td></tr>`;
   try {
     const list = await api('/api/projects');
     const active = list.find(p => p.is_active);

@@ -56,7 +56,16 @@ async def on_startup() -> None:
         _telegram_app = build_application()
         await _telegram_app.initialize()
         await _telegram_app.start()
-        logger.info("Telegram bot polling/dispatcher started. Build: %s", BUILD_MARKER)
+        # Application.start() поднимает только обработчик апдейтов -- сам он
+        # НИЧЕГО не получает от Telegram. Нужен один из двух каналов входящих:
+        #
+        # webhook (если задан PUBLIC_URL) -- Telegram сам присылает апдейты на
+        #   наш адрес. Регистрируем его на КАЖДОМ старте: при переезде на новый
+        #   домен вебхук иначе остаётся висеть на старом, исходящие сообщения
+        #   идут, а команды молча перестают доходить (кейс 27.07.2026: после
+        #   остановки Railway бот отправлял сводку, но не отвечал на /board);
+        # polling -- если публичного адреса нет.
+        await _start_telegram_updates(settings)
     else:
         logger.warning("BOT_TOKEN not set -- Telegram bot disabled, HTTP API still works")
 
@@ -127,11 +136,40 @@ async def on_startup() -> None:
     logger.info("Growth Agent started. Build: %s. Watch interval: %s sec", BUILD_MARKER, settings.watch_interval_seconds)
 
 
+async def _start_telegram_updates(settings) -> None:
+    """
+    Включает приём входящих сообщений: вебхук при заданном PUBLIC_URL,
+    иначе polling. Ошибку не проглатываем молча -- бот без входящих выглядит
+    «живым» (сводки уходят), и проблему легко не заметить неделями.
+    """
+    secret = settings.bot_token.split(":")[-1]
+
+    if settings.public_url:
+        url = f"{settings.public_url.rstrip('/')}/webhook/{secret}"
+        try:
+            await _telegram_app.bot.set_webhook(url=url, drop_pending_updates=False)
+            logger.info("Telegram webhook registered: %s. Build: %s", url, BUILD_MARKER)
+            return
+        except Exception:
+            logger.exception("Не удалось зарегистрировать вебхук %s -- пробуем polling", url)
+
+    try:
+        await _telegram_app.bot.delete_webhook(drop_pending_updates=False)
+        await _telegram_app.updater.start_polling()
+        logger.info("Telegram polling started. Build: %s", BUILD_MARKER)
+    except Exception:
+        logger.exception("Не удалось запустить приём обновлений Telegram: команды работать не будут")
+
+
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     stop_scheduler()
     global _telegram_app
     if _telegram_app is not None:
+        # Updater останавливаем до Application: иначе polling продолжит
+        # тянуть апдейты в уже остановленный обработчик.
+        if _telegram_app.updater is not None and _telegram_app.updater.running:
+            await _telegram_app.updater.stop()
         await _telegram_app.stop()
         await _telegram_app.shutdown()
 
@@ -149,6 +187,22 @@ async def health():
     не зависело от состояния БД или коннекторов.
     """
     return {"status": "ok"}
+
+
+@app.get("/api/memory")
+async def api_memory():
+    """
+    Текущая память процесса -- диагностика OOM без панели хостинга.
+    Восстановлено 2026-07-27: endpoint потерялся при загрузке файлов через
+    веб-интерфейс GitHub. Полезен ровно тем, что показывает current RSS,
+    а не только пик: по нему видно, растёт ли потребление между циклами.
+    """
+    import resource
+
+    from app.scheduler import _read_current_rss_mb
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    return {"current_rss_mb": _read_current_rss_mb(), "peak_rss_mb": round(peak)}
 
 
 @app.get("/status")
