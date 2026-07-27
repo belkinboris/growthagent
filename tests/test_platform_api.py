@@ -229,6 +229,147 @@ class TestAccountsAPI:
 
 
 # ---------------------------------------------------------------------------
+# Изоляция данных по владельцу (B1.2 / B2)
+# ---------------------------------------------------------------------------
+
+
+def _second_project(session_factory, name="Чужой проект"):
+    """Второй проект в базе -- «соседский». Активным не делаем: активный
+    в v1 ровно один, и это проект из окружения."""
+    from app.models import Project
+
+    with session_factory() as session:
+        p = Project(name=name, type="telegram_saas", base_url="https://other.test",
+                    connector_name="truepost", is_active=False,
+                    settings_json={"internal_api_token": "tok2"})
+        session.add(p)
+        session.commit()
+        session.refresh(p)
+        return p.id
+
+
+def _register(client, email, password="qwerty12"):
+    resp = client.post("/growth/api/register", json={"email": email, "password": password})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+class TestOwnerIsolation:
+    """Клиент видит только свои проекты. До этих проверок вход был один на
+    всех: любой вошедший читал чужую воронку, деньги и сигналы."""
+
+    def _two_tenants(self, monkeypatch, tmp_path):
+        from app import accounts
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        ivan = _register(client, "ivan@example.com")           # усыновляет проект из окружения
+        ivan_pid = _project_id(session_factory)
+        petr_pid = _second_project(session_factory)
+
+        client.post("/growth/api/logout")
+        petr = _register(client, "petr@example.com")           # усыновлять уже нечего
+        with session_factory() as session:
+            from sqlmodel import select
+            from app.models import PlatformUser
+            petr_user = session.exec(
+                select(PlatformUser).where(PlatformUser.email == "petr@example.com")).first()
+            accounts.grant_project(session, petr_pid, petr_user.id)
+        return client, session_factory, ivan_pid, petr_pid
+
+    def test_list_shows_only_own_projects(self, monkeypatch, tmp_path):
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        # сейчас в сессии Пётр
+        ids = [p["id"] for p in client.get("/growth/api/projects").json()]
+        assert ids == [petr_pid]
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert [p["id"] for p in client.get("/growth/api/projects").json()] == [ivan_pid]
+
+    def test_foreign_project_is_not_found(self, monkeypatch, tmp_path):
+        """404, а не 403: 403 подтверждает, что такой проект есть."""
+        client, _, ivan_pid, _ = self._two_tenants(monkeypatch, tmp_path)
+        assert client.get(f"/growth/api/projects/{ivan_pid}/stages").status_code == 404
+        assert client.put(f"/growth/api/projects/{ivan_pid}/stages",
+                          json={"titles": {"signup": "Взлом"}}).status_code == 404
+        assert client.patch(f"/growth/api/projects/{ivan_pid}",
+                            json={"name": "Взлом"}).status_code == 404
+        assert client.post(f"/growth/api/projects/{ivan_pid}/retest").status_code == 404
+        assert client.post(f"/growth/api/projects/{ivan_pid}/activate").status_code == 404
+
+    def test_overview_shows_own_project(self, monkeypatch, tmp_path):
+        """У Петра свой проект не активен -- но он у него единственный,
+        и показать надо его, а не «нет проекта» и не чужой."""
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        assert client.get("/growth/api/overview").json()["project"]["id"] == petr_pid
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/overview").json()["project"]["id"] == ivan_pid
+
+    def test_funnel_is_not_shared(self, monkeypatch, tmp_path):
+        """Главная утечка: цифры чужой воронки на своём экране."""
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        with session_factory() as session:
+            _snapshot(session, ivan_pid)
+
+        # У Петра снимков нет -- окно пустое, а не с чужими числами.
+        assert client.get("/growth/api/funnel").json()["windows"]["7d"] is None
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/funnel").json()["windows"]["7d"]["funnel"]["signup"] == 12
+
+    def test_foreign_alert_cannot_be_touched(self, monkeypatch, tmp_path):
+        """Список чужого не покажет, а действие по угаданному номеру
+        проходило бы -- это и есть дырявая изоляция."""
+        from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel
+
+        client, session_factory, ivan_pid, _ = self._two_tenants(monkeypatch, tmp_path)
+        with session_factory() as session:
+            alert = Alert(project_id=ivan_pid, rule_id="r1", fingerprint="f1",
+                          title="Чужой сигнал", severity=AlertSeverity.p2,
+                          category=AlertCategory.activation_drop, status=AlertStatus.open,
+                          confidence=ConfidenceLevel.medium, message="Чужие данные",
+                          period_key="24h")
+            session.add(alert)
+            session.commit()
+            session.refresh(alert)
+            alert_id = alert.id
+
+        assert client.post(f"/growth/api/alerts/{alert_id}/ack").status_code == 404
+        assert client.get("/growth/api/alerts").json() == []
+
+    def test_dev_task_is_owner_only(self, monkeypatch, tmp_path):
+        """Задача уходит в репозиторий владельца платформы -- клиенту туда нельзя."""
+        client, _, _, _ = self._two_tenants(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/dev-task", json={"title": "т", "body": "т"})
+        assert resp.status_code == 403
+
+    def test_env_owner_still_sees_everything(self, monkeypatch, tmp_path):
+        """Владелец платформы входит паролем из окружения и админит всё."""
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.post("/growth/api/logout")
+        _login(client)
+        ids = sorted(p["id"] for p in client.get("/growth/api/projects").json())
+        assert ids == sorted([ivan_pid, petr_pid])
+        assert client.get(f"/growth/api/projects/{ivan_pid}/stages").status_code == 200
+
+    def test_activation_does_not_silently_stop_neighbour(self, monkeypatch, tmp_path):
+        """Планировщик собирает один проект. Включение своего выключило бы
+        сбор у соседа -- отказываем словами, а не молча ломаем."""
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        resp = client.post(f"/growth/api/projects/{petr_pid}/activate")
+        assert resp.status_code == 409
+        assert "другому пользователю" in resp.json()["detail"]
+
+        from app.models import Project
+        with session_factory() as session:
+            assert session.get(Project, ivan_pid).is_active is True
+            assert session.get(Project, petr_pid).is_active is False
+
+
+# ---------------------------------------------------------------------------
 # Обзор и воронка
 # ---------------------------------------------------------------------------
 
@@ -312,7 +453,7 @@ class TestFunnel:
 
 
 def _alert(session, project_id, period, severity=None, title="Начатые оплаты без успешных"):
-    from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel
+    from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel, ConfidenceLevel
 
     session.add(Alert(
         project_id=project_id,
