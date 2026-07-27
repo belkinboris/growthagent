@@ -12,7 +12,11 @@
 - `app/main.py` — FastAPI: `/health`, `/status`, Telegram webhook, монтирование
   платформы под `/growth`, запуск планировщика в startup.
 - `app/platform_api.py` — всё API веб-платформы (`/growth/api/*`).
-- `app/platform_auth.py` — вход владельца, HMAC-сессии.
+- `app/platform_auth.py` — вход, HMAC-сессии. Личность внутри подписанного
+  токена: `<срок>:u<id>` — аккаунт, `<срок>` без `:u` — владелец по паролю
+  из окружения.
+- `app/accounts.py` — пароли, регистрация, владение проектами
+  (`PlatformUser`, `ProjectMember`).
 - `app/static/platform/index.html` — весь интерфейс: один файл, ванильный JS,
   без сборщика. Тема одна (тёмная), цвета серий валидированы под тёмную
   поверхность.
@@ -37,7 +41,7 @@ OOM в `connectors/direct.py`, диагностика памяти в `scheduler
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080   # прод-команда (Timeweb)
-python3 -m pytest tests/ -q                        # 519 тестов, все зелёные
+python3 -m pytest tests/ -q                        # 560 тестов, все зелёные
 ```
 
 Прогон должен быть чистым. Любое падение — регрессия, а не «известная

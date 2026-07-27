@@ -35,8 +35,9 @@ from app.config import (
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
 )
+from app import accounts
 from app.db import get_session, _ensure_integrations
-from app.models import Alert, Integration, MetricSnapshot, Project
+from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
     SESSION_COOKIE,
     issue_session_token,
@@ -79,6 +80,15 @@ def project_internal_api_token(project: Project) -> Optional[str]:
 
 class LoginRequest(BaseModel):
     password: str
+    # Почта необязательна: владелец платформы входит одним паролем из
+    # окружения, клиент -- почтой и паролем своего аккаунта.
+    email: Optional[str] = None
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: Optional[str] = None
 
 
 class ConnectionTestRequest(BaseModel):
@@ -123,14 +133,8 @@ async def platform_index():
     return FileResponse(PLATFORM_INDEX)
 
 
-@router.post("/api/login")
-async def login(body: LoginRequest, response: Response):
+def _set_session_cookie(response: Response, token: str) -> None:
     settings = get_settings()
-    if not settings.platform_admin_password:
-        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
-    if not verify_password(body.password):
-        raise HTTPException(status_code=401, detail="Неверный пароль")
-    token = issue_session_token()
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -140,7 +144,52 @@ async def login(body: LoginRequest, response: Response):
         secure=settings.platform_cookie_secure,
         path="/",
     )
-    return {"ok": True, "token": token}
+
+
+@router.post("/api/login")
+async def login(body: LoginRequest, response: Response):
+    """Один вход на два случая: почта+пароль (аккаунт) и просто пароль
+    (владелец из окружения). Разделять формы незачем — человек вводит то,
+    что у него есть, а платформа сама понимает, кто пришёл."""
+    settings = get_settings()
+
+    if body.email:
+        with get_session() as session:
+            user = accounts.authenticate(session, body.email, body.password)
+            if user is None:
+                raise HTTPException(status_code=401, detail="Неверная почта или пароль")
+            token = issue_session_token(user_id=user.id)
+            _set_session_cookie(response, token)
+            return {"ok": True, "token": token, "email": user.email, "owner": user.is_owner}
+
+    if not settings.platform_admin_password:
+        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
+    if not verify_password(body.password):
+        raise HTTPException(status_code=401, detail="Неверный пароль")
+    token = issue_session_token()
+    _set_session_cookie(response, token)
+    return {"ok": True, "token": token, "owner": True}
+
+
+@router.post("/api/register")
+async def register(body: RegisterRequest, response: Response):
+    """Регистрация клиента. Первый зарегистрировавшийся усыновляет проекты,
+    заведённые до появления аккаунтов, — иначе живой проект остался бы
+    без владельца и пропал бы из интерфейса после включения изоляции."""
+    with get_session() as session:
+        try:
+            user = accounts.create_user(
+                session, body.email, body.password, display_name=body.display_name
+            )
+        except accounts.EmailTaken:
+            raise HTTPException(status_code=409, detail="Такая почта уже зарегистрирована")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        adopted = accounts.adopt_orphan_projects(session, user.id)
+        token = issue_session_token(user_id=user.id)
+        _set_session_cookie(response, token)
+        return {"ok": True, "token": token, "email": user.email, "adopted_projects": adopted}
 
 
 @router.post("/api/logout")
@@ -152,9 +201,21 @@ async def logout(response: Response):
 @router.get("/api/session")
 async def session_state(request_ok: None = Depends(lambda: None)):
     """Публичный (без auth) статус: настроена ли платформа. Ничего
-    чувствительного не отдаёт -- нужен UI, чтобы показать логин/заглушку."""
+    чувствительного не отдаёт -- нужен UI, чтобы показать логин/заглушку.
+
+    Платформа настроена, если есть пароль владельца ИЛИ хотя бы один
+    аккаунт: клиент, зарегистрировавшийся сам, должен видеть форму входа,
+    а не «платформа не настроена»."""
     settings = get_settings()
-    return {"configured": bool(settings.platform_admin_password)}
+    has_accounts = False
+    try:
+        with get_session() as session:
+            has_accounts = session.exec(select(PlatformUser.id)).first() is not None
+    except Exception:  # база недоступна -- отвечаем честно «не настроена»
+        has_accounts = False
+    # Наружу -- один флаг. Отдавать «есть ли аккаунты» отдельным полем
+    # незачем: анонимному посетителю это ничего не даёт, а разведке помогает.
+    return {"configured": bool(settings.platform_admin_password) or has_accounts}
 
 
 # ---------------------------------------------------------------------------
@@ -1186,7 +1247,7 @@ async def list_projects():
 
 
 @router.post("/api/projects", dependencies=[Depends(require_admin)])
-async def create_project(body: ProjectCreateRequest):
+async def create_project(body: ProjectCreateRequest, identity=Depends(require_admin)):
     from app.connectors.truepost import DEFAULT_FUNNEL_MAPPING
 
     probe = await _probe_internal_api(body.base_url, body.internal_api_token)
@@ -1216,6 +1277,11 @@ async def create_project(body: ProjectCreateRequest):
         session.commit()
         session.refresh(project)
         _ensure_integrations(session, project)
+        # Владение записывается сразу: проект, созданный клиентом, должен
+        # быть его. Вход по паролю из окружения -- владелец платформы, у него
+        # аккаунта может не быть, и связывать не с кем.
+        if identity is not None and identity.user_id is not None:
+            accounts.grant_project(session, project.id, identity.user_id)
         return {"ok": True, "project": _project_to_dict(project), "probe": probe}
 
 

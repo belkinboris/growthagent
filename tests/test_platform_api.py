@@ -152,6 +152,83 @@ class TestAuth:
 
 
 # ---------------------------------------------------------------------------
+# Аккаунты (B1, часть 1)
+# ---------------------------------------------------------------------------
+
+
+class TestAccountsAPI:
+    def test_register_then_login_by_email(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.status_code == 200, resp.text
+        assert client.get("/growth/api/overview").status_code == 200
+
+        client.post("/growth/api/logout")
+        assert client.get("/growth/api/overview").status_code == 401
+
+        resp = client.post("/growth/api/login",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.status_code == 200, resp.text
+        assert client.get("/growth/api/overview").status_code == 200
+
+    def test_duplicate_email_is_409_not_500(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        resp = client.post("/growth/api/register",
+                           json={"email": "IVAN@example.com", "password": "другой123"})
+        assert resp.status_code == 409
+
+    def test_short_password_rejected_with_reason(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "123"})
+        assert resp.status_code == 400
+        assert "8" in resp.json()["detail"]
+
+    def test_wrong_account_password_rejected(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        client.post("/growth/api/logout")
+        resp = client.post("/growth/api/login",
+                           json={"email": "ivan@example.com", "password": "неверный"})
+        assert resp.status_code == 401
+
+    def test_account_login_does_not_need_env_password(self, monkeypatch, tmp_path):
+        """Клиент на своём сервере не обязан заводить PLATFORM_ADMIN_PASSWORD:
+        зарегистрировался -- значит, платформа настроена."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/session").json()["configured"] is True
+
+    def test_registered_user_adopts_existing_project(self, monkeypatch, tmp_path):
+        """Живой проект был заведён до аккаунтов -- он должен достаться
+        первому зарегистрировавшемуся, иначе исчезнет с изоляцией."""
+        from app import accounts
+        client, session_factory = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.json()["adopted_projects"] == 1
+        with session_factory() as session:
+            from app.models import PlatformUser
+            from sqlmodel import select
+            user = session.exec(select(PlatformUser)).first()
+            assert len(accounts.user_project_ids(session, user.id)) == 1
+
+    def test_owner_env_login_still_works(self, monkeypatch, tmp_path):
+        """Аккаунты не должны сломать вход владельца одним паролем."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        client.post("/growth/api/logout")
+        assert client.post("/growth/api/login", json={"password": PASSWORD}).status_code == 200
+        assert client.get("/growth/api/overview").status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Обзор и воронка
 # ---------------------------------------------------------------------------
 
