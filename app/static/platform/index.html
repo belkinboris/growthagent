@@ -166,6 +166,28 @@
 
   <!-- ОБЗОР -->
   <div id="view-overview" class="hidden">
+    <!-- Первый экран, пока проект не подключён. Показывать вместо доски из
+         прочерков: пустые карточки не объясняют новому человеку ничего. -->
+    <div id="overview-empty" class="hidden">
+      <div class="card">
+        <h2>Проект ещё не подключён</h2>
+        <p>Аналитик подключается к вашему продукту по сети и раз в несколько часов
+          сам собирает данные. Ему нужны три вещи: название, адрес продукта и токен
+          его внутреннего API.</p>
+        <p class="muted">Когда проект подключится, здесь появится:</p>
+        <ul class="plain">
+          <li><b>Воронка</b> — сколько людей дошло до каждого шага и где теряется больше всего.</li>
+          <li><b>Решение</b> — одно предложение, что изменить, с кнопками «принять» и «отклонить».</li>
+          <li><b>Сигналы</b> — что выбилось из нормы: оплаты не проходят, регистрации встали.</li>
+          <li><b>Динамика и лента</b> — как меняется неделя и что делают конкретные люди.</li>
+        </ul>
+        <div class="row" style="margin-top:16px">
+          <button class="btn primary" onclick="switchTab('projects')">Подключить проект</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="overview-content">
     <div class="row" style="margin-bottom:14px">
       <button class="btn primary" id="run-btn">Проверить сейчас</button>
       <span id="run-result" class="muted"></span>
@@ -217,6 +239,7 @@
       <h2>Источники данных</h2>
       <div class="row" id="integrations-body"></div>
     </div>
+    </div><!-- /overview-content -->
   </div>
 
   <!-- РЕКЛАМА -->
@@ -445,24 +468,38 @@ const stageTitle = k => STAGE_TITLES[k] || k;
 
 async function loadOverview() {
   try {
-    const [o, f, g, d, alerts] = await Promise.all([
-      api('/api/overview'), api('/api/funnel'), api('/api/growth'),
-      api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
-    ]);
-    window._funnel = f.windows;
-    STAGE_TITLES = f.stage_titles || {};
-    STAGE_ORDER = (f.stage_order || STAGE_ORDER).filter(k => k !== 'revenue');
-
-    if (o.project) {
-      $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
-    } else {
-      $('hdr-project').textContent = 'нет активного проекта';
+    // Обзор грузим первым: пока проект не подключён, остальные panels
+    // отвечают 404, и одним Promise.all весь экран умирал на «Загрузка…».
+    const o = await api('/api/overview');
+    if (!o.project) {
+      $('hdr-project').textContent = 'проект не подключён';
+      $('overview-empty').classList.remove('hidden');
+      $('overview-content').classList.add('hidden');
+      return;
     }
-    renderKpis(f.windows['7d']);
+    $('overview-empty').classList.add('hidden');
+    $('overview-content').classList.remove('hidden');
+    $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
+
+    // allSettled, а не all: если один источник отвалился, остальные панели
+    // должны отрисоваться — каждая сама честно скажет, что данных нет.
+    const [f, g, d, alerts] = (await Promise.allSettled([
+      api('/api/funnel'), api('/api/growth'),
+      api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
+    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+
+    window._funnel = (f && f.windows) || {};
+    STAGE_TITLES = (f && f.stage_titles) || {};
+    STAGE_ORDER = ((f && f.stage_order) || STAGE_ORDER).filter(k => k !== 'revenue');
+
+    renderKpis(f && f.windows ? f.windows['7d'] : null);
     renderDecision(g);
     renderFunnel($('funnel-window').value);
     renderDynamics(d);
-    renderAlerts(alerts);
+    // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
+    // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
+    const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
+    renderAlerts(alerts, hasSnapshots);
     $('integrations-body').innerHTML = (o.integrations || []).map(i => {
       const cls = i.status === 'ok' ? 'good' : (i.status === 'error' ? 'critical'
                 : (i.status === 'stale' ? 'warning' : ''));
@@ -475,7 +512,10 @@ async function loadOverview() {
 
 function renderKpis(win) {
   const fu = (win && win.funnel) || {};
-  const cpa = (fu.traffic && fu.signup) ? null : null;
+  // Пока цикл ни разу не отработал, снимка нет вовсе. Показать шесть
+  // прочерков и молчать — значит заставить человека гадать, сломалось
+  // что-то или просто рано.
+  const noData = !win;
   const tiles = [
     {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней'},
     {label: stageTitle('activation_1'), value: fu.activation_1,
@@ -490,7 +530,7 @@ function renderKpis(win) {
   $('kpis').innerHTML = tiles.map(t =>
     `<div class="kpi"><div class="label">${esc(t.label)}</div>
      <div class="value">${nf(t.value)}</div>
-     <div class="sub">${esc(t.sub || '')}</div></div>`).join('');
+     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div></div>`).join('');
 }
 function pct(a, b, suffix) {
   if (a == null || !b) return '';
@@ -501,7 +541,8 @@ function renderFunnel(winKey) {
   const win = (window._funnel || {})[winKey];
   const box = $('funnel-body');
   if (!win) {
-    box.innerHTML = '<p class="muted">Снимка за это окно ещё нет — нажмите «Проверить сейчас».</p>';
+    box.innerHTML = '<p class="muted">Снимка за это окно ещё нет. Аналитик собирает данные '
+      + 'сам раз в несколько часов — или нажмите «Проверить сейчас», чтобы не ждать.</p>';
     $('funnel-note').textContent = '';
     return;
   }
@@ -528,7 +569,9 @@ function renderFunnel(winKey) {
       <div class="funnel-value">${nf(v)}</div></div>`;
     prevVal = v;
   }
-  box.innerHTML = html || '<p class="muted">Данных по шагам нет.</p>';
+  box.innerHTML = html || '<p class="muted">Снимок есть, но продукт не вернул ни одного '
+    + 'шага воронки. Проверьте на вкладке «Проекты», что связь с продуктом жива '
+    + 'и разметка шагов совпадает с его метриками.</p>';
   $('funnel-note').textContent = `Источник: ${win.source}, данные на `
     + (win.as_of ? win.as_of.slice(0,16).replace('T',' ') + ' UTC' : '—');
 }
@@ -541,7 +584,7 @@ const DYN_SERIES = [
 ];
 function renderDynamics(d) {
   const box = $('dynamics-body');
-  const history = d.history || [];
+  const history = (d && d.history) || [];
   if (history.length < 2) {
     box.innerHTML = '<p class="muted">Появится после двух дней наблюдений — '
       + 'график из одной точки ничего не значит.</p>';
@@ -587,6 +630,12 @@ function renderDynamics(d) {
 function renderDecision(g) {
   const box = $('decision-body'), hint = $('decision-hint');
   hint.textContent = '';
+  if (!g) {
+    box.innerHTML = '<p class="muted">Не удалось получить состояние цикла роста. '
+      + 'Нажмите «Проверить сейчас» — если не поможет, смотрите вкладку «Проекты»: '
+      + 'возможно, продукт не отвечает.</p>';
+    return;
+  }
   if (g.recommendation) {
     const r = g.recommendation;
     hint.textContent = 'ждёт вашего решения';
@@ -655,10 +704,16 @@ window.why = async id => {
   $('why-box').innerHTML = renderReport(r.text);
 };
 
-function renderAlerts(alerts) {
+function renderAlerts(alerts, hasSnapshots) {
+  alerts = alerts || [];
   $('alerts-count').textContent = alerts.length ? `${alerts.length} открытых` : '';
   if (!alerts.length) {
-    $('alerts-body').innerHTML = '<p class="muted">Сигналов нет — по проверяемым правилам всё в норме.</p>';
+    // Честность: «всё в норме» можно говорить только если правила
+    // действительно прогонялись по данным.
+    $('alerts-body').innerHTML = hasSnapshots
+      ? '<p class="muted">Сигналов нет — по проверяемым правилам всё в норме.</p>'
+      : '<p class="muted">Проверок ещё не было: аналитик не собрал ни одного снимка данных. '
+        + 'Это не значит, что всё хорошо — просто пока не по чему судить.</p>';
     return;
   }
   const sevClass = s => ({P0:'critical', P1:'critical', P2:'warning', P3:'serious'})[s] || '';
