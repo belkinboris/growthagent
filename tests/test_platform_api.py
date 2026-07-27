@@ -374,18 +374,28 @@ class TestOwnerIsolation:
         assert ids == sorted([ivan_pid, petr_pid])
         assert client.get(f"/growth/api/projects/{ivan_pid}/stages").status_code == 200
 
-    def test_activation_does_not_silently_stop_neighbour(self, monkeypatch, tmp_path):
-        """Планировщик собирает один проект. Включение своего выключило бы
-        сбор у соседа -- отказываем словами, а не молча ломаем."""
+    def test_activation_does_not_touch_neighbour(self, monkeypatch, tmp_path):
+        """Планировщик обходит все включённые проекты (B7), поэтому включение
+        своего больше не выключает чужой -- раньше это было бы тихой
+        остановкой сбора у соседа, и платформа отказывала в активации."""
         client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
-        resp = client.post(f"/growth/api/projects/{petr_pid}/activate")
-        assert resp.status_code == 409
-        assert "другому пользователю" in resp.json()["detail"]
+        assert client.post(f"/growth/api/projects/{petr_pid}/activate").status_code == 200
 
         from app.models import Project
         with session_factory() as session:
             assert session.get(Project, ivan_pid).is_active is True
+            assert session.get(Project, petr_pid).is_active is True
+
+    def test_pause_stops_only_own_project(self, monkeypatch, tmp_path):
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.post(f"/growth/api/projects/{petr_pid}/activate")
+        assert client.post(f"/growth/api/projects/{petr_pid}/pause").status_code == 200
+        assert client.post(f"/growth/api/projects/{ivan_pid}/pause").status_code == 404
+
+        from app.models import Project
+        with session_factory() as session:
             assert session.get(Project, petr_pid).is_active is False
+            assert session.get(Project, ivan_pid).is_active is True
 
 
 # ---------------------------------------------------------------------------

@@ -1432,38 +1432,33 @@ async def update_project(project_id: int, body: ProjectUpdateRequest, identity=D
 
 @router.post("/api/projects/{project_id}/activate", dependencies=[Depends(require_admin)])
 async def activate_project(project_id: int, identity=Depends(require_admin)):
-    """Делает проект активным (его анализирует планировщик).
+    """Включает сбор данных по проекту.
 
-    Планировщик пока собирает данные ровно по одному активному проекту,
-    поэтому активация выключает остальные. Пока платформой пользуется один
-    владелец, это верно. Как только появится второй аккаунт, включение
-    своего проекта тихо остановило бы сбор у соседа -- поэтому в таком
-    случае отказываем словами вместо молчаливого вреда. Снимет ограничение
-    задача B7 (планировщик по всем активным проектам).
+    Раньше активным мог быть ровно один проект на всю платформу -- цикл брал
+    первый попавшийся активный, и включение своего проекта останавливало
+    сбор у соседа. Планировщик теперь обходит все включённые проекты
+    (`run_cycle_for_all_active`), поэтому выключать чужие больше не нужно
+    и нельзя.
     """
     with get_session() as session:
         project = _owned_project(session, project_id, identity)
-        visible = _visible_project_ids(session, identity)
-        others_active = [
-            p for p in session.exec(select(Project).where(Project.is_active == True)).all()  # noqa: E712
-            if p.id != project_id and (visible is not None and p.id not in visible)
-        ]
-        if others_active:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Сейчас платформа собирает данные по одному проекту, и этот "
-                    "проект принадлежит другому пользователю. Включить ваш "
-                    "проект нельзя, пока идёт сбор по чужому."
-                ),
-            )
-        for p in session.exec(select(Project)).all():
-            if visible is not None and p.id not in visible:
-                continue
-            p.is_active = (p.id == project_id)
-            session.add(p)
+        project.is_active = True
+        session.add(project)
         session.commit()
-        return {"ok": True}
+        return {"ok": True, "is_active": True}
+
+
+@router.post("/api/projects/{project_id}/pause", dependencies=[Depends(require_admin)])
+async def pause_project(project_id: int, identity=Depends(require_admin)):
+    """Выключает сбор. Нужен как пара к включению: иначе сбор можно только
+    завести и никогда не остановить -- например, на время переезда продукта,
+    когда его данные всё равно врут."""
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project.is_active = False
+        session.add(project)
+        session.commit()
+        return {"ok": True, "is_active": False}
 
 
 @router.post("/api/projects/{project_id}/retest", dependencies=[Depends(require_admin)])

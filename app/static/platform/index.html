@@ -311,8 +311,8 @@
       <h2>Сбор данных по этому проекту выключен</h2>
       <p>Проект подключён, но расписание для него выключено: сам аналитик его не
         опрашивает, поэтому новые цифры не появятся. Кнопка «Проверить сейчас»
-        соберёт данные разово. Чтобы сбор шёл без вас, сделайте проект активным
-        на вкладке «Проекты».</p>
+        соберёт данные разово. Чтобы сбор шёл без вас, включите его на вкладке
+        «Проекты» — кнопка «включить сбор».</p>
       <div class="row" style="margin-top:12px">
         <button class="btn primary" onclick="switchTab('projects')">Перейти к проектам</button>
       </div>
@@ -1480,17 +1480,24 @@ async function loadProjects() {
     const active = list.find(p => p.is_active);
     window._activeProjectId = active ? active.id : null;
     if (active) loadStages(active.id); else $('stages-body').innerHTML =
-      '<p class="muted">Сначала подключите проект и сделайте его активным.</p>';
+      '<p class="muted">Сначала подключите проект и включите по нему сбор.</p>';
     $('projects-table').tBodies[0].innerHTML = list.length ? list.map(p =>
       `<tr><td><b>${esc(p.name)}</b><div class="muted">${esc(p.base_url || '—')}</div></td>
-       <td>${p.is_active ? '<span class="tag good">✓ активный</span>'
-            : `<button class="btn sm" onclick="activate(${p.id})">сделать активным</button>`}</td>
+       <td>${p.is_active
+            ? `<span class="tag good">✓ сбор идёт</span>
+               <button class="btn sm" onclick="pause(${p.id})">выключить</button>`
+            : `<span class="muted">сбор выключен</span>
+               <button class="btn sm" onclick="activate(${p.id})">включить сбор</button>`}</td>
        <td class="muted">${(p.available_endpoints || []).length} endpoints</td>
        <td><button class="btn sm" onclick="retest(${p.id})">перепроверить</button></td></tr>`).join('')
       : '<tr><td class="muted">Проектов пока нет.</td></tr>';
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
+// Сбор включается и выключается у каждого проекта отдельно: планировщик
+// обходит все включённые, поэтому «включить свой» больше не значит
+// «выключить чужой».
 window.activate = async id => { await api(`/api/projects/${id}/activate`, {method:'POST'}); loadProjects(); };
+window.pause = async id => { await api(`/api/projects/${id}/pause`, {method:'POST'}); loadProjects(); };
 window.retest = async id => {
   const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
   alert(r.ok ? 'Связь есть. Endpoints: ' + r.available_endpoints.join(', ')
