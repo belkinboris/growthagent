@@ -111,6 +111,19 @@
   .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Скелетоны загрузки. Это ФОРМА будущего содержимого, а не данные:
+     ни одной цифры до ответа сервера не показываем — иначе нарушили бы
+     принцип честности. Пустой экран, наоборот, читается как поломка. */
+  .skel{background:var(--surface-2);border-radius:6px;height:12px;
+    animation:skel-pulse 1.4s ease-in-out infinite}
+  .skel + .skel{margin-top:8px}
+  .skel.w40{width:40%} .skel.w60{width:60%} .skel.w80{width:80%}
+  .skel.tall{height:24px}
+  @keyframes skel-pulse{0%,100%{opacity:.45}50%{opacity:.85}}
+  @media (prefers-reduced-motion: reduce){
+    .skel{animation:none;opacity:.6}
+  }
+
   /* Строка настройки этапа: ключ — поле — пояснение */
   .stage-row{display:grid;grid-template-columns:130px minmax(0,1fr) minmax(0,200px);
     gap:10px;align-items:center;margin-bottom:8px}
@@ -557,6 +570,24 @@ document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () 
   sync();
 })();
 
+
+/* --- Скелетоны загрузки ------------------------------------------------
+   Показываем форму будущей панели, пока идёт запрос. Не «Загрузка…» текстом:
+   при пяти параллельных запросах экран из пяти надписей выглядит хуже, чем
+   контур того, что появится. Цифр в скелетоне нет принципиально. */
+const skelLines = (n = 3, cls = '') =>
+  Array.from({length: n}, (_, i) =>
+    `<div class="skel ${cls || (i % 3 === 0 ? 'w80' : (i % 3 === 1 ? 'w60' : 'w40'))}"></div>`).join('');
+const skelKpis = (n = 6) =>
+  Array.from({length: n}, () =>
+    `<div class="kpi"><div class="skel w60"></div>
+     <div class="skel tall w40" style="margin-top:10px"></div>
+     <div class="skel w80" style="margin-top:8px"></div></div>`).join('');
+function showSkeleton(id, html) {
+  const el = $(id);
+  if (el) el.innerHTML = html;
+}
+
 /* ---------------- Обзор ---------------- */
 // Обязателен один источник — внутренний API продукта. Остальные добавляют
 // данных, но их отсутствие не поломка: значок «·» без пояснения читался
@@ -587,6 +618,12 @@ let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_sta
 const stageTitle = k => STAGE_TITLES[k] || k;
 
 async function loadOverview() {
+  showSkeleton('kpis', skelKpis());
+  showSkeleton('decision-body', skelLines(3));
+  showSkeleton('funnel-body', skelLines(5, 'tall'));
+  showSkeleton('dynamics-body', skelLines(4));
+  showSkeleton('alerts-body', skelLines(2));
+  showSkeleton('integrations-body', skelLines(1, 'w60'));
   try {
     // Обзор грузим первым: пока проект не подключён, остальные panels
     // отвечают 404, и одним Promise.all весь экран умирал на «Загрузка…».
@@ -897,6 +934,7 @@ $('run-btn').onclick = async () => {
 
 /* ---------------- Этапы воронки ---------------- */
 async function loadStages(projectId) {
+  showSkeleton('stages-body', skelLines(5, 'tall'));
   try {
     const r = await api(`/api/projects/${projectId}/stages`);
     $('stages-body').innerHTML = r.stages.map(st => `<div class="stage-row">
@@ -984,6 +1022,8 @@ function renderOptionalSources(sources, hasDirectData) {
 }
 
 async function loadAds() {
+  showSkeleton('ads-kpis', skelKpis(5));
+  $('ads-table').tBodies[0].innerHTML = `<tr><td>${skelLines(4)}</td></tr>`;
   try {
     const a = await api('/api/ads');
     const t = a.totals || {};
@@ -1042,6 +1082,7 @@ const EXP_STATUS = {running:'идёт', enough_data:'данных достато
   lost:'не сработало', inconclusive:'без вывода', cancelled:'отменено'};
 async function loadHistory() {
   const box = $('history-body');
+  box.innerHTML = skelLines(4);
   try {
     const h = await api('/api/history');
     if (!h.items.length) {
@@ -1165,7 +1206,7 @@ function timeAgo(iso) {
 }
 async function loadLive() {
   const box = $('live-body');
-  box.innerHTML = '<span class="muted">Загрузка…</span>';
+  box.innerHTML = skelLines(4);
   try {
     const r = await api('/api/live?period_minutes=' + $('live-period').value);
     const custom = r.event_labels || {};
@@ -1214,7 +1255,7 @@ async function loadReport(kind) {
   currentReport = kind;
   document.querySelectorAll('#report-nav button').forEach(b =>
     b.classList.toggle('active', b.dataset.kind === kind));
-  $('report-body').textContent = 'Загрузка…';
+  $('report-body').innerHTML = skelLines(6);
   try {
     const r = await api('/api/reports/' + kind);
     $('report-body').innerHTML = renderReport(r.text) || '<span class="muted">Отчёт пуст.</span>';
@@ -1250,6 +1291,7 @@ $('chat-input').addEventListener('keydown', e => {
 
 /* ---------------- Проекты ---------------- */
 async function loadProjects() {
+  $('projects-table').tBodies[0].innerHTML = `<tr><td>${skelLines(2)}</td></tr>`;
   try {
     const list = await api('/api/projects');
     const active = list.find(p => p.is_active);
