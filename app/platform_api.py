@@ -192,6 +192,26 @@ async def register(body: RegisterRequest, response: Response):
         return {"ok": True, "token": token, "email": user.email, "adopted_projects": adopted}
 
 
+@router.get("/api/me", dependencies=[Depends(require_admin)])
+async def me(identity=Depends(require_admin)):
+    """Кто вошёл. Нужен интерфейсу после перезагрузки страницы: сессия
+    живёт в cookie, и без этого шапка не знает, чей аккаунт открыт."""
+    if identity is None or identity.user_id is None:
+        return {"email": None, "is_owner": True, "kind": "platform_owner"}
+    with get_session() as session:
+        user = session.get(PlatformUser, identity.user_id)
+        if user is None:
+            # Аккаунт удалили, а cookie осталась -- честнее разлогинить,
+            # чем показывать интерфейс несуществующему пользователю.
+            raise HTTPException(status_code=401, detail="Не авторизован")
+        return {
+            "email": user.email,
+            "display_name": user.display_name,
+            "is_owner": user.is_owner,
+            "kind": "account",
+        }
+
+
 @router.post("/api/logout")
 async def logout(response: Response):
     response.delete_cookie(SESSION_COOKIE, path="/")
@@ -244,16 +264,20 @@ def _find_project(session, identity) -> Optional[Project]:
     при живом проекте в списке.
     """
     visible = _visible_project_ids(session, identity)
-    query = select(Project).where(Project.is_active == True)  # noqa: E712
-    if visible is not None:
-        if not visible:
-            return None
-        query = query.where(Project.id.in_(visible))
-    project = session.exec(query).first()
-    if project is None and visible:
-        project = session.exec(
-            select(Project).where(Project.id.in_(visible)).order_by(Project.id)
-        ).first()
+    if visible is not None and not visible:
+        return None
+
+    def _scoped(query):
+        return query if visible is None else query.where(Project.id.in_(visible))
+
+    project = session.exec(
+        _scoped(select(Project).where(Project.is_active == True))  # noqa: E712
+    ).first()
+    if project is None:
+        # Проект есть, но выключен -- показываем его. Иначе экран говорит
+        # «проект ещё не подключён», хотя проект подключён: это враньё,
+        # и человек идёт подключать второй раз.
+        project = session.exec(_scoped(select(Project)).order_by(Project.id)).first()
     return project
 
 
@@ -320,6 +344,9 @@ async def overview(identity=Depends(require_admin)):
                 "base_url": project.base_url,
                 "connector": project.connector_name,
                 "mode": (project.settings_json or {}).get("mode", "watch_only"),
+                # Неактивный проект планировщик не собирает: экран обязан
+                # сказать это словами, иначе пустой обзор выглядит поломкой.
+                "is_active": project.is_active,
             },
             "integrations": [
                 {

@@ -218,6 +218,25 @@ class TestAccountsAPI:
             user = session.exec(select(PlatformUser)).first()
             assert len(accounts.user_project_ids(session, user.id)) == 1
 
+    def test_me_tells_who_is_logged_in(self, monkeypatch, tmp_path):
+        """Интерфейс после перезагрузки страницы знает о сессии только из
+        cookie -- имя аккаунта приходится спрашивать у сервера."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "Ivan@example.com", "password": "qwerty12",
+                          "display_name": "Иван"})
+        me = client.get("/growth/api/me").json()
+        assert me == {"email": "ivan@example.com", "display_name": "Иван",
+                      "is_owner": False, "kind": "account"}
+
+        client.post("/growth/api/logout")
+        _login(client)
+        assert client.get("/growth/api/me").json()["kind"] == "platform_owner"
+
+    def test_me_requires_session(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        assert client.get("/growth/api/me").status_code == 401
+
     def test_owner_env_login_still_works(self, monkeypatch, tmp_path):
         """Аккаунты не должны сломать вход владельца одним паролем."""
         client, _ = _client(monkeypatch, tmp_path)
@@ -383,6 +402,29 @@ class TestOverview:
         body = client.get("/growth/api/overview").json()
         assert body["project"] is None
         assert body["build_marker"]
+
+    def test_inactive_project_is_shown_and_marked(self, monkeypatch, tmp_path):
+        """Выключенный проект -- это не «проект не подключён». Раньше обзор
+        отвечал project: null, и человек шёл подключать проект второй раз."""
+        from app.models import Project
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        _login(client)
+        with session_factory() as session:
+            from sqlmodel import select
+            project = session.exec(select(Project)).first()
+            project.is_active = False
+            session.add(project)
+            session.commit()
+
+        body = client.get("/growth/api/overview").json()
+        assert body["project"] is not None
+        assert body["project"]["is_active"] is False
+
+    def test_active_project_marked_active(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        _login(client)
+        assert client.get("/growth/api/overview").json()["project"]["is_active"] is True
 
     def test_telegram_and_llm_status_from_config(self, monkeypatch, tmp_path):
         """Эти интеграции не источники метрик, цикл сбора их не обновляет --
