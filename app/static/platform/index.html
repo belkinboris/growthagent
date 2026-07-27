@@ -103,6 +103,19 @@
   .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Шаги первого запуска */
+  .step{display:flex;gap:12px;align-items:flex-start;padding:11px 0;
+    border-top:1px solid var(--border)}
+  .step:first-child{border-top:none;padding-top:0}
+  .step .mark{flex:0 0 22px;height:22px;border-radius:50%;display:flex;
+    align-items:center;justify-content:center;font-size:12px;font-weight:600;
+    background:var(--surface-2);color:var(--muted);border:1px solid var(--border)}
+  .step.done .mark{background:var(--good);border-color:var(--good);color:#04210a}
+  .step.now .mark{background:var(--series-1);border-color:var(--series-1);color:#08111c}
+  .step .text{flex:1}
+  .step .text b{display:block;margin-bottom:2px}
+  .step .text span{color:var(--muted);font-size:13px}
+
   /* Отчёты */
   .report{white-space:pre-wrap;font-size:14px;line-height:1.6;color:var(--text-2)}
   .report b{color:var(--text)}
@@ -191,6 +204,14 @@
     <div class="row" style="margin-bottom:14px">
       <button class="btn primary" id="run-btn">Проверить сейчас</button>
       <span id="run-result" class="muted"></span>
+    </div>
+
+    <!-- Путь первого запуска. Живёт только до первого снимка данных: дальше
+         это был бы постоянный шум на главном экране. -->
+    <div class="card hidden" id="first-run">
+      <h2>Первые шаги</h2>
+      <div id="first-run-steps"></div>
+      <p class="muted" id="first-run-note" style="margin:14px 0 0"></p>
     </div>
 
     <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
@@ -500,6 +521,7 @@ async function loadOverview() {
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
     renderAlerts(alerts, hasSnapshots);
+    renderFirstRun(o, hasSnapshots);
     $('integrations-body').innerHTML = (o.integrations || []).map(i => {
       const cls = i.status === 'ok' ? 'good' : (i.status === 'error' ? 'critical'
                 : (i.status === 'stale' ? 'warning' : ''));
@@ -888,6 +910,65 @@ window.sendToDev = async (title, body) => {
     if (confirm('Задача создана: ' + r.url + '\n\nОткрыть?')) window.open(r.url, '_blank');
   } catch (e) { alert(e.message); }
 };
+
+
+/* --- Путь первого запуска (виден только до первого снимка данных) --- */
+function renderFirstRun(o, hasSnapshots) {
+  const card = $('first-run');
+  if (hasSnapshots) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+
+  // Связь с продуктом: пока она не ok, запускать проверку бессмысленно --
+  // честнее сказать об этом сразу, чем дать нажать и получить пустоту.
+  const product = (o.integrations || []).find(i => i.type === 'project_metrics_api');
+  const linkOk = product && product.status === 'ok';
+  const linkFailed = product && product.status === 'error';
+
+  const steps = [
+    {
+      state: 'done',
+      title: `Проект подключён — ${o.project.name}`,
+      note: o.project.base_url || '',
+    },
+    {
+      // Три честных состояния, а не два: «ещё не проверяли» — это не «работает».
+      state: linkOk ? 'done' : (linkFailed ? 'now' : 'wait'),
+      title: linkOk ? 'Связь с продуктом есть'
+           : (linkFailed ? 'Связь с продуктом не работает'
+                         : 'Связь ещё не проверялась'),
+      note: linkFailed
+        ? (product.last_error || 'Продукт не отвечает на запросы аналитика.')
+          + ' Проверьте адрес и токен на вкладке «Проекты» — кнопка «перепроверить».'
+        : (linkOk ? 'Продукт отвечает на запросы аналитика.'
+                  : 'Аналитик проверит её при первом сборе данных. Проверить сразу '
+                    + 'можно на вкладке «Проекты» — кнопка «перепроверить».'),
+    },
+    {
+      state: linkFailed ? 'wait' : 'now',
+      title: 'Запустите первый сбор данных',
+      note: 'Кнопка «Проверить сейчас» вверху. Дальше аналитик собирает данные сам '
+            + 'раз в несколько часов — ждать у экрана не нужно.',
+    },
+    {
+      state: 'wait',
+      title: 'Через пару дней появится динамика',
+      note: 'По одному замеру нельзя сказать, растёт что-то или падает. '
+            + 'Воронка и сигналы появятся сразу после первого сбора, график — позже.',
+    },
+  ];
+
+  $('first-run-steps').innerHTML = steps.map((st, i) => {
+    const mark = st.state === 'done' ? '✓' : (i + 1);
+    return `<div class="step ${st.state === 'wait' ? '' : st.state}">
+      <div class="mark">${mark}</div>
+      <div class="text"><b>${esc(st.title)}</b><span>${esc(st.note)}</span></div>
+    </div>`;
+  }).join('');
+
+  $('first-run-note').textContent = linkFailed
+    ? 'Пока связь не восстановится, данных не будет — это не поломка аналитика.'
+    : 'Этот блок исчезнет сам, как только появится первый снимок данных.';
+}
 
 /* ---------------- Живая лента ---------------- */
 const EVENT_META = {
