@@ -266,7 +266,14 @@ async def funnel():
                 "created_at": snapshot.created_at.isoformat(),
                 "funnel": funnel_values,
             }
-        return {"project_id": project.id, "windows": result}
+        # Названия шагов идут вместе с числами: интерфейс не должен
+        # знать продуктовую специфику проекта.
+        return {
+            "project_id": project.id,
+            "windows": result,
+            "stage_titles": load_stage_titles(session, project.id),
+            "stage_order": STAGE_ORDER,
+        }
 
 
 @router.get("/api/alerts", dependencies=[Depends(require_admin)])
@@ -316,6 +323,735 @@ async def alerts(limit: int = 30):
         for g in out:
             g["periods"].sort(key=lambda p: window_order.get(p, 9))
         return out
+
+
+# ---------------------------------------------------------------------------
+# Отчёты аналитика (то, что раньше жило в командах Telegram-бота)
+# ---------------------------------------------------------------------------
+
+
+def _report_context(session, project):
+    """
+    Общий контекст для всех отчётов: последний combined-снэпшот за 7 дней →
+    NormalizedMetrics, кэш диагностики пути к оплате, кэш путей пользователей.
+    Ровно те же данные, на которых строит отчёты Telegram-бот (без внешних
+    вызовов -- всё из кэша, страница должна открываться быстро).
+    """
+    from app.rules import NormalizedMetrics
+    from app.service import (
+        PAYMENT_PATH_CACHE_PERIOD_KEY,
+        USER_JOURNEYS_CACHE_PERIOD_KEY,
+        extract_normalized_metrics_from_snapshot,
+        get_cached_diagnostics,
+    )
+
+    snapshot = session.exec(
+        select(MetricSnapshot)
+        .where(
+            MetricSnapshot.project_id == project.id,
+            MetricSnapshot.period_key == "7d",
+            MetricSnapshot.source == "combined",
+        )
+        .order_by(MetricSnapshot.created_at.desc())
+        .limit(1)
+    ).first()
+
+    metrics_obj = None
+    snapshot_dt = None
+    if snapshot is not None:
+        raw = extract_normalized_metrics_from_snapshot(snapshot)
+        sources_ok = {
+            name for name in ("product", "metrika", "direct", "yookassa")
+            if (snapshot.metrics_json or {}).get(name) is not None
+        }
+        metrics_obj = NormalizedMetrics(
+            period_key="7d",
+            signup=raw.get("signup"),
+            activation_1=raw.get("activation_1"),
+            activation_2=raw.get("activation_2"),
+            payment_started=raw.get("payment_started"),
+            payment_success=raw.get("payment_success"),
+            spend=raw.get("spend"),
+            clicks=raw.get("clicks"),
+            sources_ok=sources_ok,
+        )
+        snapshot_dt = snapshot.created_at
+
+    pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+    payment_path = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+    j_cached = get_cached_diagnostics(session, project.id, USER_JOURNEYS_CACHE_PERIOD_KEY)
+    journeys = (j_cached.result_json or {}).get("journeys") if (j_cached and j_cached.ok) else None
+
+    return {
+        "project_name": project.name,
+        "metrics": metrics_obj,
+        "payment_path": payment_path,
+        "journeys": journeys,
+        "snapshot_dt": snapshot_dt,
+    }
+
+
+# Какие отчёты доступны на дашборде. Порядок = порядок вкладок в UI.
+REPORT_KINDS = ["board", "funnel", "pay", "ads", "checks", "journeys", "experiments"]
+
+
+@router.get("/api/reports/{kind}", dependencies=[Depends(require_admin)])
+async def report(kind: str):
+    """
+    Текстовый отчёт аналитика. Формулировки (гипотезы, «что не менять»,
+    честные слова про малые выборки) -- главная ценность, поэтому берём
+    ровно те же builder'ы, что и Telegram-бот, а не пересобираем заново.
+    """
+    if kind not in REPORT_KINDS:
+        raise HTTPException(status_code=404, detail="Неизвестный отчёт")
+
+    from app import commercial_report as cr
+
+    with get_session() as session:
+        project = _active_project(session)
+        ctx = _report_context(session, project)
+
+    name = ctx["project_name"]
+    pp = ctx["payment_path"]
+    metrics = ctx["metrics"]
+    registrations = (pp or {}).get("registrations")
+
+    if kind == "board":
+        text = cr.build_board_report(
+            name, metrics, payment_path=pp,
+            new_registrations_since_deploy=registrations,
+            skip_decision=True,  # решение показываем отдельным блоком Growth Loop
+        )
+    elif kind == "funnel":
+        text = cr.build_funnel_report(name, metrics, payment_path=pp, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "pay":
+        text = cr.build_pay_report(name, payment_path=pp, metrics=metrics, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "ads":
+        text = cr.build_ads_report(name, metrics=metrics, snapshot_dt=ctx["snapshot_dt"])
+    elif kind == "checks":
+        text = cr.build_checks_report(name, payment_path=pp)
+    elif kind == "journeys":
+        text = cr.build_journeys_report(name, ctx["journeys"])
+    else:  # experiments
+        text = cr.build_experiments_report(
+            name, payment_path=pp,
+            new_registrations_since_deploy=registrations,
+            recent_journeys=ctx["journeys"],
+        )
+    return {"kind": kind, "text": text}
+
+
+@router.get("/api/dynamics", dependencies=[Depends(require_admin)])
+async def dynamics(days: int = 14):
+    """Динамика по дням: и сырые точки для графика, и текстовый блок
+    аналитика (он умеет честно говорить «данных мало»)."""
+    from app.commercial_report import build_dynamics_block
+    from app.service import load_daily_counters_history
+
+    with get_session() as session:
+        project = _active_project(session)
+        history = load_daily_counters_history(session, project.id, days=days)
+
+    text = build_dynamics_block(history) if len(history) >= 2 else None
+    return {"history": history, "text": text}
+
+
+@router.get("/api/live", dependencies=[Depends(require_admin)])
+async def live_feed(period_minutes: int = 720, limit: int = 100):
+    """
+    Живая лента: дискретные события пользователей продукта (регистрация,
+    канал, отзыв о первом посте, открытие тарифов, оплата) в порядке
+    от свежих к старым. Данные анонимные -- продукт отдаёт user_key
+    (необратимый хэш), никаких email и id.
+
+    В отличие от остальных панелей это НЕ кэш: лента должна быть живой,
+    поэтому дёргаем продукт напрямую. Ошибку не прячем -- владельцу важно
+    отличать «событий нет» от «источник не отвечает».
+    """
+    from app.connectors.user_events import fetch_user_events
+
+    with get_session() as session:
+        project = _active_project(session)
+        base_url = project.base_url
+        token = project_internal_api_token(project)
+        # Названия событий: свои для проекта, если владелец их задал
+        # (или подтвердил предложенные ИИ) -- иначе покажем как есть.
+        event_labels = (project.settings_json or {}).get("event_labels") or {}
+
+    result = await fetch_user_events(base_url, token, period_minutes=period_minutes, limit=limit)
+    events = result.get("events") or []
+    events.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+
+    if not result.get("ok"):
+        hint = {
+            "not_configured": "У проекта не задан адрес или токен внутреннего API.",
+            "not_found": "Продукт не отдаёт /api/internal/user-events — обновите его до версии с этим endpoint.",
+            "timeout": "Продукт не ответил вовремя.",
+        }.get(result.get("status"))
+        return {
+            "ok": False, "status": result.get("status"), "error": result.get("error"),
+            "hint": hint, "events": [], "period_minutes": period_minutes,
+            "event_labels": event_labels,
+        }
+    return {
+        "ok": True, "events": events, "period_minutes": period_minutes,
+        "event_labels": event_labels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Growth Loop: рекомендация → эксперимент → вердикт (кнопки владельца)
+# ---------------------------------------------------------------------------
+
+
+def _rec_to_dict(rec) -> dict:
+    return {
+        "id": rec.id,
+        "area": rec.area,
+        "title": rec.title,
+        "action": rec.action,
+        "hypothesis": rec.hypothesis,
+        "evidence": rec.evidence_json or [],
+        "confidence": rec.confidence,
+        "expected_effect": rec.expected_effect,
+        "risk": rec.risk,
+        "change_set": rec.change_set_json or [],
+        "measure": rec.measure,
+        "locked_variables": rec.locked_variables_json or [],
+        "success_criterion": rec.success_criterion,
+        "failure_criterion": rec.failure_criterion,
+        "created_at": rec.created_at.isoformat(),
+    }
+
+
+@router.get("/api/growth", dependencies=[Depends(require_admin)])
+async def growth_state():
+    """Состояние цикла роста: что предложено, что идёт, чем закончилось."""
+    from app import growth_loop
+    from app.commercial_report import build_experiment_block, build_verdict_block
+
+    with get_session() as session:
+        project = _active_project(session)
+        ctx = _report_context(session, project)
+        pp = ctx["payment_path"]
+
+        rec = growth_loop.get_active_recommendation(session, project.id)
+        running = growth_loop.get_running_experiment(session, project.id)
+        last = growth_loop.get_last_finished_experiment(session, project.id)
+
+        out: dict = {"recommendation": None, "experiment": None, "last_verdict": None}
+
+        if rec is not None:
+            out["recommendation"] = _rec_to_dict(rec)
+        if running is not None:
+            progress = growth_loop.experiment_progress(running, pp)
+            out["experiment"] = {
+                "id": running.id,
+                "title": running.title,
+                "area": running.area,
+                "hypothesis": running.hypothesis,
+                "primary_metric": running.primary_metric,
+                "sample_metric": running.sample_metric,
+                "target_sample": running.target_sample,
+                "locked_variables": running.locked_variables_json or [],
+                "success_criterion": running.success_criterion,
+                "failure_criterion": running.failure_criterion,
+                "started_at": running.started_at.isoformat(),
+                "progress": progress,
+                "text": build_experiment_block(running, progress),
+            }
+        if last is not None:
+            out["last_verdict"] = {
+                "id": last.id,
+                "title": last.title,
+                "status": last.status.value,
+                "verdict": last.verdict,
+                "result_summary": last.result_summary,
+                "ended_at": last.ended_at.isoformat() if last.ended_at else None,
+                "text": build_verdict_block(last),
+            }
+        return out
+
+
+@router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
+async def growth_why(rec_id: int):
+    from app import growth_loop
+    from app.commercial_report import build_recommendation_why
+    from app.models import GrowthRecommendation
+
+    with get_session() as session:
+        rec = session.get(GrowthRecommendation, rec_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Рекомендация не найдена")
+        return {"text": build_recommendation_why(rec)}
+
+
+class GrowthDecision(BaseModel):
+    reason: str = ""
+    days: int = 7
+
+
+@router.post("/api/growth/recommendation/{rec_id}/{action}", dependencies=[Depends(require_admin)])
+async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = None):
+    """Решение владельца по рекомендации: принять (стартует эксперимент
+    с зафиксированным baseline), отложить или отклонить."""
+    from app import growth_loop
+    from app.models import GrowthRecommendation
+
+    if action not in ("accept", "defer", "reject"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+
+    body = body or GrowthDecision()
+    with get_session() as session:
+        rec = session.get(GrowthRecommendation, rec_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Рекомендация не найдена")
+        project = _active_project(session)
+        pp = _report_context(session, project)["payment_path"]
+
+        if action == "accept":
+            exp = growth_loop.accept_recommendation(session, rec, pp)
+            return {"ok": True, "experiment_id": exp.id if exp else None}
+        if action == "defer":
+            growth_loop.defer_recommendation(session, rec, days=body.days)
+            return {"ok": True}
+        growth_loop.reject_recommendation(session, rec, reason=body.reason)
+        return {"ok": True}
+
+
+@router.post("/api/growth/experiment/{exp_id}/cancel", dependencies=[Depends(require_admin)])
+async def growth_cancel(exp_id: int, body: GrowthDecision | None = None):
+    from app import growth_loop
+    from app.models import GrowthExperiment
+
+    with get_session() as session:
+        exp = session.get(GrowthExperiment, exp_id)
+        if exp is None:
+            raise HTTPException(status_code=404, detail="Проверка не найдена")
+        growth_loop.cancel_experiment(session, exp, reason=(body.reason if body else ""))
+        return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Этапы воронки: человеческие названия шагов для каждого проекта
+# ---------------------------------------------------------------------------
+#
+# Ядро работает на нормализованных ключах (signup, activation_1 ...), они
+# универсальны, но клиенту показывать "activation_1" нельзя. У АвтоПоста
+# названия известны, у чужого проекта -- нет, поэтому по умолчанию это
+# честные "Этап 1", "Этап 2", а осмысленные имена приходят одним из двух
+# путей: владелец переименовал руками либо ИИ посмотрел сайт проекта
+# и предложил названия (autoname).
+
+
+STAGE_ORDER = ["traffic", "signup", "activation_1", "activation_2",
+               "payment_started", "payment_success", "revenue"]
+
+# Названия, не зависящие от продукта: их смысл одинаков для любого проекта.
+UNIVERSAL_STAGE_TITLES = {
+    "traffic": "Трафик",
+    "signup": "Регистрация",
+    "payment_started": "Оплата начата",
+    "payment_success": "Оплата прошла",
+    "revenue": "Выручка",
+}
+
+
+def _default_stage_title(key: str) -> str:
+    """Для activation_* продуктового смысла ядро не знает -- нумеруем честно."""
+    if key in UNIVERSAL_STAGE_TITLES:
+        return UNIVERSAL_STAGE_TITLES[key]
+    if key.startswith("activation_"):
+        return f"Этап {key.split('_')[-1]}"
+    return key
+
+
+def load_stage_titles(session, project_id: int) -> dict[str, str]:
+    """Ключ воронки → название для показа. Своё название проекта имеет
+    приоритет над дефолтным."""
+    from app.models import FunnelStep
+
+    rows = session.exec(select(FunnelStep).where(FunnelStep.project_id == project_id)).all()
+    custom = {r.key: r.title for r in rows if r.title}
+    return {key: custom.get(key) or _default_stage_title(key) for key in STAGE_ORDER}
+
+
+@router.get("/api/projects/{project_id}/stages", dependencies=[Depends(require_admin)])
+async def get_stages(project_id: int):
+    from app.models import FunnelStep
+
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        rows = {r.key: r for r in session.exec(
+            select(FunnelStep).where(FunnelStep.project_id == project_id)).all()}
+        mapping = (project.settings_json or {}).get("funnel_mapping") or {}
+        return {
+            "stages": [
+                {
+                    "key": key,
+                    "title": (rows[key].title if key in rows and rows[key].title
+                              else _default_stage_title(key)),
+                    "is_custom": key in rows and bool(rows[key].title),
+                    "description": rows[key].description if key in rows else None,
+                    "source_metric": mapping.get(key),
+                }
+                for key in STAGE_ORDER
+            ],
+            "event_labels": (project.settings_json or {}).get("event_labels") or {},
+        }
+
+
+class StagesUpdate(BaseModel):
+    titles: dict[str, str] = {}          # ключ воронки -> название
+    event_labels: dict[str, str] = {}    # тип события -> название (для ленты)
+
+
+@router.put("/api/projects/{project_id}/stages", dependencies=[Depends(require_admin)])
+async def update_stages(project_id: int, body: StagesUpdate):
+    from app.models import FunnelStep
+
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+
+        existing = {r.key: r for r in session.exec(
+            select(FunnelStep).where(FunnelStep.project_id == project_id)).all()}
+        for key, title in (body.titles or {}).items():
+            title = (title or "").strip()
+            if key in existing:
+                existing[key].title = title
+                session.add(existing[key])
+            elif title:
+                session.add(FunnelStep(
+                    project_id=project_id, key=key, title=title,
+                    order=STAGE_ORDER.index(key) if key in STAGE_ORDER else 99,
+                ))
+        if body.event_labels:
+            sj = dict(project.settings_json or {})
+            sj["event_labels"] = {**(sj.get("event_labels") or {}), **body.event_labels}
+            project.settings_json = sj
+            session.add(project)
+        session.commit()
+        return {"ok": True, "stages": (await get_stages(project_id))["stages"]}
+
+
+@router.post("/api/projects/{project_id}/stages/autoname", dependencies=[Depends(require_admin)])
+async def autoname_stages(project_id: int):
+    """
+    ИИ смотрит на сайт проекта и предлагает названия этапов вместо
+    «Этап 1/2». Ничего не сохраняет сам -- возвращает предложение,
+    владелец подтверждает (или правит) в интерфейсе.
+    """
+    import json
+    import re
+
+    from app import ask as ask_module
+
+    settings = get_settings()
+    if not ask_module.is_configured(settings):
+        raise HTTPException(status_code=503, detail="Для автоназвания нужен настроенный LLM (LLM_PROVIDER=yandex)")
+
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        base_url = project.base_url
+        project_name = project.name
+        mapping = (project.settings_json or {}).get("funnel_mapping") or {}
+
+    page_text = ""
+    if base_url:
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(base_url)
+            if resp.status_code == 200:
+                html = resp.text
+                html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+                page_text = re.sub(r"<[^>]+>", " ", html)
+                page_text = re.sub(r"\s+", " ", page_text).strip()[:3000]
+        except httpx.HTTPError:
+            logger.info("autoname: сайт проекта недоступен, назовём этапы по метрикам")
+
+    stages_to_name = [k for k in STAGE_ORDER if k.startswith("activation_") or k in mapping]
+    prompt = (
+        f"Проект «{project_name}», сайт: {base_url or 'неизвестен'}.\n"
+        f"Текст главной страницы: {page_text or '(недоступен)'}\n\n"
+        f"Метрики продукта по шагам воронки: {json.dumps(mapping, ensure_ascii=False)}\n\n"
+        f"Назови шаги воронки простыми русскими словами, как их назвал бы владелец "
+        f"продукта: что именно сделал пользователь на этом шаге (например «Создал канал», "
+        f"«Загрузил файл», «Пригласил команду»). Нужны названия для ключей: "
+        f"{', '.join(stages_to_name)}.\n"
+        f"Ответь ТОЛЬКО JSON-объектом вида {{\"ключ\": \"Название\"}}, без пояснений. "
+        f"Название — 1-3 слова, глагол в прошедшем времени или существительное."
+    )
+    answer = await ask_module.answer_question(
+        prompt,
+        "Ты помогаешь назвать шаги воронки подключаемого продукта.",
+        settings,
+    )
+    if not answer:
+        raise HTTPException(status_code=502, detail="LLM не ответил, попробуйте ещё раз")
+
+    match = re.search(r"\{.*\}", answer, re.S)
+    if not match:
+        raise HTTPException(status_code=502, detail="LLM вернул ответ не в формате JSON")
+    try:
+        proposed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Не удалось разобрать ответ LLM")
+
+    proposed = {k: str(v)[:60] for k, v in proposed.items() if k in STAGE_ORDER and v}
+    return {"ok": True, "proposed": proposed, "site_used": bool(page_text)}
+
+
+# ---------------------------------------------------------------------------
+# Реклама: деньги и результат в одной таблице
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/ads", dependencies=[Depends(require_admin)])
+async def ads_overview():
+    """
+    Связка «откуда пришли» и «сколько это стоило». Расход и клики приходят
+    из Директа, а что из этих людей выросло -- из разреза по источникам
+    самого продукта. Цену регистрации считаем ТОЛЬКО для Директа: расход
+    известен именно по нему, приписывать его другим источникам нельзя.
+    """
+    from app.connectors.traffic_sources import parse_source_breakdown
+
+    with get_session() as session:
+        project = _active_project(session)
+        ctx = _report_context(session, project)
+        stage_titles = load_stage_titles(session, project.id)
+
+    metrics = ctx["metrics"]
+    pp = ctx["payment_path"]
+    spend = getattr(metrics, "spend", None) if metrics else None
+    clicks = getattr(metrics, "clicks", None) if metrics else None
+
+    breakdown = parse_source_breakdown(pp) or {}
+    rows = []
+    for source_key, data in breakdown.items():
+        if not isinstance(data, dict):
+            continue
+        regs = data.get("registrations")
+        is_direct = source_key in ("yandex_direct", "direct")
+        rows.append({
+            "source": source_key,
+            "registrations": regs,
+            "activation": data.get("channels_created"),
+            "pricing_viewed": data.get("pricing_viewed"),
+            "payment_started": data.get("payment_started"),
+            "payment_success": data.get("payment_success"),
+            "spend": spend if is_direct else None,
+            "clicks": clicks if is_direct else None,
+            "cpa": (round(spend / regs) if is_direct and spend and regs else None),
+        })
+    rows.sort(key=lambda r: r["registrations"] or 0, reverse=True)
+
+    # Цену регистрации считаем только по Директу: делить его расход на
+    # регистрации из всех источников (включая бесплатные) -- значит занижать
+    # реальную цену. Если разреза нет, честно говорим, что делили на всё.
+    direct_regs = next((r["registrations"] for r in rows
+                        if r["source"] in ("yandex_direct", "direct")), None)
+    cpa_base = direct_regs if direct_regs else (pp or {}).get("registrations")
+    return {
+        "period": "7d",
+        "totals": {
+            "spend": spend,
+            "clicks": clicks,
+            "registrations": (pp or {}).get("registrations"),
+            "payment_success": (pp or {}).get("payment_success"),
+            "cpa": round(spend / cpa_base) if spend and cpa_base else None,
+            "cpa_basis": ("регистрации из Директа" if direct_regs
+                          else "все регистрации — разреза по источникам нет"),
+        },
+        "by_source": rows,
+        "stage_titles": stage_titles,
+        "as_of": ctx["snapshot_dt"].isoformat() if ctx["snapshot_dt"] else None,
+    }
+
+
+@router.post("/api/ads/deep-check", dependencies=[Depends(require_admin)])
+async def ads_deep_check():
+    """
+    Глубокая проверка Директа: granular-отчёты по фразам и площадкам --
+    какие запросы жгут бюджет без регистраций. Дорогая операция (десятки
+    секунд), поэтому только по кнопке, а не в обычном цикле.
+    """
+    from app.commercial_report import build_deep_direct_status
+    from app.config import MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS
+    from app.scheduler import force_refresh_deep_diagnostics_sync_with_timeout
+
+    with get_session() as session:
+        project = _active_project(session)
+        project_id = project.id
+
+    result = await asyncio.to_thread(
+        force_refresh_deep_diagnostics_sync_with_timeout,
+        project_id,
+        MANUAL_DEEP_DIRECT_TIMEOUT_SECONDS,
+    )
+    text = None
+    try:
+        text = build_deep_direct_status(result.get("result") if result.get("ok") else None)
+    except Exception:
+        logger.exception("deep-check: не удалось собрать текст отчёта")
+    return {
+        "ok": bool(result.get("ok")),
+        "timeout": bool(result.get("timeout")),
+        "error": result.get("error"),
+        "text": text,
+        "result": result.get("result"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# История решений: что предлагали, что приняли, чем кончилось
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/history", dependencies=[Depends(require_admin)])
+async def decisions_history(limit: int = 50):
+    """
+    Журнал цикла роста. Ценность накапливается именно здесь: видно, какие
+    гипотезы подтверждались, а какие нет -- и не предлагать снова то,
+    что уже проверено.
+    """
+    from app.models import GrowthExperiment, GrowthRecommendation
+
+    with get_session() as session:
+        project = _active_project(session)
+        recs = session.exec(
+            select(GrowthRecommendation)
+            .where(GrowthRecommendation.project_id == project.id)
+            .order_by(GrowthRecommendation.created_at.desc())
+            .limit(limit)
+        ).all()
+        exps = {}
+        for e in session.exec(
+            select(GrowthExperiment).where(GrowthExperiment.project_id == project.id)
+        ).all():
+            exps[e.recommendation_id] = e
+
+        items = []
+        for r in recs:
+            exp = exps.get(r.id)
+            items.append({
+                "id": r.id,
+                "title": r.title,
+                "area": r.area,
+                "action": r.action,
+                "hypothesis": r.hypothesis,
+                "status": r.status.value,
+                "created_at": r.created_at.isoformat(),
+                "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+                "reject_reason": r.reject_reason,
+                "experiment": None if exp is None else {
+                    "id": exp.id,
+                    "status": exp.status.value,
+                    "verdict": exp.verdict,
+                    "result_summary": exp.result_summary,
+                    "started_at": exp.started_at.isoformat(),
+                    "ended_at": exp.ended_at.isoformat() if exp.ended_at else None,
+                    "current_sample": exp.current_sample,
+                    "target_sample": exp.target_sample,
+                },
+            })
+        return {"items": items}
+
+
+# ---------------------------------------------------------------------------
+# Передача задачи в разработку (Claude Code через GitHub Issue)
+# ---------------------------------------------------------------------------
+
+
+class DevTaskRequest(BaseModel):
+    title: str
+    body: str
+    repo: Optional[str] = None   # owner/repo; по умолчанию из GITHUB_TASK_REPO
+    mention_claude: bool = True
+
+
+@router.post("/api/dev-task", dependencies=[Depends(require_admin)])
+async def create_dev_task(body: DevTaskRequest):
+    """
+    Создаёт issue в GitHub с диагнозом аналитика. Если в репозитории
+    настроен workflow Claude Code (реагирует на @claude), задача уходит
+    сразу в работу: правки лендинга и продукта делает Claude, аналитик
+    остаётся источником фактов, а не исполнителем.
+
+    Токен и репозиторий -- в переменных окружения аналитика; никакие
+    ключи через интерфейс не передаются.
+    """
+    settings = get_settings()
+    token = settings.github_task_token
+    repo = body.repo or settings.github_task_repo
+    if not token or not repo:
+        raise HTTPException(
+            status_code=503,
+            detail="Не настроено: задайте GITHUB_TASK_TOKEN и GITHUB_TASK_REPO в переменных окружения аналитика",
+        )
+
+    text = body.body
+    if body.mention_claude:
+        text = (
+            "@claude\n\n" + text +
+            "\n\n---\nЗадачу поставил Аналитик Воронки на основании своих данных. "
+            "Числа выше — факты из продакшена, не выдуманные примеры."
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"https://api.github.com/repos/{repo}/issues",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                json={"title": body.title[:250], "body": text},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub недоступен: {exc.__class__.__name__}")
+
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"GitHub ответил {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    return {"ok": True, "url": data.get("html_url"), "number": data.get("number")}
+
+
+# ---------------------------------------------------------------------------
+# Действия по сигналам
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/alerts/{alert_id}/{action}", dependencies=[Depends(require_admin)])
+async def alert_action(alert_id: int, action: str):
+    """«Понял» (acknowledged) и «Отложить» (snoozed на сутки) -- то же, что
+    кнопки под сигналом в Telegram."""
+    from datetime import timedelta
+
+    from app.models import AlertStatus, utcnow
+
+    if action not in ("ack", "snooze"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+
+    with get_session() as session:
+        alert = session.get(Alert, alert_id)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Сигнал не найден")
+        if action == "ack":
+            alert.status = AlertStatus.acknowledged
+        else:
+            alert.status = AlertStatus.snoozed
+            alert.snooze_until = utcnow() + timedelta(hours=24)
+        session.add(alert)
+        session.commit()
+        return {"ok": True, "status": alert.status.value}
 
 
 @router.post("/api/run", dependencies=[Depends(require_admin)])

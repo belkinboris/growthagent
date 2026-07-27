@@ -186,6 +186,13 @@ class Settings(BaseSettings):
     # только для локальной разработки по http.
     platform_cookie_secure: bool = True
 
+    # --- Передача задач в разработку (GitHub Issue → Claude Code) ---
+    # Аналитик находит проблему и ставит задачу в репозиторий продукта.
+    # Если в репозитории настроен workflow Claude Code (реагирует на @claude),
+    # задача уходит в работу без участия человека.
+    github_task_repo: Optional[str] = None    # owner/repo
+    github_task_token: Optional[str] = None   # PAT с правом issues:write
+
     # --- Текущий подключённый проект ---
     # В v1 сервис обслуживает один активный проект. Project как модель в БД
     # универсален (на будущее), но эти переменные описывают единственную

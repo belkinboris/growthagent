@@ -31,6 +31,7 @@ YANDEX_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/co
 YANDEX_RESPONSES_URL = "https://ai.api.cloud.yandex.net/v1/responses"
 # Невидимые reasoning-токены DeepSeek съедают лимит вывода -- запас как в АвтоПосте.
 YANDEX_REASONING_TOKENS_MARGIN = 8000
+YANDEX_RETRIES = 3
 MAX_QUESTION_CHARS = 1000
 MAX_CONTEXT_CHARS = 9000     # доска+воронка+оплата+эксперимент обычно ~3-5k
 MAX_ANSWER_TOKENS = 700
@@ -282,28 +283,44 @@ async def _answer_yandex(
         }
     else:
         url = YANDEX_RESPONSES_URL
+        # Формат проверен в проде АвтоПоста и Компаса: модель ВСЕГДА с
+        # префиксом gpt:// -- без него Responses API отвечает ошибкой.
         payload = {
-            "model": f"{settings.yandex_folder_id}/{settings.yandex_model}",
+            "model": settings.yandex_model_uri
+                     or f"gpt://{settings.yandex_folder_id}/{settings.yandex_model}",
             "instructions": system_text,
             "input": question,
             "max_output_tokens": MAX_ANSWER_TOKENS + YANDEX_REASONING_TOKENS_MARGIN,
+            # DeepSeek по умолчанию «размышляет» невидимыми токенами и может
+            # израсходовать на них весь лимит, оставив пустой ответ.
             "thinking": {"type": "disabled"},
         }
 
-    try:
-        if _post is not None:
-            data = await _post(payload, headers)
-        else:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+    if _post is not None:
+        try:
+            return _extract_yandex_text(await _post(payload, headers), mode)
+        except Exception:
+            logger.exception("ask: yandex call failed")
+            return None
+
+    # Сеть до Яндекса иногда моргает -- три попытки, как в АвтоПосте.
+    for attempt in range(YANDEX_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
                 resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code != 200:
-                    logger.warning("ask: yandex HTTP %s: %s", resp.status_code, resp.text[:300])
-                    return None
-                data = resp.json()
-        return _extract_yandex_text(data, mode)
-    except Exception:
-        logger.exception("ask: yandex call failed")
-        return None
+            if resp.status_code != 200:
+                logger.warning(
+                    "ask: yandex HTTP %s (попытка %s/%s): %s",
+                    resp.status_code, attempt + 1, YANDEX_RETRIES, resp.text[:300],
+                )
+                continue
+            text = _extract_yandex_text(resp.json(), mode)
+            if text:
+                return text
+            logger.warning("ask: yandex вернул пустой текст (попытка %s)", attempt + 1)
+        except Exception:
+            logger.exception("ask: yandex call failed (попытка %s)", attempt + 1)
+    return None
 
 
 def _extract_yandex_text(data: dict, mode: str) -> str | None:
@@ -313,13 +330,19 @@ def _extract_yandex_text(data: dict, mode: str) -> str | None:
             return text or None
         except (KeyError, IndexError, TypeError, AttributeError):
             return None
-    # Responses API: output -- список блоков, текст в output[].content[].text
+    # Responses API: reasoning-блоки DeepSeek отбрасываем, берём только
+    # message/output_text (разбор совпадает с рабочим кодом Компаса).
     parts: list[str] = []
     for item in data.get("output") or []:
+        if item.get("type") == "reasoning":
+            continue
         for block in item.get("content") or []:
-            if isinstance(block, dict) and block.get("text"):
-                parts.append(block["text"])
-    text = "\n".join(parts).strip()
+            if isinstance(block, dict) and block.get("type") in (None, "output_text", "text"):
+                if block.get("text"):
+                    parts.append(block["text"])
+    if not parts and isinstance(data.get("output_text"), str):
+        parts.append(data["output_text"])
+    text = "".join(parts).strip()
     return text or None
 
 
