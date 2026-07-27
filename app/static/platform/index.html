@@ -103,6 +103,16 @@
   .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Подсказка «откуда это число». Клик, а не наведение: с телефона
+     наведения нет, а смотрят с телефона чаще всего. */
+  .hint{background:none;border:1px solid var(--border);color:var(--muted);
+    width:17px;height:17px;border-radius:50%;font-size:11px;line-height:1;
+    padding:0;margin-left:6px;vertical-align:middle}
+  .hint:hover{color:var(--text);border-color:var(--muted)}
+  .hint-pop{margin-top:8px;padding:9px 11px;background:var(--surface-2);
+    border:1px solid var(--border);border-left:3px solid var(--series-1);
+    border-radius:8px;font-size:12px;line-height:1.5;color:var(--text-2)}
+
   /* Шаги первого запуска */
   .step{display:flex;gap:12px;align-items:flex-start;padding:11px 0;
     border-top:1px solid var(--border)}
@@ -230,6 +240,7 @@
 
     <div class="card">
       <h2>Воронка
+        <button class="hint" data-hint="funnel" title="Как читать воронку">?</button>
         <span class="spacer"></span>
         <select id="funnel-window" style="width:auto;margin:0;padding:4px 8px;font-size:13px">
           <option value="7d">7 дней</option>
@@ -239,12 +250,26 @@
       </h2>
       <p class="purpose" style="margin-top:0">Зачем: найти шаг, где теряется больше всего людей.
         Проценты — доля дошедших от предыдущего шага.</p>
+      <div class="hint-pop hidden" id="hint-funnel">Проценты между строками — доля дошедших
+        от предыдущего шага, а не от начала воронки. Если на шаге написано «× 2,5 к предыдущему
+        шагу» вместо процента, значит на нём событий больше, чем на предыдущем: так бывает,
+        когда одно действие повторяют или его совершают люди, зарегистрированные раньше окна.
+        Длина полосы — доля от самого большого шага, поэтому короткая полоса не значит «мало»,
+        она значит «меньше верхнего шага». Окно (3 часа / 24 часа / 7 дней) переключается справа:
+        на коротких окнах числа маленькие и по ним нельзя делать выводы.</div>
       <div id="funnel-body"></div>
       <p class="muted" id="funnel-note" style="margin:12px 0 0"></p>
     </div>
 
     <div class="card">
-      <h2>Динамика<span class="spacer"></span><span class="muted">недельное окно на каждый день</span></h2>
+      <h2>Динамика
+        <button class="hint" data-hint="dyn" title="Что показывает график">?</button>
+        <span class="spacer"></span><span class="muted">недельное окно на каждый день</span></h2>
+      <div class="hint-pop hidden" id="hint-dyn">Каждая точка — это сумма за предыдущие 7 дней
+        на тот день, а не события одного дня. Так видно, растёт неделя или падает, без скачков
+        от «во вторник было двое, в среду ноль». Поэтому линия меняется плавно, а два соседних
+        дня почти всегда близки. График появляется с третьего дня наблюдений: по одной-двум
+        точкам направление не определяется.</div>
       <div id="dynamics-body"></div>
     </div>
 
@@ -538,22 +563,51 @@ function renderKpis(win) {
   // прочерков и молчать — значит заставить человека гадать, сломалось
   // что-то или просто рано.
   const noData = !win;
+  // Откуда берётся число — часть самого числа. Без этого «40» на шаге,
+  // где на предыдущем «8», выглядит ошибкой, а прочерк читается как ноль.
+  const FROM_PRODUCT = 'Считает сам продукт и отдаёт по своему внутреннему API. '
+    + 'Какое именно его поле стоит за этим шагом — видно на вкладке «Проекты».';
   const tiles = [
-    {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней'},
+    {label: stageTitle('signup'), value: fu.signup, sub:'за 7 дней',
+     hint: 'Сколько человек зарегистрировалось за последние 7 дней. ' + FROM_PRODUCT},
     {label: stageTitle('activation_1'), value: fu.activation_1,
-     sub: pct(fu.activation_1, fu.signup, 'от регистраций')},
+     sub: pct(fu.activation_1, fu.signup, 'от регистраций'),
+     hint: 'Первое целевое действие после регистрации, за 7 дней. Может оказаться '
+       + 'больше числа регистраций: действие совершают и те, кто зарегистрировался '
+       + 'раньше этого окна. ' + FROM_PRODUCT},
     {label: stageTitle('payment_started'), value: fu.payment_started,
-     sub: pct(fu.payment_started, fu.signup, 'от регистраций')},
+     sub: pct(fu.payment_started, fu.signup, 'от регистраций'),
+     hint: 'Сколько раз человек начал оплату за 7 дней. Начатая оплата — ещё не деньги: '
+       + 'разрыв с «оплата прошла» и есть главный предмет разбора. ' + FROM_PRODUCT},
     {label: stageTitle('payment_success'), value: fu.payment_success,
-     sub: pct(fu.payment_success, fu.payment_started, 'от начатых')},
-    {label: stageTitle('revenue'), value: fu.revenue, sub:'₽ за 7 дней'},
-    {label: stageTitle('traffic'), value: fu.traffic, sub:'Яндекс.Директ'},
+     sub: pct(fu.payment_success, fu.payment_started, 'от начатых'),
+     hint: 'Успешные оплаты за 7 дней — подтверждённые продуктом, а не намерения. '
+       + FROM_PRODUCT},
+    {label: stageTitle('revenue'), value: fu.revenue, sub:'₽ за 7 дней',
+     hint: 'Выручка за 7 дней в рублях, как её считает сам продукт. Аналитик её '
+       + 'не пересчитывает и налоги с комиссиями не вычитает.'},
+    {label: stageTitle('traffic'), value: fu.traffic, sub:'Яндекс.Директ',
+     hint: 'Клики по рекламе за 7 дней из Яндекс.Директа. Директ подключать '
+       + 'не обязательно — без него здесь прочерк, и это не ноль, а «мы не знаем». '
+       + 'Остальная воронка работает и без рекламных источников.'},
   ];
-  $('kpis').innerHTML = tiles.map(t =>
-    `<div class="kpi"><div class="label">${esc(t.label)}</div>
+  $('kpis').innerHTML = tiles.map((t, i) =>
+    `<div class="kpi"><div class="label">${esc(t.label)}${
+       t.hint ? `<button class="hint" data-hint="kpi-${i}" title="Откуда это число">?</button>` : ''}</div>
      <div class="value">${nf(t.value)}</div>
-     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div></div>`).join('');
+     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div>
+     ${t.hint ? `<div class="hint-pop hidden" id="hint-kpi-${i}">${esc(t.hint)}</div>` : ''}
+     </div>`).join('');
 }
+
+// Одна общая обработка кликов по подсказкам: пары кнопка → блок связаны
+// через data-hint, поэтому новые подсказки не требуют своего кода.
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.hint');
+  if (!btn) return;
+  const pop = document.getElementById('hint-' + btn.dataset.hint);
+  if (pop) pop.classList.toggle('hidden');
+});
 function pct(a, b, suffix) {
   if (a == null || !b) return '';
   return Math.round(a / b * 100) + '% ' + suffix;
