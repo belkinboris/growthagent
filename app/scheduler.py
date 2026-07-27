@@ -465,14 +465,37 @@ def _jsonify(data: dict | None) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _read_current_rss_mb() -> float | None:
+    """Текущий RSS процесса из /proc/self/status (Linux). None если не вышло."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except Exception:
+        return None
+    return None
+
+
 def _log_memory(label: str) -> None:
-    """Пишет текущее потребление памяти процесса в лог. Диагностика после
-    инцидента Out of Memory 2026-07-14 -- при следующем падении по этим
-    строкам сразу видно, на каком шаге цикла память растёт, а не гадаем."""
+    """Пишет текущее и пиковое потребление памяти процесса в лог.
+
+    Диагностика после инцидента Out of Memory 2026-07-14.
+
+    ФИКС 2026-07-17: раньше писали только ru_maxrss -- это ПИК за всю жизнь
+    процесса, он никогда не уменьшается, поэтому найти шаг, на котором память
+    растёт, по этим логам было невозможно. Теперь пишем current (VmRSS) --
+    именно по нему видно, какой шаг цикла держит/копит память.
+    (Восстановлено 2026-07-27: фикс потерялся при загрузке файлов через
+    веб-интерфейс GitHub, рабочая копия откатилась к версии от 14-го.)"""
     try:
         import resource
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        logger.info("memory: %s -- RSS ~%.0f MB", label, rss_mb)
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        cur = _read_current_rss_mb()
+        if cur is not None:
+            logger.info("memory: %s -- current ~%.0f MB, peak ~%.0f MB", label, cur, peak_mb)
+        else:
+            logger.info("memory: %s -- RSS(peak) ~%.0f MB", label, peak_mb)
     except Exception:
         pass  # диагностика не должна ронять цикл
 

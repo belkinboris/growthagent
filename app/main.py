@@ -189,6 +189,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/memory")
+async def api_memory():
+    """
+    Текущая память процесса -- диагностика OOM без панели хостинга.
+    Восстановлено 2026-07-27: endpoint потерялся при загрузке файлов через
+    веб-интерфейс GitHub. Полезен ровно тем, что показывает current RSS,
+    а не только пик: по нему видно, растёт ли потребление между циклами.
+    """
+    import resource
+
+    from app.scheduler import _read_current_rss_mb
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    return {"current_rss_mb": _read_current_rss_mb(), "peak_rss_mb": round(peak)}
+
+
 @app.get("/status")
 async def status():
     settings = get_settings()
