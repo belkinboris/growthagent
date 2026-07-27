@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -56,41 +57,107 @@ def verify_password(password: str) -> bool:
     return hmac.compare_digest(given, expected)
 
 
-def issue_session_token() -> str:
-    """Токен вида "<expires_ts>.<hmac>". Никаких данных пользователя внутри
-    нет намеренно: платформа однопользовательская (владелец)."""
+@dataclass(frozen=True)
+class Identity:
+    """Кто пришёл. `user_id is None` — вход по паролю из окружения:
+    это владелец платформы, у него аккаунта в базе может и не быть."""
+
+    user_id: Optional[int] = None
+    is_owner: bool = True
+
+    @property
+    def is_env_owner(self) -> bool:
+        return self.user_id is None
+
+
+def issue_session_token(user_id: Optional[int] = None) -> str:
+    """Токен вида "<expires_ts>.<hmac>" или "<expires_ts>:u<id>.<hmac>".
+
+    Личность попала внутрь подписанного payload, а не в отдельную cookie:
+    иначе её можно подменить, не трогая подпись. Старый формат (без `:u`)
+    остаётся валидным — у владельца не должна разлогиниться вкладка из-за
+    выкатки.
+    """
     settings = get_settings()
     expires = int(time.time()) + settings.platform_session_ttl_hours * 3600
-    payload = str(expires)
+    payload = str(expires) if user_id is None else f"{expires}:u{int(user_id)}"
     return f"{payload}.{_sign(payload)}"
 
 
-def validate_session_token(token: Optional[str]) -> bool:
+def resolve_session_token(token: Optional[str]) -> Optional[Identity]:
+    """Проверяет подпись и срок. Возвращает личность или None."""
     if not token or "." not in token:
-        return False
+        return None
     payload, signature = token.rsplit(".", 1)
     if not hmac.compare_digest(signature, _sign(payload)):
-        return False
+        return None
+
+    expires_part, _, user_part = payload.partition(":")
     try:
-        return int(payload) > time.time()
+        if int(expires_part) <= time.time():
+            return None
     except ValueError:
-        return False
+        return None
+
+    if not user_part:
+        return Identity(user_id=None, is_owner=True)
+    if not user_part.startswith("u"):
+        return None
+    try:
+        return Identity(user_id=int(user_part[1:]), is_owner=False)
+    except ValueError:
+        return None
 
 
-def require_admin(request: Request) -> None:
-    """FastAPI-dependency: пускает только владельца с валидной сессией.
+def validate_session_token(token: Optional[str]) -> bool:
+    return resolve_session_token(token) is not None
 
-    Поддерживает и cookie (браузер), и Authorization: Bearer (скрипты/API) --
-    Bearer сравнивается с тем же форматом токена, что выдаёт /api/login.
-    """
-    settings = get_settings()
-    if not settings.platform_admin_password:
-        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
 
+def _token_from_request(request: Request) -> Optional[str]:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             token = auth[7:]
-    if not validate_session_token(token):
+    return token
+
+
+def require_admin(request: Request) -> Identity:
+    """FastAPI-dependency: пускает только с валидной сессией и возвращает,
+    кто именно пришёл.
+
+    Поддерживает и cookie (браузер), и Authorization: Bearer (скрипты/API) --
+    Bearer сравнивается с тем же форматом токена, что выдаёт /api/login.
+
+    Платформа считается настроенной, если задан пароль владельца ИЛИ в базе
+    есть хотя бы один аккаунт: иначе клиент, зарегистрировавшийся сам, не
+    смог бы войти без переменной окружения на чужом сервере.
+    """
+    settings = get_settings()
+    identity = resolve_session_token(_token_from_request(request))
+
+    if not settings.platform_admin_password and not _has_any_account():
+        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
+    if identity is None:
         raise HTTPException(status_code=401, detail="Не авторизован")
+    if identity.is_env_owner and not settings.platform_admin_password:
+        # Пароль владельца убрали из окружения -- старые «владельческие»
+        # сессии обязаны умереть вместе с ним.
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    return identity
+
+
+def _has_any_account() -> bool:
+    """Есть ли хоть один аккаунт. Ошибку базы трактуем как «нет»: на пустой
+    или недоступной базе вход всё равно невозможен, а 500 из dependency
+    выглядел бы как поломка платформы."""
+    try:
+        from sqlmodel import select
+
+        from app.db import get_session
+        from app.models import PlatformUser
+
+        with get_session() as session:
+            return session.exec(select(PlatformUser.id)).first() is not None
+    except Exception:
+        return False

@@ -564,3 +564,59 @@ class NotificationClaim(SQLModel, table=True):
     project_id: int = Field(foreign_key="project.id", index=True)
     event_key: str = Field(index=True)
     claimed_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Аккаунты платформы (B1, часть 1)
+# ---------------------------------------------------------------------------
+
+
+class PlatformUser(SQLModel, table=True):
+    """
+    Пользователь веб-платформы.
+
+    До этой таблицы платформа была однопользовательской: один пароль в
+    PLATFORM_ADMIN_PASSWORD, и любой, кто его знает, видит все проекты.
+    Продавать так нельзя — у клиента должен быть свой вход и свои проекты.
+
+    Пароль владельца из окружения при этом остаётся рабочим: он и есть
+    «аварийный вход», которым платформа поднимается на пустой базе. Такой
+    вход помечается как владелец и видит всё — поэтому в этой таблице у
+    него записи может и не быть.
+
+    Почта хранится в нижнем регистре: человек введёт «Ivan@…» завтра и
+    «ivan@…» послезавтра, и это должен быть один и тот же аккаунт.
+    """
+
+    __table_args__ = (UniqueConstraint("email", name="uq_platform_user_email"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+    password_hash: str
+    display_name: Optional[str] = None
+    is_owner: bool = Field(default=False)
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    last_login_at: Optional[datetime] = None
+
+
+class ProjectMember(SQLModel, table=True):
+    """
+    Кто имеет доступ к проекту.
+
+    Отдельная таблица связи, а не колонка `owner_id` в Project: ALTER TABLE
+    на существующих таблицах в этом проекте запрещён (правило из прод-
+    инцидентов), а связь «многие ко многим» всё равно понадобится — клиент
+    захочет пустить в свой проект напарника.
+
+    role сейчас всегда "owner" (создатель проекта). Значение заведено
+    заранее, чтобы добавление роли «наблюдатель» не потребовало миграции.
+    """
+
+    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_member_project_user"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    user_id: int = Field(foreign_key="platformuser.id", index=True)
+    role: str = Field(default="owner")
+    created_at: datetime = Field(default_factory=utcnow)

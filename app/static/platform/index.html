@@ -32,6 +32,10 @@
   header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;
     white-space:nowrap;flex:1 1 0;min-width:0}
   header .spacer{flex:1}
+  /* Кто вошёл. Не .proj: у той строки flex:1, и два растягивающихся
+     элемента съедали место у вкладок. На телефоне прячется -- там та же
+     строка есть на вкладке «Проекты». */
+  header .who{color:var(--muted);font-size:12px;white-space:nowrap}
   /* Вкладок больше, чем влезает на телефон. Прокрутка есть, но о ней надо
      сообщить — иначе половина разделов выглядит несуществующей. */
   .nav-wrap{position:relative;min-width:0;flex:0 1 auto;display:flex;justify-content:flex-end}
@@ -168,6 +172,21 @@
   th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
   tr:last-child td{border-bottom:none}
   #login-view{max-width:380px;margin:14vh auto 0}
+  /* Код для вставки к себе. Перенос строк выключен намеренно: сломанный
+     переносом отступ в питоне -- это код, который не заработает. */
+  pre.code{background:#0e1116;border:1px solid var(--border);border-radius:8px;
+    padding:12px 14px;overflow-x:auto;font-size:12.5px;line-height:1.5;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    white-space:pre;max-height:420px;overflow-y:auto}
+  ol.plain{margin:10px 0;padding-left:20px;font-size:13px;color:var(--text-2)}
+  ol.plain li{margin:4px 0}
+  /* Короткое сообщение о том, что платформа только что сделала сама
+     (например, закрепила проект за новым аккаунтом). Само гаснет:
+     это уведомление о факте, а не то, что нужно закрывать руками. */
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:50;
+    max-width:min(520px,92vw);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:10px;padding:12px 16px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+  #toast.hidden{display:none}
   .error-text{color:var(--critical);font-size:13px;margin:6px 0}
   .ok-text{color:var(--good);font-size:13px;margin:6px 0}
   #chat-log{display:flex;flex-direction:column;gap:10px;max-height:56vh;overflow-y:auto;margin-bottom:12px}
@@ -179,6 +198,7 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
   @media(max-width:1000px){
     header .proj{display:none}
+    header .who{display:none}
   }
   @media(max-width:700px){
     .grid2{grid-template-columns:1fr}
@@ -186,6 +206,7 @@
     .stage-row{grid-template-columns:1fr;gap:4px;padding:10px 0;margin-bottom:0;
       border-top:1px solid var(--border)}
     header .proj{display:none}
+    header .who{display:none}
     /* Слово «Аналитик» съедало треть шапки, а вкладки из-за этого не влезали. */
     header .logo-text{display:none}
     header{gap:8px;padding:12px 14px}
@@ -208,6 +229,7 @@
 <header>
   <span class="logo">📊<span class="logo-text"> Аналитик</span></span>
   <span class="proj" id="hdr-project"></span>
+  <span class="who" id="hdr-user"></span>
   <div class="nav-wrap" id="nav-wrap">
   <nav id="tabs" class="hidden">
     <button data-tab="overview" class="active">Обзор</button>
@@ -222,16 +244,40 @@
   </div>
 </header>
 
+<div id="toast" class="hidden"></div>
+
 <main>
-  <!-- Вход -->
+  <!-- Вход. Три режима одной формой: вход по почте, регистрация и вход
+       владельца платформы одним паролем из окружения. Отдельными экранами
+       это было бы три ссылки в пустоту -- человек не должен выбирать
+       «какой у меня тип входа», он просто вводит то, что у него есть. -->
   <div id="login-view">
     <div class="card">
-      <h2>Вход для владельца</h2>
-      <label>Пароль</label>
+      <h2 id="login-title">Вход</h2>
+      <p class="muted" id="login-sub">Аналитик покажет воронку вашего продукта: где теряются люди и что чинить первым.</p>
+
+      <div id="login-email-row">
+        <label>Почта</label>
+        <input type="email" id="login-email" autocomplete="username" placeholder="ваша@почта.ру">
+      </div>
+      <div id="login-name-row" class="hidden">
+        <label>Как к вам обращаться <span class="muted">(необязательно)</span></label>
+        <input id="login-name" autocomplete="name">
+      </div>
+      <label id="login-password-label">Пароль</label>
       <input type="password" id="login-password" autocomplete="current-password">
+      <p class="muted hidden" id="login-password-hint" style="margin:-6px 0 12px">Не короче 8 символов.</p>
+
       <div id="login-error" class="error-text hidden"></div>
       <button class="btn primary" id="login-btn">Войти</button>
-      <p class="muted" style="margin-top:14px">Аналитика проекта доступна только владельцу.</p>
+
+      <p class="muted" style="margin-top:16px">
+        <a href="#" id="login-mode-account">Войти по почте</a>
+        <span id="login-sep-1"> · </span>
+        <a href="#" id="login-mode-register">Создать аккаунт</a>
+        <span id="login-sep-2"> · </span>
+        <a href="#" id="login-mode-owner">Я владелец платформы</a>
+      </p>
     </div>
   </div>
 
@@ -259,6 +305,19 @@
     </div>
 
     <div id="overview-content">
+    <!-- Проект подключён, но планировщик его не собирает. Без этой строки
+         экран выглядит поломкой: карточки пустые, а причины не видно. -->
+    <div class="card hidden" id="project-inactive">
+      <h2>Сбор данных по этому проекту выключен</h2>
+      <p>Проект подключён, но расписание для него выключено: сам аналитик его не
+        опрашивает, поэтому новые цифры не появятся. Кнопка «Проверить сейчас»
+        соберёт данные разово. Чтобы сбор шёл без вас, включите его на вкладке
+        «Проекты» — кнопка «включить сбор».</p>
+      <div class="row" style="margin-top:12px">
+        <button class="btn primary" onclick="switchTab('projects')">Перейти к проектам</button>
+      </div>
+    </div>
+
     <div class="row" style="margin-bottom:14px">
       <button class="btn primary" id="run-btn">Проверить сейчас</button>
       <span id="run-result" class="muted"></span>
@@ -422,6 +481,7 @@
   <div id="view-projects" class="hidden">
     <div class="card">
       <h2>Подключённые проекты</h2>
+      <p class="muted" id="projects-who" style="margin-top:-6px"></p>
       <table id="projects-table" class="stack"><tbody></tbody></table>
     </div>
     <div class="card">
@@ -461,7 +521,7 @@
       <label>Адрес проекта *</label>
       <input id="np-url" placeholder="https://projectautopost.ru">
       <label>Токен внутреннего API *</label>
-      <input id="np-token" placeholder="значение TRUEPOST_INTERNAL_API_TOKEN на стороне проекта">
+      <input id="np-token" placeholder="секретный токен, который вы задали у себя на сервере">
       <details style="margin-bottom:12px">
         <summary class="muted" style="cursor:pointer">Необязательно: реклама и внешний трафик</summary>
         <p class="muted" style="margin:10px 0 0">Эти источники добавляют ровно одно — деньги:
@@ -474,6 +534,26 @@
         </div>
         <p class="muted">OAuth-токены Яндекса задаются в переменных окружения сервера аналитика.</p>
       </details>
+      <!-- Самый дорогой шаг подключения -- написать endpoint у себя. Раньше
+           клиент читал CONTRACT.md и писал код сам; здесь тот же контракт
+           выдан готовым кодом под его стек. -->
+      <details id="snippet-box" style="margin-bottom:12px">
+        <summary class="muted" style="cursor:pointer">У продукта ещё нет нужного endpoint’а — покажите код</summary>
+        <p class="muted" style="margin:10px 0 0">Аналитик читает у продукта один адрес:
+          <code>GET /api/internal/metrics</code>. Вот готовый код — скопируйте к себе
+          и подставьте свои запросы к базе там, где помечено. Свою схему базы аналитик
+          не знает и угадывать не станет: выдуманный запрос вернул бы неверные числа.</p>
+        <label>Стек продукта</label>
+        <select id="snippet-stack"></select>
+        <ol class="plain" id="snippet-steps" style="margin:0 0 10px"></ol>
+        <div class="row" style="margin-bottom:6px">
+          <span class="muted" id="snippet-filename"></span>
+          <span class="spacer"></span>
+          <button class="btn sm" id="snippet-copy">Скопировать код</button>
+        </div>
+        <pre class="code" id="snippet-code">Загрузка…</pre>
+      </details>
+
       <div class="row">
         <button class="btn" id="np-test">Проверить подключение</button>
         <button class="btn primary" id="np-create" disabled>Подключить</button>
@@ -521,17 +601,45 @@ async function api(path, opts = {}) {
   return data;
 }
 
+let toastTimer = null;
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 7000);
+}
+
 const VIEWS = ['overview','ads','live','history','reports','chat','projects'];
 function showLogin() {
   $('login-view').classList.remove('hidden');
   $('tabs').classList.add('hidden');
   $('hdr-project').textContent = '';
+  $('hdr-user').textContent = '';
+  // Сообщение о том, что произошло внутри платформы, на экране входа
+  // выглядит чужим -- гасим вместе с выходом.
+  clearTimeout(toastTimer); $('toast').classList.add('hidden');
   VIEWS.forEach(v => $('view-'+v).classList.add('hidden'));
 }
 function showApp() {
   $('login-view').classList.add('hidden');
   $('tabs').classList.remove('hidden');
   switchTab('overview');
+  loadWho();
+}
+
+// Кто вошёл. Спрашиваем у сервера, а не запоминаем ответ формы: после
+// перезагрузки страницы сессия живёт в cookie, а интерфейс о ней не знает.
+async function loadWho() {
+  try {
+    const me = await api('/api/me');
+    const text = me.kind === 'account'
+      ? `вы вошли как ${me.email}`
+      : 'вы вошли как владелец платформы';
+    $('hdr-user').textContent = text;
+    $('projects-who').textContent = text.charAt(0).toUpperCase() + text.slice(1) +
+      (me.kind === 'account' ? '. Здесь только ваши проекты.' : '. Видны все проекты платформы.');
+  } catch (e) { /* 401 уже увёл на экран входа */ }
 }
 function switchTab(tab) {
   VIEWS.forEach(v => $('view-'+v).classList.toggle('hidden', v !== tab));
@@ -546,19 +654,93 @@ function switchTab(tab) {
 }
 
 /* ---------------- Вход ---------------- */
+// Один экран, три режима. Владелец платформы входит паролем из окружения
+// (у него аккаунта может не быть), клиент -- почтой и своим паролем.
+let loginMode = 'account';   // account | register | owner
+const LOGIN_MODES = {
+  account: {
+    title: 'Вход',
+    sub: 'Аналитик покажет воронку вашего продукта: где теряются люди и что чинить первым.',
+    button: 'Войти', email: true, name: false, hint: false,
+    passwordAutocomplete: 'current-password',
+  },
+  register: {
+    title: 'Создать аккаунт',
+    sub: 'Аккаунт нужен, чтобы подключить свой продукт: данные каждого проекта видит только его владелец.',
+    button: 'Создать аккаунт', email: true, name: true, hint: true,
+    passwordAutocomplete: 'new-password',
+  },
+  owner: {
+    title: 'Вход владельца платформы',
+    sub: 'Пароль задан в переменной PLATFORM_ADMIN_PASSWORD на сервере аналитика.',
+    button: 'Войти', email: false, name: false, hint: false,
+    passwordAutocomplete: 'current-password',
+  },
+};
+
+function setLoginMode(mode) {
+  loginMode = mode;
+  const m = LOGIN_MODES[mode];
+  $('login-title').textContent = m.title;
+  $('login-sub').textContent = m.sub;
+  $('login-btn').textContent = m.button;
+  $('login-email-row').classList.toggle('hidden', !m.email);
+  $('login-name-row').classList.toggle('hidden', !m.name);
+  $('login-password-hint').classList.toggle('hidden', !m.hint);
+  $('login-password').setAttribute('autocomplete', m.passwordAutocomplete);
+  $('login-error').classList.add('hidden');
+  // Ссылка на текущий режим бессмысленна -- прячем её вместе с разделителем,
+  // иначе человек кликает и ничего не происходит.
+  $('login-mode-account').classList.toggle('hidden', mode === 'account');
+  $('login-mode-register').classList.toggle('hidden', mode === 'register');
+  $('login-mode-owner').classList.toggle('hidden', mode === 'owner');
+  $('login-sep-1').classList.toggle('hidden', mode === 'account' || mode === 'register');
+  $('login-sep-2').classList.toggle('hidden', mode === 'owner');
+}
+setLoginMode('account');   // без этого ссылка на текущий режим остаётся видимой
+$('login-mode-account').onclick = e => { e.preventDefault(); setLoginMode('account'); };
+$('login-mode-register').onclick = e => { e.preventDefault(); setLoginMode('register'); };
+$('login-mode-owner').onclick = e => { e.preventDefault(); setLoginMode('owner'); };
+
 $('login-btn').onclick = async () => {
   $('login-error').classList.add('hidden');
+  const email = $('login-email').value.trim();
+  const password = $('login-password').value;
+  if (loginMode !== 'owner' && !email) return loginError('Введите почту');
+  if (!password) return loginError('Введите пароль');
+  if (loginMode === 'register' && password.length < 8) return loginError('Пароль короче 8 символов — так нельзя');
+
+  const path = loginMode === 'register' ? '/api/register' : '/api/login';
+  const body = loginMode === 'owner'
+    ? {password}
+    : {email, password, display_name: $('login-name').value.trim() || null};
   try {
-    await api('/api/login', {method:'POST', body: JSON.stringify({password: $('login-password').value})});
+    const res = await api(path, {method:'POST', body: JSON.stringify(body)});
     $('login-password').value = '';
+    // Регистрация могла забрать проект, заведённый до аккаунтов: говорим
+    // об этом прямо, иначе появление чужого на вид проекта пугает.
+    if (res.adopted_projects) {
+      toast(res.adopted_projects === 1
+        ? 'Аккаунт создан. Проект, заведённый до аккаунтов, теперь ваш.'
+        : `Аккаунт создан. Проектов закреплено за вами: ${res.adopted_projects}.`);
+    }
     showApp();
   } catch (e) {
-    $('login-error').textContent = e.message;
-    $('login-error').classList.remove('hidden');
+    loginError(e.message);
   }
 };
-$('login-password').addEventListener('keydown', e => { if (e.key === 'Enter') $('login-btn').click(); });
-$('logout-btn').onclick = async () => { try { await api('/api/logout', {method:'POST'}); } catch(e){} showLogin(); };
+function loginError(text) {
+  $('login-error').textContent = text;
+  $('login-error').classList.remove('hidden');
+}
+['login-email','login-password','login-name'].forEach(id =>
+  $(id).addEventListener('keydown', e => { if (e.key === 'Enter') $('login-btn').click(); }));
+$('logout-btn').onclick = async () => {
+  try { await api('/api/logout', {method:'POST'}); } catch(e){}
+  $('hdr-user').textContent = '';
+  setLoginMode('account');
+  showLogin();
+};
 document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 // Градиент у края вкладок — подсказка «здесь есть ещё». Докрутили до конца — убираем.
 (() => {
@@ -637,6 +819,7 @@ async function loadOverview() {
     $('overview-empty').classList.add('hidden');
     $('overview-content').classList.remove('hidden');
     $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
+    $('project-inactive').classList.toggle('hidden', o.project.is_active !== false);
 
     // allSettled, а не all: если один источник отвалился, остальные панели
     // должны отрисоваться — каждая сама честно скажет, что данных нет.
@@ -1297,23 +1480,69 @@ async function loadProjects() {
     const active = list.find(p => p.is_active);
     window._activeProjectId = active ? active.id : null;
     if (active) loadStages(active.id); else $('stages-body').innerHTML =
-      '<p class="muted">Сначала подключите проект и сделайте его активным.</p>';
+      '<p class="muted">Сначала подключите проект и включите по нему сбор.</p>';
     $('projects-table').tBodies[0].innerHTML = list.length ? list.map(p =>
       `<tr><td><b>${esc(p.name)}</b><div class="muted">${esc(p.base_url || '—')}</div></td>
-       <td>${p.is_active ? '<span class="tag good">✓ активный</span>'
-            : `<button class="btn sm" onclick="activate(${p.id})">сделать активным</button>`}</td>
+       <td>${p.is_active
+            ? `<span class="tag good">✓ сбор идёт</span>
+               <button class="btn sm" onclick="pause(${p.id})">выключить</button>`
+            : `<span class="muted">сбор выключен</span>
+               <button class="btn sm" onclick="activate(${p.id})">включить сбор</button>`}</td>
        <td class="muted">${(p.available_endpoints || []).length} endpoints</td>
        <td><button class="btn sm" onclick="retest(${p.id})">перепроверить</button></td></tr>`).join('')
       : '<tr><td class="muted">Проектов пока нет.</td></tr>';
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
+// Сбор включается и выключается у каждого проекта отдельно: планировщик
+// обходит все включённые, поэтому «включить свой» больше не значит
+// «выключить чужой».
 window.activate = async id => { await api(`/api/projects/${id}/activate`, {method:'POST'}); loadProjects(); };
+window.pause = async id => { await api(`/api/projects/${id}/pause`, {method:'POST'}); loadProjects(); };
 window.retest = async id => {
   const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
   alert(r.ok ? 'Связь есть. Endpoints: ' + r.available_endpoints.join(', ')
              : 'Проблема: ' + (r.hint || JSON.stringify(r.errors)));
   loadProjects();
 };
+/* ---- Готовый код endpoint'а для стороны продукта ---- */
+// Грузим по первому раскрытию, а не при загрузке вкладки: у большинства
+// endpoint уже есть, и лишний запрос им незачем.
+let snippetLoaded = false;
+$('snippet-box').addEventListener('toggle', () => {
+  if ($('snippet-box').open && !snippetLoaded) { snippetLoaded = true; loadSnippet(); }
+});
+$('snippet-stack').onchange = () => loadSnippet($('snippet-stack').value);
+
+async function loadSnippet(stack) {
+  try {
+    const d = await api('/api/connect-snippet' + (stack ? `?stack=${encodeURIComponent(stack)}` : ''));
+    if (!$('snippet-stack').options.length) {
+      $('snippet-stack').innerHTML = d.stacks.map(s =>
+        `<option value="${esc(s.key)}">${esc(s.title)}</option>`).join('');
+    }
+    $('snippet-stack').value = d.stack;
+    $('snippet-steps').innerHTML = d.steps.map(t => `<li>${esc(t)}</li>`).join('');
+    $('snippet-filename').textContent = d.filename ? `Файл: ${d.filename}` : '';
+    $('snippet-code').textContent = d.code;
+  } catch (e) {
+    if (e.message !== 'unauthorized') $('snippet-code').textContent = 'Не удалось загрузить код: ' + e.message;
+  }
+}
+
+$('snippet-copy').onclick = async () => {
+  const text = $('snippet-code').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Код скопирован.');
+  } catch (e) {
+    // Буфер обмена доступен не везде (http без TLS, старые браузеры).
+    // Молча «скопировать» и не скопировать -- хуже, чем выделить текст.
+    const r = document.createRange(); r.selectNodeContents($('snippet-code'));
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    toast('Браузер не дал доступ к буферу — код выделен, скопируйте вручную.');
+  }
+};
+
 function newProjectPayload() {
   return {
     name: $('np-name').value.trim(), type: $('np-type').value,

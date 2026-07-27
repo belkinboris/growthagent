@@ -1,193 +1,202 @@
-"""Тесты разговорного слоя (app/ask.py)."""
-import asyncio
+# Контракт подключения продукта к Аналитику Воронки
 
-import pytest
-from sqlmodel import Session, SQLModel, create_engine
+Этот файл описывает, что должен отдавать ваш продукт, чтобы аналитик мог
+показывать воронку, находить потери и предлагать, что чинить. Больше от
+продукта ничего не требуется: аналитик сам ходит к вам по сети раз в
+несколько часов и только читает.
 
-from app import ask
-from app.models import Project
+> Файл восстановлен 27.07.2026: при загрузке 23.07.2026 его содержимое было
+> затёрто чужим кодом (там лежали тесты `app/ask.py`). Восстановлен не по
+> памяти, а по действующему коду — `app/connectors/*.py` и
+> `app/platform_api.py`. Тест `tests/test_contract_doc.py` теперь следит,
+> чтобы документ не расходился с кодом и не был затёрт снова.
 
+## Коротко
 
-def _factory():
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
-    SQLModel.metadata.create_all(engine)
-    return lambda: Session(engine)
+- Один обязательный endpoint: `GET /api/internal/metrics`.
+- Всё остальное — необязательно. Без него аналитик работает, просто видит меньше.
+- Авторизация везде одна: заголовок `Authorization: Bearer <токен>`.
+- Токен придумываете вы и храните у себя в переменной окружения; тот же
+  токен вводится один раз в мастере подключения на `/growth`.
+- Наружу отдаются **только агрегаты и анонимные ключи**. Ни почты, ни имён,
+  ни telegram_id, ни внутренних id пользователей в ответах быть не должно.
 
+Готовый рабочий код endpoint'ов — в `examples/`:
+`truepost_internal_metrics_patch.py` и
+`truepost_onboarding_diagnostics_patch.py`. Они написаны под конкретный
+продукт (АвтоПост), но структура ответа одинакова для всех.
 
-class _Settings:
-    anthropic_api_key = "sk-test"
-    anthropic_model = "claude-sonnet-4-6"
-    llm_provider = "anthropic"
+## Общие правила для всех endpoint'ов
 
+1. **Только чтение.** Аналитик вызывает их регулярно и в любом порядке;
+   побочных эффектов быть не должно.
+2. **Поле `as_of`** — момент, на который посчитаны числа, в ISO 8601
+   (`2026-07-27T18:40:00Z` или со смещением). Для обязательного endpoint'а
+   оно обязательно: без него аналитик отклонит ответ. Это защита от того,
+   чтобы залипшие данные не выдавались за свежие.
+3. **Неизвестный период — ошибка, а не ноль.** Если вы не умеете считать за
+   запрошенное окно, честнее ответить ошибкой: ноль будет воспринят как факт
+   «ничего не произошло».
+4. **404 на необязательном endpoint'е — это нормально.** Аналитик отличает
+   «endpoint не реализован» от «endpoint сломан» и пишет владельцу разные
+   вещи. Заглушек с выдуманными числами делать не надо.
+5. **Ошибка источника — не бизнес-сигнал.** Если endpoint не ответил,
+   аналитик пометит источник как недоступный и не станет делать выводов о
+   продукте по отсутствующим данным.
 
-class TestBuildContext:
+## 1. Обязательный: метрики воронки
 
-    def test_context_survives_empty_project(self):
-        f = _factory()
-        with f() as s:
-            p = Project(name="TruePost", type="t", is_active=True)
-            s.add(p); s.commit(); s.refresh(p)
-            ctx = ask.build_context(s, p)
-        assert "Доска" in ctx           # доска строится даже без данных
-        assert len(ctx) <= ask.MAX_CONTEXT_CHARS
+```
+GET /api/internal/metrics?period_hours=24
+Authorization: Bearer <токен>
+```
 
-    def test_context_includes_experiment_and_numbers(self):
-        from app.growth_loop import accept_recommendation, propose_if_needed
-        from app.truepost_playbook import truepost_playbook
-        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
-        f = _factory()
-        pp = dict(registrations=20, channels_created=16, first_post_feedback_good=7,
-                  first_post_feedback_bad=3, pricing_viewed=2, payment_started=0,
-                  payment_success=0, queue_offer_shown=4, queue_offer_clicked=1)
-        with f() as s:
-            p = Project(name="TruePost", type="t", is_active=True)
-            s.add(p); s.commit(); s.refresh(p)
-            save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "test", pp)
-            rec = propose_if_needed(s, p.id, pp, truepost_playbook)
-            accept_recommendation(s, rec, pp)
-            ctx = ask.build_context(s, p)
-        assert "АКТИВНЫЙ ЭКСПЕРИМЕНТ" in ctx
-        assert "queue_offer_shown=4" in ctx
-        assert "registrations=20" in ctx
+`period_hours` аналитик присылает три раза за цикл: `3`, `24` и `168`
+(семь дней) — три независимых запроса.
 
+Ответ:
 
-class TestAnswerQuestion:
+```json
+{
+  "as_of": "2026-07-27T18:40:00Z",
+  "period_hours": 24,
+  "users_created": 42,
+  "channels_created": 31,
+  "posts_generated": 128,
+  "payments_started": 5,
+  "payments_success": 3,
+  "revenue_rub": 2970,
+  "pending_payments": 1
+}
+```
 
-    def _run(self, coro):
-        return asyncio.run(coro)
+Имена полей — ваши. Аналитик переводит их в свои нормализованные шаги
+воронки через разметку `funnel_mapping`, которую вы задаёте при подключении
+проекта (в мастере она уже заполнена значениями по умолчанию):
 
-    def test_happy_path_and_context_in_system(self):
-        ask._last_call_ts = 0.0
-        captured = {}
+| шаг воронки у аналитика | что это значит | поле по умолчанию |
+|---|---|---|
+| `signup` | зарегистрировался | `users_created` |
+| `activation_1` | сделал первое значимое действие | `channels_created` |
+| `activation_2` | дошёл до основной ценности продукта | `posts_generated` |
+| `payment_started` | начал оплату | `payments_started` |
+| `payment_success` | оплатил | `payments_success` |
+| `revenue` | выручка за период, в рублях | `revenue_rub` |
 
-        async def fake_post(payload, headers):
-            captured["payload"] = payload
-            return {"content": [{"type": "text", "text": "Ответ по данным."}]}
+Шаг `traffic` (сколько людей пришло) продукт не отдаёт — он приходит из
+Яндекс.Директа или Метрики, если вы их подключите. Без них воронка просто
+начинается с регистраций.
 
-        out = self._run(ask.answer_question("почему нет оплат?", "КОНТЕКСТ-ДАННЫЕ", _Settings(), _post=fake_post))
-        assert out == "Ответ по данным."
-        assert "КОНТЕКСТ-ДАННЫЕ" in captured["payload"]["system"]
-        assert "Данные важнее мнений" in captured["payload"]["system"]
-        assert captured["payload"]["messages"][0]["content"] == "почему нет оплат?"
+`pending_payments` — оплаты, начатые и не завершённые. Поле необязательное,
+но по нему аналитик замечает зависшие платежи.
 
-    def test_none_on_api_failure(self):
-        ask._last_call_ts = 0.0
+## 2. Необязательные endpoint'ы
 
-        async def failing_post(payload, headers):
-            raise RuntimeError("boom")
+Аналитик сам проверяет при подключении, какие из них у вас есть, и
+показывает список в мастере. Ни один не обязателен.
 
-        out = self._run(ask.answer_question("вопрос", "ctx", _Settings(), _post=failing_post))
-        assert out is None
+### `GET /api/internal/payment-path-diagnostics?period_hours=24`
 
-    def test_cooldown(self):
-        ask._last_call_ts = 0.0
+Разбор пути до оплаты: где именно теряются люди перед деньгами.
 
-        async def fake_post(payload, headers):
-            return {"content": [{"type": "text", "text": "ok"}]}
+Ожидаемые поля: `registrations`, `channels_created`, `post_generations`,
+`pricing_viewed`, `payment_cta_clicked`, `payment_started`,
+`payment_success`, `payment_failed`, `payment_returned`,
+`quota_warning_seen`, `limit_reached`, `biggest_dropoff`,
+`likely_explanation`, `missing_data`, `conversion_steps`, `event_map`.
 
-        first = self._run(ask.answer_question("q1", "ctx", _Settings(), _post=fake_post))
-        second = self._run(ask.answer_question("q2", "ctx", _Settings(), _post=fake_post))
-        assert first == "ok"
-        assert "не чаще" in second
+Дополнительно, если считаете: `onboarding_choice_counts`,
+`first_post_feedback_good`, `first_post_feedback_bad`,
+`first_post_feedback_reasons` (словарь «код причины → сколько раз»),
+`post_generations_verified`, `post_generations_unverified`,
+`source_breakdown`.
 
-    def test_question_truncated(self):
-        ask._last_call_ts = 0.0
-        captured = {}
+Аналитик понимает и распространённые синонимы имён (`payments_started`
+вместо `payment_started` и подобные) — переименовывать у себя ничего не надо.
 
-        async def fake_post(payload, headers):
-            captured["payload"] = payload
-            return {"content": [{"type": "text", "text": "ok"}]}
+### `GET /api/internal/landing-funnel-diagnostics?period_hours=24`
 
-        self._run(ask.answer_question("х" * 5000, "ctx", _Settings(), _post=fake_post))
-        assert len(captured["payload"]["messages"][0]["content"]) <= ask.MAX_QUESTION_CHARS
+Воронка лендинга: `landing_views`, `cta_hero_bot_clicks`,
+`cta_hero_app_clicks`, `bot_starts_from_landing`, `web_register_opened`,
+`register_success`, `activation_1`.
 
+У каждого поля можно дополнительно отдать пару с суффиксом `_raw`
+(например, `landing_views_raw`). Основное значение — уникальные люди,
+`_raw` — все события. Аналитик сравнивает их и предупреждает, если счётчик
+считает дубли; для выводов о продукте используются только уникальные.
 
-class TestIsConfigured:
+### `GET /api/internal/onboarding-diagnostics?period_hours=24`
 
-    def test_configured(self):
-        assert ask.is_configured(_Settings()) is True
+Первые шаги нового пользователя: `registrations`, `onboarding_started`,
+`create_channel_clicked`, `channels_created`, `channels_verified`,
+`first_post_generated`, `payment_started`, `payment_success`,
+`errors_count`, `dropoff_by_step` (список), `last_known_step_summary`
+(словарь), `notes` (список строк).
 
-    def test_not_configured(self):
-        class NoKey:
-            anthropic_api_key = None
-            llm_provider = "anthropic"
-        assert ask.is_configured(NoKey()) is False
-        class WrongProvider:
-            anthropic_api_key = "sk"
-            llm_provider = "none"
-        assert ask.is_configured(WrongProvider()) is False
+### `GET /api/internal/user-journeys?period_hours=24&limit=100`
 
+Анонимные пути отдельных людей — чтобы видеть не только суммы, но и на чём
+конкретно человек застрял.
 
-class TestExperimentLegend:
+```json
+{"ok": true, "period_hours": 24, "as_of": "...", "journeys": [
+  {"user_key": "u_febdae54", "source": "direct", "utm_source": "yandex",
+   "utm_campaign": "...", "utm_content": "...",
+   "registered_at": "...", "channel_created_at": "...",
+   "onboarding_choice": null, "first_post_feedback": "good",
+   "first_post_feedback_reason": null, "first_post_feedback_at": "...",
+   "pricing_viewed_at": null, "payment_cta_clicked_at": null,
+   "payment_started_at": null, "payment_success_at": null,
+   "payment_failed_at": null,
+   "last_step": "channel_created", "stuck_at": "pricing",
+   "minutes_since_last_step": 47}
+]}
+```
 
-    def test_legend_present_when_experiment_running(self):
-        from app.growth_loop import accept_recommendation, propose_if_needed
-        from app.truepost_playbook import truepost_playbook
-        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
-        f = _factory()
-        pp = dict(registrations=20, channels_created=16, first_post_feedback_good=3,
-                  first_post_feedback_bad=9, pricing_viewed=6, payment_started=0, payment_success=0)
-        with f() as s:
-            p = Project(name="TruePost", type="t", is_active=True)
-            s.add(p); s.commit(); s.refresh(p)
-            save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "test", pp)
-            rec = propose_if_needed(s, p.id, pp, truepost_playbook)
-            accept_recommendation(s, rec, pp)
-            ctx = ask.build_context(s, p)
-        assert "КАК ЧИТАТЬ ЭКСПЕРИМЕНТ" in ctx
-        assert "не только успешные" in ctx
-        assert "ДО старта эксперимента" in ctx
+`user_key` — **анонимный** ключ (например, короткий хэш). Не telegram_id,
+не почта, не имя. Это требование, а не пожелание: приватность — принцип
+продукта, и аналитик не должен получать возможность узнать человека.
 
+### `GET /api/internal/user-events?period_minutes=120&limit=200`
 
-class TestContextGapsClosed:
-    """Дыры, найденные прогоном по сценариям владельца 2026-07-07."""
+Дискретные события для живой ленты — то же, что journeys, но событиями:
 
-    def _project_with_pp(self, s, pp):
-        from app.service import save_diagnostics_cache, PAYMENT_PATH_CACHE_PERIOD_KEY
-        p = Project(name="АвтоПост", type="t", is_active=True)
-        s.add(p); s.commit(); s.refresh(p)
-        save_diagnostics_cache(s, p.id, PAYMENT_PATH_CACHE_PERIOD_KEY, "t", pp)
-        return p
+```json
+{"ok": true, "events": [
+  {"event_id": "ev_1029", "event_type": "payment_success",
+   "user_key": "u_febdae54", "source": "direct",
+   "utm_source": "yandex", "utm_campaign": "...", "utm_content": "...",
+   "created_at": "2026-07-27T18:31:00Z",
+   "journey_snapshot": {"registered": true, "channel_created": true,
+     "pricing_viewed": true, "payment_started": true, "payment_success": true}}
+]}
+```
 
-    def test_ad_spend_in_context(self):
-        from datetime import datetime, timezone
-        from app.models import MetricSnapshot
-        f = _factory()
-        with f() as s:
-            p = self._project_with_pp(s, {"registrations": 16})
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            s.add(MetricSnapshot(
-                project_id=p.id, period_key="7d", source="combined",
-                period_start=now, period_end=now,
-                metrics_json={"product": {"signup": 16}, "direct": {"spend": 4124, "clicks": 136}},
-            ))
-            s.commit()
-            ctx = ask.build_context(s, p)
-        assert "расход 4124 ₽" in ctx
-        assert "кликов 136" in ctx
-        assert "цена регистрации ≈ 258 ₽" in ctx
+`event_id` должен быть устойчивым: по нему аналитик отбрасывает повторы,
+чтобы одно событие не попало в ленту дважды.
 
-    def test_project_facts_and_price_honesty(self):
-        f = _factory()
-        with f() as s:
-            p = self._project_with_pp(s, {"registrations": 16})
-            ctx = ask.build_context(s, p)
-        assert "ФАКТЫ О ПРОЕКТЕ" in ctx
-        assert "актуальных цен в" in ctx and "НЕТ" in ctx  # честность про цены
-        assert "ПАУЗУ" in ctx  # статус Telegram Ads
+Типы событий, которые аналитик понимает без настройки: `user_registered`,
+`channel_created`, `first_post_feedback_good`, `first_post_feedback_bad`,
+`pricing_viewed`, `payment_cta_clicked`, `payment_started`,
+`payment_success`, `payment_failed`. Свои типы присылать можно — они
+попадут в ленту как есть, и их можно переименовать в интерфейсе.
 
-    def test_how_to_read_numbers(self):
-        f = _factory()
-        with f() as s:
-            p = self._project_with_pp(s, {"registrations": 16, "channels_created": 18})
-            ctx = ask.build_context(s, p)
-        assert "КАК ЧИТАТЬ ЦИФРЫ" in ctx
-        assert "превышать registrations" in ctx
-        assert "автогенерация" in ctx
+## Как проверить, что всё подключилось
 
-    def test_context_still_under_limit(self):
-        f = _factory()
-        with f() as s:
-            p = self._project_with_pp(s, {"registrations": 16})
-            ctx = ask.build_context(s, p)
-        assert len(ctx) <= ask.MAX_CONTEXT_CHARS
+1. Заведите токен у себя в переменной окружения и поднимите endpoint.
+2. Откройте `/growth`, вкладка «Проекты» → «Подключить проект»: название,
+   адрес продукта, токен.
+3. Кнопка «Проверить подключение» вызовет ваши endpoint'ы и покажет, какие
+   ответили. Обязателен только `metrics` — без него подключение не пройдёт.
+4. После подключения нажмите «Проверить сейчас» на обзоре: воронка появится
+   сразу, динамика — через пару дней наблюдений.
+
+Проверить руками можно так:
+
+```bash
+curl -H "Authorization: Bearer ВАШ_ТОКЕН" \
+  "https://ваш-продукт.ру/api/internal/metrics?period_hours=24"
+```
+
+Ответ без `as_of` или с кодом 401 — самые частые причины, по которым
+подключение не проходит.

@@ -35,8 +35,9 @@ from app.config import (
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
 )
+from app import accounts, connect_snippets
 from app.db import get_session, _ensure_integrations
-from app.models import Alert, Integration, MetricSnapshot, Project
+from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
     SESSION_COOKIE,
     issue_session_token,
@@ -79,6 +80,15 @@ def project_internal_api_token(project: Project) -> Optional[str]:
 
 class LoginRequest(BaseModel):
     password: str
+    # Почта необязательна: владелец платформы входит одним паролем из
+    # окружения, клиент -- почтой и паролем своего аккаунта.
+    email: Optional[str] = None
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: Optional[str] = None
 
 
 class ConnectionTestRequest(BaseModel):
@@ -123,14 +133,8 @@ async def platform_index():
     return FileResponse(PLATFORM_INDEX)
 
 
-@router.post("/api/login")
-async def login(body: LoginRequest, response: Response):
+def _set_session_cookie(response: Response, token: str) -> None:
     settings = get_settings()
-    if not settings.platform_admin_password:
-        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
-    if not verify_password(body.password):
-        raise HTTPException(status_code=401, detail="Неверный пароль")
-    token = issue_session_token()
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -140,7 +144,72 @@ async def login(body: LoginRequest, response: Response):
         secure=settings.platform_cookie_secure,
         path="/",
     )
-    return {"ok": True, "token": token}
+
+
+@router.post("/api/login")
+async def login(body: LoginRequest, response: Response):
+    """Один вход на два случая: почта+пароль (аккаунт) и просто пароль
+    (владелец из окружения). Разделять формы незачем — человек вводит то,
+    что у него есть, а платформа сама понимает, кто пришёл."""
+    settings = get_settings()
+
+    if body.email:
+        with get_session() as session:
+            user = accounts.authenticate(session, body.email, body.password)
+            if user is None:
+                raise HTTPException(status_code=401, detail="Неверная почта или пароль")
+            token = issue_session_token(user_id=user.id)
+            _set_session_cookie(response, token)
+            return {"ok": True, "token": token, "email": user.email, "owner": user.is_owner}
+
+    if not settings.platform_admin_password:
+        raise HTTPException(status_code=503, detail="Платформа не настроена: задайте PLATFORM_ADMIN_PASSWORD")
+    if not verify_password(body.password):
+        raise HTTPException(status_code=401, detail="Неверный пароль")
+    token = issue_session_token()
+    _set_session_cookie(response, token)
+    return {"ok": True, "token": token, "owner": True}
+
+
+@router.post("/api/register")
+async def register(body: RegisterRequest, response: Response):
+    """Регистрация клиента. Первый зарегистрировавшийся усыновляет проекты,
+    заведённые до появления аккаунтов, — иначе живой проект остался бы
+    без владельца и пропал бы из интерфейса после включения изоляции."""
+    with get_session() as session:
+        try:
+            user = accounts.create_user(
+                session, body.email, body.password, display_name=body.display_name
+            )
+        except accounts.EmailTaken:
+            raise HTTPException(status_code=409, detail="Такая почта уже зарегистрирована")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        adopted = accounts.adopt_orphan_projects(session, user.id)
+        token = issue_session_token(user_id=user.id)
+        _set_session_cookie(response, token)
+        return {"ok": True, "token": token, "email": user.email, "adopted_projects": adopted}
+
+
+@router.get("/api/me", dependencies=[Depends(require_admin)])
+async def me(identity=Depends(require_admin)):
+    """Кто вошёл. Нужен интерфейсу после перезагрузки страницы: сессия
+    живёт в cookie, и без этого шапка не знает, чей аккаунт открыт."""
+    if identity is None or identity.user_id is None:
+        return {"email": None, "is_owner": True, "kind": "platform_owner"}
+    with get_session() as session:
+        user = session.get(PlatformUser, identity.user_id)
+        if user is None:
+            # Аккаунт удалили, а cookie осталась -- честнее разлогинить,
+            # чем показывать интерфейс несуществующему пользователю.
+            raise HTTPException(status_code=401, detail="Не авторизован")
+        return {
+            "email": user.email,
+            "display_name": user.display_name,
+            "is_owner": user.is_owner,
+            "kind": "account",
+        }
 
 
 @router.post("/api/logout")
@@ -152,9 +221,21 @@ async def logout(response: Response):
 @router.get("/api/session")
 async def session_state(request_ok: None = Depends(lambda: None)):
     """Публичный (без auth) статус: настроена ли платформа. Ничего
-    чувствительного не отдаёт -- нужен UI, чтобы показать логин/заглушку."""
+    чувствительного не отдаёт -- нужен UI, чтобы показать логин/заглушку.
+
+    Платформа настроена, если есть пароль владельца ИЛИ хотя бы один
+    аккаунт: клиент, зарегистрировавшийся сам, должен видеть форму входа,
+    а не «платформа не настроена»."""
     settings = get_settings()
-    return {"configured": bool(settings.platform_admin_password)}
+    has_accounts = False
+    try:
+        with get_session() as session:
+            has_accounts = session.exec(select(PlatformUser.id)).first() is not None
+    except Exception:  # база недоступна -- отвечаем честно «не настроена»
+        has_accounts = False
+    # Наружу -- один флаг. Отдавать «есть ли аккаунты» отдельным полем
+    # незачем: анонимному посетителю это ничего не даёт, а разведке помогает.
+    return {"configured": bool(settings.platform_admin_password) or has_accounts}
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +243,81 @@ async def session_state(request_ok: None = Depends(lambda: None)):
 # ---------------------------------------------------------------------------
 
 
-def _active_project(session) -> Project:
-    project = session.exec(select(Project).where(Project.is_active == True)).first()
+def _visible_project_ids(session, identity) -> Optional[set[int]]:
+    """Какие проекты видит пришедший. None -- видит все.
+
+    None -- это вход по паролю из окружения: владелец платформы. У него
+    аккаунта может не быть, и ограничивать его нечем и незачем -- сервер его.
+    У аккаунта видно ровно то, что записано в ProjectMember.
+    """
+    if identity is None or identity.user_id is None:
+        return None
+    return set(accounts.user_project_ids(session, identity.user_id))
+
+
+def _find_project(session, identity) -> Optional[Project]:
+    """Проект, о котором идёт разговор на всех экранах.
+
+    Приоритет -- активный (тот, который собирает планировщик). Если у
+    аккаунта активного нет, а свой проект есть, показываем его: иначе
+    человек, только что подключивший проект, видел бы «нет проекта»
+    при живом проекте в списке.
+    """
+    visible = _visible_project_ids(session, identity)
+    if visible is not None and not visible:
+        return None
+
+    def _scoped(query):
+        return query if visible is None else query.where(Project.id.in_(visible))
+
+    project = session.exec(
+        _scoped(select(Project).where(Project.is_active == True))  # noqa: E712
+    ).first()
+    if project is None:
+        # Проект есть, но выключен -- показываем его. Иначе экран говорит
+        # «проект ещё не подключён», хотя проект подключён: это враньё,
+        # и человек идёт подключать второй раз.
+        project = session.exec(_scoped(select(Project)).order_by(Project.id)).first()
+    return project
+
+
+def _active_project(session, identity=None) -> Project:
+    project = _find_project(session, identity)
     if project is None:
         raise HTTPException(status_code=404, detail="Нет активного проекта")
     return project
 
 
+def _owned_project(session, project_id: int, identity) -> Project:
+    """Проект по id с проверкой доступа.
+
+    Чужой проект отдаём как 404, а не 403: 403 подтверждает, что проект
+    с таким номером существует, и превращает перебор в разведку.
+    """
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    visible = _visible_project_ids(session, identity)
+    if visible is not None and project.id not in visible:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    return project
+
+
+def _require_own_project_id(session, project_id: Optional[int], identity) -> None:
+    """Проверка доступа к объекту, найденному не по проекту, а по своему id
+    (сигнал, рекомендация, эксперимент). Без неё изоляция дырявая: список
+    чужой не покажет, а действие по угаданному номеру пройдёт."""
+    visible = _visible_project_ids(session, identity)
+    if visible is None:
+        return
+    if project_id is None or project_id not in visible:
+        raise HTTPException(status_code=404, detail="Не найдено")
+
+
 @router.get("/api/overview", dependencies=[Depends(require_admin)])
-async def overview():
+async def overview(identity=Depends(require_admin)):
     with get_session() as session:
-        project = session.exec(select(Project).where(Project.is_active == True)).first()
+        project = _find_project(session, identity)
         if project is None:
             return {"build_marker": BUILD_MARKER, "project": None}
 
@@ -199,6 +344,9 @@ async def overview():
                 "base_url": project.base_url,
                 "connector": project.connector_name,
                 "mode": (project.settings_json or {}).get("mode", "watch_only"),
+                # Неактивный проект планировщик не собирает: экран обязан
+                # сказать это словами, иначе пустой обзор выглядит поломкой.
+                "is_active": project.is_active,
             },
             "integrations": [
                 {
@@ -225,12 +373,12 @@ def _config_based_statuses(settings) -> dict[str, str]:
 
 
 @router.get("/api/funnel", dependencies=[Depends(require_admin)])
-async def funnel():
+async def funnel(identity=Depends(require_admin)):
     """Последний снимок нормализованной воронки по каждому окну (3h/24h/7d).
     Берём combined-снэпшот (product + Метрика/Директ), если он есть,
     иначе -- project_metrics_api."""
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         result = {}
         for period_key in ANALYSIS_WINDOWS_HOURS:
             snapshot = None
@@ -277,9 +425,9 @@ async def funnel():
 
 
 @router.get("/api/alerts", dependencies=[Depends(require_admin)])
-async def alerts(limit: int = 30):
+async def alerts(limit: int = 30, identity=Depends(require_admin)):
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         rows = session.exec(
             select(Alert)
             .where(Alert.project_id == project.id)
@@ -397,7 +545,7 @@ REPORT_KINDS = ["board", "funnel", "pay", "ads", "checks", "journeys", "experime
 
 
 @router.get("/api/reports/{kind}", dependencies=[Depends(require_admin)])
-async def report(kind: str):
+async def report(kind: str, identity=Depends(require_admin)):
     """
     Текстовый отчёт аналитика. Формулировки (гипотезы, «что не менять»,
     честные слова про малые выборки) -- главная ценность, поэтому берём
@@ -409,7 +557,7 @@ async def report(kind: str):
     from app import commercial_report as cr
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         ctx = _report_context(session, project)
 
     name = ctx["project_name"]
@@ -443,14 +591,14 @@ async def report(kind: str):
 
 
 @router.get("/api/dynamics", dependencies=[Depends(require_admin)])
-async def dynamics(days: int = 14):
+async def dynamics(days: int = 14, identity=Depends(require_admin)):
     """Динамика по дням: и сырые точки для графика, и текстовый блок
     аналитика (он умеет честно говорить «данных мало»)."""
     from app.commercial_report import build_dynamics_block
     from app.service import load_daily_counters_history
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         history = load_daily_counters_history(session, project.id, days=days)
 
     text = build_dynamics_block(history) if len(history) >= 2 else None
@@ -458,7 +606,7 @@ async def dynamics(days: int = 14):
 
 
 @router.get("/api/live", dependencies=[Depends(require_admin)])
-async def live_feed(period_minutes: int = 720, limit: int = 100):
+async def live_feed(period_minutes: int = 720, limit: int = 100, identity=Depends(require_admin)):
     """
     Живая лента: дискретные события пользователей продукта (регистрация,
     канал, отзыв о первом посте, открытие тарифов, оплата) в порядке
@@ -472,7 +620,7 @@ async def live_feed(period_minutes: int = 720, limit: int = 100):
     from app.connectors.user_events import fetch_user_events
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         base_url = project.base_url
         token = project_internal_api_token(project)
         # Названия событий: свои для проекта, если владелец их задал
@@ -526,13 +674,13 @@ def _rec_to_dict(rec) -> dict:
 
 
 @router.get("/api/growth", dependencies=[Depends(require_admin)])
-async def growth_state():
+async def growth_state(identity=Depends(require_admin)):
     """Состояние цикла роста: что предложено, что идёт, чем закончилось."""
     from app import growth_loop
     from app.commercial_report import build_experiment_block, build_verdict_block
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         ctx = _report_context(session, project)
         pp = ctx["payment_path"]
 
@@ -575,7 +723,7 @@ async def growth_state():
 
 
 @router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
-async def growth_why(rec_id: int):
+async def growth_why(rec_id: int, identity=Depends(require_admin)):
     from app import growth_loop
     from app.commercial_report import build_recommendation_why
     from app.models import GrowthRecommendation
@@ -584,6 +732,7 @@ async def growth_why(rec_id: int):
         rec = session.get(GrowthRecommendation, rec_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="Рекомендация не найдена")
+        _require_own_project_id(session, rec.project_id, identity)
         return {"text": build_recommendation_why(rec)}
 
 
@@ -593,7 +742,7 @@ class GrowthDecision(BaseModel):
 
 
 @router.post("/api/growth/recommendation/{rec_id}/{action}", dependencies=[Depends(require_admin)])
-async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = None):
+async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = None, identity=Depends(require_admin)):
     """Решение владельца по рекомендации: принять (стартует эксперимент
     с зафиксированным baseline), отложить или отклонить."""
     from app import growth_loop
@@ -607,7 +756,8 @@ async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = 
         rec = session.get(GrowthRecommendation, rec_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="Рекомендация не найдена")
-        project = _active_project(session)
+        _require_own_project_id(session, rec.project_id, identity)
+        project = _active_project(session, identity)
         pp = _report_context(session, project)["payment_path"]
 
         if action == "accept":
@@ -621,7 +771,7 @@ async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = 
 
 
 @router.post("/api/growth/experiment/{exp_id}/cancel", dependencies=[Depends(require_admin)])
-async def growth_cancel(exp_id: int, body: GrowthDecision | None = None):
+async def growth_cancel(exp_id: int, body: GrowthDecision | None = None, identity=Depends(require_admin)):
     from app import growth_loop
     from app.models import GrowthExperiment
 
@@ -629,6 +779,7 @@ async def growth_cancel(exp_id: int, body: GrowthDecision | None = None):
         exp = session.get(GrowthExperiment, exp_id)
         if exp is None:
             raise HTTPException(status_code=404, detail="Проверка не найдена")
+        _require_own_project_id(session, exp.project_id, identity)
         growth_loop.cancel_experiment(session, exp, reason=(body.reason if body else ""))
         return {"ok": True}
 
@@ -678,13 +829,11 @@ def load_stage_titles(session, project_id: int) -> dict[str, str]:
 
 
 @router.get("/api/projects/{project_id}/stages", dependencies=[Depends(require_admin)])
-async def get_stages(project_id: int):
+async def get_stages(project_id: int, identity=Depends(require_admin)):
     from app.models import FunnelStep
 
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
+        project = _owned_project(session, project_id, identity)
         rows = {r.key: r for r in session.exec(
             select(FunnelStep).where(FunnelStep.project_id == project_id)).all()}
         mapping = (project.settings_json or {}).get("funnel_mapping") or {}
@@ -710,13 +859,11 @@ class StagesUpdate(BaseModel):
 
 
 @router.put("/api/projects/{project_id}/stages", dependencies=[Depends(require_admin)])
-async def update_stages(project_id: int, body: StagesUpdate):
+async def update_stages(project_id: int, body: StagesUpdate, identity=Depends(require_admin)):
     from app.models import FunnelStep
 
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
+        project = _owned_project(session, project_id, identity)
 
         existing = {r.key: r for r in session.exec(
             select(FunnelStep).where(FunnelStep.project_id == project_id)).all()}
@@ -736,11 +883,11 @@ async def update_stages(project_id: int, body: StagesUpdate):
             project.settings_json = sj
             session.add(project)
         session.commit()
-        return {"ok": True, "stages": (await get_stages(project_id))["stages"]}
+        return {"ok": True, "stages": (await get_stages(project_id, identity))["stages"]}
 
 
 @router.post("/api/projects/{project_id}/stages/autoname", dependencies=[Depends(require_admin)])
-async def autoname_stages(project_id: int):
+async def autoname_stages(project_id: int, identity=Depends(require_admin)):
     """
     ИИ смотрит на сайт проекта и предлагает названия этапов вместо
     «Этап 1/2». Ничего не сохраняет сам -- возвращает предложение,
@@ -756,9 +903,7 @@ async def autoname_stages(project_id: int):
         raise HTTPException(status_code=503, detail="Для автоназвания нужен настроенный LLM (LLM_PROVIDER=yandex)")
 
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
+        project = _owned_project(session, project_id, identity)
         base_url = project.base_url
         project_name = project.name
         mapping = (project.settings_json or {}).get("funnel_mapping") or {}
@@ -814,7 +959,7 @@ async def autoname_stages(project_id: int):
 
 
 @router.get("/api/ads", dependencies=[Depends(require_admin)])
-async def ads_overview():
+async def ads_overview(identity=Depends(require_admin)):
     """
     Связка «откуда пришли» и «сколько это стоило». Расход и клики приходят
     из Директа, а что из этих людей выросло -- из разреза по источникам
@@ -824,7 +969,7 @@ async def ads_overview():
     from app.connectors.traffic_sources import parse_source_breakdown
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         ctx = _report_context(session, project)
         stage_titles = load_stage_titles(session, project.id)
         # Статусы необязательных источников: без них аналитик работает,
@@ -888,7 +1033,7 @@ async def ads_overview():
 
 
 @router.post("/api/ads/deep-check", dependencies=[Depends(require_admin)])
-async def ads_deep_check():
+async def ads_deep_check(identity=Depends(require_admin)):
     """
     Глубокая проверка Директа: granular-отчёты по фразам и площадкам --
     какие запросы жгут бюджет без регистраций. Дорогая операция (десятки
@@ -899,7 +1044,7 @@ async def ads_deep_check():
     from app.scheduler import force_refresh_deep_diagnostics_sync_with_timeout
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         project_id = project.id
 
     result = await asyncio.to_thread(
@@ -927,7 +1072,7 @@ async def ads_deep_check():
 
 
 @router.get("/api/history", dependencies=[Depends(require_admin)])
-async def decisions_history(limit: int = 50):
+async def decisions_history(limit: int = 50, identity=Depends(require_admin)):
     """
     Журнал цикла роста. Ценность накапливается именно здесь: видно, какие
     гипотезы подтверждались, а какие нет -- и не предлагать снова то,
@@ -936,7 +1081,7 @@ async def decisions_history(limit: int = 50):
     from app.models import GrowthExperiment, GrowthRecommendation
 
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         recs = session.exec(
             select(GrowthRecommendation)
             .where(GrowthRecommendation.project_id == project.id)
@@ -989,7 +1134,7 @@ class DevTaskRequest(BaseModel):
 
 
 @router.post("/api/dev-task", dependencies=[Depends(require_admin)])
-async def create_dev_task(body: DevTaskRequest):
+async def create_dev_task(body: DevTaskRequest, identity=Depends(require_admin)):
     """
     Создаёт issue в GitHub с диагнозом аналитика. Если в репозитории
     настроен workflow Claude Code (реагирует на @claude), задача уходит
@@ -999,6 +1144,11 @@ async def create_dev_task(body: DevTaskRequest):
     Токен и репозиторий -- в переменных окружения аналитика; никакие
     ключи через интерфейс не передаются.
     """
+    # Задача уходит в репозиторий владельца платформы, поэтому кнопка
+    # доступна только ему: клиент не должен заводить задачи в чужом репозитории.
+    if identity is not None and identity.user_id is not None:
+        raise HTTPException(status_code=403, detail="Постановка задач доступна только владельцу платформы")
+
     settings = get_settings()
     token = settings.github_task_token
     repo = body.repo or settings.github_task_repo
@@ -1041,7 +1191,7 @@ async def create_dev_task(body: DevTaskRequest):
 
 
 @router.post("/api/alerts/{alert_id}/{action}", dependencies=[Depends(require_admin)])
-async def alert_action(alert_id: int, action: str):
+async def alert_action(alert_id: int, action: str, identity=Depends(require_admin)):
     """«Понял» (acknowledged) и «Отложить» (snoozed на сутки) -- то же, что
     кнопки под сигналом в Telegram."""
     from datetime import timedelta
@@ -1055,6 +1205,7 @@ async def alert_action(alert_id: int, action: str):
         alert = session.get(Alert, alert_id)
         if alert is None:
             raise HTTPException(status_code=404, detail="Сигнал не найден")
+        _require_own_project_id(session, alert.project_id, identity)
         if action == "ack":
             alert.status = AlertStatus.acknowledged
         else:
@@ -1066,12 +1217,17 @@ async def alert_action(alert_id: int, action: str):
 
 
 @router.post("/api/run", dependencies=[Depends(require_admin)])
-async def run_cycle():
+async def run_cycle(identity=Depends(require_admin)):
     from app.scheduler import run_cycle_once_sync_with_timeout
+
+    # Явно передаём проект пришедшего: без этого кнопка «Проверить сейчас»
+    # у клиента запускала бы цикл по чужому активному проекту.
+    with get_session() as session:
+        project_id = _active_project(session, identity).id
 
     try:
         result = await asyncio.to_thread(
-            run_cycle_once_sync_with_timeout, None, RUN_CYCLE_TIMEOUT_SECONDS, "platform_run",
+            run_cycle_once_sync_with_timeout, project_id, RUN_CYCLE_TIMEOUT_SECONDS, "platform_run",
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Источники данных не ответили вовремя")
@@ -1099,7 +1255,7 @@ async def run_cycle():
 
 
 @router.post("/api/ask", dependencies=[Depends(require_admin)])
-async def ask(body: AskRequest):
+async def ask(body: AskRequest, identity=Depends(require_admin)):
     from app import ask as ask_module
 
     settings = get_settings()
@@ -1109,7 +1265,7 @@ async def ask(body: AskRequest):
             detail="LLM не настроен: задайте LLM_PROVIDER=yandex и YANDEX_API_KEY/YANDEX_FOLDER_ID",
         )
     with get_session() as session:
-        project = _active_project(session)
+        project = _active_project(session, identity)
         context_text = ask_module.build_context(session, project)
 
     answer = await ask_module.answer_question(body.question, context_text, settings)
@@ -1155,6 +1311,16 @@ async def _probe_internal_api(base_url: str, token: str) -> dict:
     }
 
 
+@router.get("/api/connect-snippet", dependencies=[Depends(require_admin)])
+async def connect_snippet(stack: str = connect_snippets.DEFAULT_STACK):
+    """Готовый код endpoint'а под стек клиента. Самый дорогой шаг
+    подключения -- написать его самому по документу; здесь он выдан кодом."""
+    return {
+        "stacks": connect_snippets.available_stacks(),
+        **connect_snippets.build_snippet(stack),
+    }
+
+
 @router.post("/api/connection-test", dependencies=[Depends(require_admin)])
 async def connection_test(body: ConnectionTestRequest):
     return await _probe_internal_api(body.base_url, body.internal_api_token)
@@ -1179,14 +1345,19 @@ def _project_to_dict(p: Project) -> dict:
 
 
 @router.get("/api/projects", dependencies=[Depends(require_admin)])
-async def list_projects():
+async def list_projects(identity=Depends(require_admin)):
     with get_session() as session:
-        projects = session.exec(select(Project).order_by(Project.id)).all()
-        return [_project_to_dict(p) for p in projects]
+        visible = _visible_project_ids(session, identity)
+        query = select(Project).order_by(Project.id)
+        if visible is not None:
+            if not visible:
+                return []
+            query = query.where(Project.id.in_(visible))
+        return [_project_to_dict(p) for p in session.exec(query).all()]
 
 
 @router.post("/api/projects", dependencies=[Depends(require_admin)])
-async def create_project(body: ProjectCreateRequest):
+async def create_project(body: ProjectCreateRequest, identity=Depends(require_admin)):
     from app.connectors.truepost import DEFAULT_FUNNEL_MAPPING
 
     probe = await _probe_internal_api(body.base_url, body.internal_api_token)
@@ -1194,8 +1365,14 @@ async def create_project(body: ProjectCreateRequest):
         raise HTTPException(status_code=422, detail={"message": "Подключение не прошло проверку", "probe": probe})
 
     with get_session() as session:
-        existing = session.exec(select(Project).where(Project.name == body.name)).first()
-        if existing is not None:
+        # Название уникально в пределах владельца, а не всей платформы:
+        # иначе первый клиент, назвавший проект «Магазин», занял бы это
+        # слово для всех остальных.
+        visible = _visible_project_ids(session, identity)
+        same_name = session.exec(select(Project).where(Project.name == body.name)).all()
+        if visible is not None:
+            same_name = [p for p in same_name if p.id in visible]
+        if same_name:
             raise HTTPException(status_code=409, detail="Проект с таким названием уже есть")
 
         project = Project(
@@ -1216,15 +1393,18 @@ async def create_project(body: ProjectCreateRequest):
         session.commit()
         session.refresh(project)
         _ensure_integrations(session, project)
+        # Владение записывается сразу: проект, созданный клиентом, должен
+        # быть его. Вход по паролю из окружения -- владелец платформы, у него
+        # аккаунта может не быть, и связывать не с кем.
+        if identity is not None and identity.user_id is not None:
+            accounts.grant_project(session, project.id, identity.user_id)
         return {"ok": True, "project": _project_to_dict(project), "probe": probe}
 
 
 @router.patch("/api/projects/{project_id}", dependencies=[Depends(require_admin)])
-async def update_project(project_id: int, body: ProjectUpdateRequest):
+async def update_project(project_id: int, body: ProjectUpdateRequest, identity=Depends(require_admin)):
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
+        project = _owned_project(session, project_id, identity)
 
         if body.name is not None:
             project.name = body.name
@@ -1251,26 +1431,40 @@ async def update_project(project_id: int, body: ProjectUpdateRequest):
 
 
 @router.post("/api/projects/{project_id}/activate", dependencies=[Depends(require_admin)])
-async def activate_project(project_id: int):
-    """Делает проект активным (его анализирует планировщик). В v1 активен
-    ровно один проект -- остальные деактивируются."""
+async def activate_project(project_id: int, identity=Depends(require_admin)):
+    """Включает сбор данных по проекту.
+
+    Раньше активным мог быть ровно один проект на всю платформу -- цикл брал
+    первый попавшийся активный, и включение своего проекта останавливало
+    сбор у соседа. Планировщик теперь обходит все включённые проекты
+    (`run_cycle_for_all_active`), поэтому выключать чужие больше не нужно
+    и нельзя.
+    """
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
-        for p in session.exec(select(Project)).all():
-            p.is_active = (p.id == project_id)
-            session.add(p)
+        project = _owned_project(session, project_id, identity)
+        project.is_active = True
+        session.add(project)
         session.commit()
-        return {"ok": True}
+        return {"ok": True, "is_active": True}
+
+
+@router.post("/api/projects/{project_id}/pause", dependencies=[Depends(require_admin)])
+async def pause_project(project_id: int, identity=Depends(require_admin)):
+    """Выключает сбор. Нужен как пара к включению: иначе сбор можно только
+    завести и никогда не остановить -- например, на время переезда продукта,
+    когда его данные всё равно врут."""
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project.is_active = False
+        session.add(project)
+        session.commit()
+        return {"ok": True, "is_active": False}
 
 
 @router.post("/api/projects/{project_id}/retest", dependencies=[Depends(require_admin)])
-async def retest_project(project_id: int):
+async def retest_project(project_id: int, identity=Depends(require_admin)):
     with get_session() as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Проект не найден")
+        project = _owned_project(session, project_id, identity)
         token = project_internal_api_token(project)
         if not project.base_url or not token:
             raise HTTPException(status_code=422, detail="У проекта нет base_url или токена")

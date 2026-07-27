@@ -152,6 +152,253 @@ class TestAuth:
 
 
 # ---------------------------------------------------------------------------
+# Аккаунты (B1, часть 1)
+# ---------------------------------------------------------------------------
+
+
+class TestAccountsAPI:
+    def test_register_then_login_by_email(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.status_code == 200, resp.text
+        assert client.get("/growth/api/overview").status_code == 200
+
+        client.post("/growth/api/logout")
+        assert client.get("/growth/api/overview").status_code == 401
+
+        resp = client.post("/growth/api/login",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.status_code == 200, resp.text
+        assert client.get("/growth/api/overview").status_code == 200
+
+    def test_duplicate_email_is_409_not_500(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        resp = client.post("/growth/api/register",
+                           json={"email": "IVAN@example.com", "password": "другой123"})
+        assert resp.status_code == 409
+
+    def test_short_password_rejected_with_reason(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "123"})
+        assert resp.status_code == 400
+        assert "8" in resp.json()["detail"]
+
+    def test_wrong_account_password_rejected(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        client.post("/growth/api/logout")
+        resp = client.post("/growth/api/login",
+                           json={"email": "ivan@example.com", "password": "неверный"})
+        assert resp.status_code == 401
+
+    def test_account_login_does_not_need_env_password(self, monkeypatch, tmp_path):
+        """Клиент на своём сервере не обязан заводить PLATFORM_ADMIN_PASSWORD:
+        зарегистрировался -- значит, платформа настроена."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/session").json()["configured"] is True
+
+    def test_registered_user_adopts_existing_project(self, monkeypatch, tmp_path):
+        """Живой проект был заведён до аккаунтов -- он должен достаться
+        первому зарегистрировавшемуся, иначе исчезнет с изоляцией."""
+        from app import accounts
+        client, session_factory = _client(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/register",
+                           json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert resp.json()["adopted_projects"] == 1
+        with session_factory() as session:
+            from app.models import PlatformUser
+            from sqlmodel import select
+            user = session.exec(select(PlatformUser)).first()
+            assert len(accounts.user_project_ids(session, user.id)) == 1
+
+    def test_me_tells_who_is_logged_in(self, monkeypatch, tmp_path):
+        """Интерфейс после перезагрузки страницы знает о сессии только из
+        cookie -- имя аккаунта приходится спрашивать у сервера."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "Ivan@example.com", "password": "qwerty12",
+                          "display_name": "Иван"})
+        me = client.get("/growth/api/me").json()
+        assert me == {"email": "ivan@example.com", "display_name": "Иван",
+                      "is_owner": False, "kind": "account"}
+
+        client.post("/growth/api/logout")
+        _login(client)
+        assert client.get("/growth/api/me").json()["kind"] == "platform_owner"
+
+    def test_me_requires_session(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        assert client.get("/growth/api/me").status_code == 401
+
+    def test_owner_env_login_still_works(self, monkeypatch, tmp_path):
+        """Аккаунты не должны сломать вход владельца одним паролем."""
+        client, _ = _client(monkeypatch, tmp_path)
+        client.post("/growth/api/register",
+                    json={"email": "ivan@example.com", "password": "qwerty12"})
+        client.post("/growth/api/logout")
+        assert client.post("/growth/api/login", json={"password": PASSWORD}).status_code == 200
+        assert client.get("/growth/api/overview").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Изоляция данных по владельцу (B1.2 / B2)
+# ---------------------------------------------------------------------------
+
+
+def _second_project(session_factory, name="Чужой проект"):
+    """Второй проект в базе -- «соседский». Активным не делаем: активный
+    в v1 ровно один, и это проект из окружения."""
+    from app.models import Project
+
+    with session_factory() as session:
+        p = Project(name=name, type="telegram_saas", base_url="https://other.test",
+                    connector_name="truepost", is_active=False,
+                    settings_json={"internal_api_token": "tok2"})
+        session.add(p)
+        session.commit()
+        session.refresh(p)
+        return p.id
+
+
+def _register(client, email, password="qwerty12"):
+    resp = client.post("/growth/api/register", json={"email": email, "password": password})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+class TestOwnerIsolation:
+    """Клиент видит только свои проекты. До этих проверок вход был один на
+    всех: любой вошедший читал чужую воронку, деньги и сигналы."""
+
+    def _two_tenants(self, monkeypatch, tmp_path):
+        from app import accounts
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        ivan = _register(client, "ivan@example.com")           # усыновляет проект из окружения
+        ivan_pid = _project_id(session_factory)
+        petr_pid = _second_project(session_factory)
+
+        client.post("/growth/api/logout")
+        petr = _register(client, "petr@example.com")           # усыновлять уже нечего
+        with session_factory() as session:
+            from sqlmodel import select
+            from app.models import PlatformUser
+            petr_user = session.exec(
+                select(PlatformUser).where(PlatformUser.email == "petr@example.com")).first()
+            accounts.grant_project(session, petr_pid, petr_user.id)
+        return client, session_factory, ivan_pid, petr_pid
+
+    def test_list_shows_only_own_projects(self, monkeypatch, tmp_path):
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        # сейчас в сессии Пётр
+        ids = [p["id"] for p in client.get("/growth/api/projects").json()]
+        assert ids == [petr_pid]
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert [p["id"] for p in client.get("/growth/api/projects").json()] == [ivan_pid]
+
+    def test_foreign_project_is_not_found(self, monkeypatch, tmp_path):
+        """404, а не 403: 403 подтверждает, что такой проект есть."""
+        client, _, ivan_pid, _ = self._two_tenants(monkeypatch, tmp_path)
+        assert client.get(f"/growth/api/projects/{ivan_pid}/stages").status_code == 404
+        assert client.put(f"/growth/api/projects/{ivan_pid}/stages",
+                          json={"titles": {"signup": "Взлом"}}).status_code == 404
+        assert client.patch(f"/growth/api/projects/{ivan_pid}",
+                            json={"name": "Взлом"}).status_code == 404
+        assert client.post(f"/growth/api/projects/{ivan_pid}/retest").status_code == 404
+        assert client.post(f"/growth/api/projects/{ivan_pid}/activate").status_code == 404
+
+    def test_overview_shows_own_project(self, monkeypatch, tmp_path):
+        """У Петра свой проект не активен -- но он у него единственный,
+        и показать надо его, а не «нет проекта» и не чужой."""
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        assert client.get("/growth/api/overview").json()["project"]["id"] == petr_pid
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/overview").json()["project"]["id"] == ivan_pid
+
+    def test_funnel_is_not_shared(self, monkeypatch, tmp_path):
+        """Главная утечка: цифры чужой воронки на своём экране."""
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        with session_factory() as session:
+            _snapshot(session, ivan_pid)
+
+        # У Петра снимков нет -- окно пустое, а не с чужими числами.
+        assert client.get("/growth/api/funnel").json()["windows"]["7d"] is None
+
+        client.post("/growth/api/logout")
+        client.post("/growth/api/login", json={"email": "ivan@example.com", "password": "qwerty12"})
+        assert client.get("/growth/api/funnel").json()["windows"]["7d"]["funnel"]["signup"] == 12
+
+    def test_foreign_alert_cannot_be_touched(self, monkeypatch, tmp_path):
+        """Список чужого не покажет, а действие по угаданному номеру
+        проходило бы -- это и есть дырявая изоляция."""
+        from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel
+
+        client, session_factory, ivan_pid, _ = self._two_tenants(monkeypatch, tmp_path)
+        with session_factory() as session:
+            alert = Alert(project_id=ivan_pid, rule_id="r1", fingerprint="f1",
+                          title="Чужой сигнал", severity=AlertSeverity.p2,
+                          category=AlertCategory.activation_drop, status=AlertStatus.open,
+                          confidence=ConfidenceLevel.medium, message="Чужие данные",
+                          period_key="24h")
+            session.add(alert)
+            session.commit()
+            session.refresh(alert)
+            alert_id = alert.id
+
+        assert client.post(f"/growth/api/alerts/{alert_id}/ack").status_code == 404
+        assert client.get("/growth/api/alerts").json() == []
+
+    def test_dev_task_is_owner_only(self, monkeypatch, tmp_path):
+        """Задача уходит в репозиторий владельца платформы -- клиенту туда нельзя."""
+        client, _, _, _ = self._two_tenants(monkeypatch, tmp_path)
+        resp = client.post("/growth/api/dev-task", json={"title": "т", "body": "т"})
+        assert resp.status_code == 403
+
+    def test_env_owner_still_sees_everything(self, monkeypatch, tmp_path):
+        """Владелец платформы входит паролем из окружения и админит всё."""
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.post("/growth/api/logout")
+        _login(client)
+        ids = sorted(p["id"] for p in client.get("/growth/api/projects").json())
+        assert ids == sorted([ivan_pid, petr_pid])
+        assert client.get(f"/growth/api/projects/{ivan_pid}/stages").status_code == 200
+
+    def test_activation_does_not_touch_neighbour(self, monkeypatch, tmp_path):
+        """Планировщик обходит все включённые проекты (B7), поэтому включение
+        своего больше не выключает чужой -- раньше это было бы тихой
+        остановкой сбора у соседа, и платформа отказывала в активации."""
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        assert client.post(f"/growth/api/projects/{petr_pid}/activate").status_code == 200
+
+        from app.models import Project
+        with session_factory() as session:
+            assert session.get(Project, ivan_pid).is_active is True
+            assert session.get(Project, petr_pid).is_active is True
+
+    def test_pause_stops_only_own_project(self, monkeypatch, tmp_path):
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.post(f"/growth/api/projects/{petr_pid}/activate")
+        assert client.post(f"/growth/api/projects/{petr_pid}/pause").status_code == 200
+        assert client.post(f"/growth/api/projects/{ivan_pid}/pause").status_code == 404
+
+        from app.models import Project
+        with session_factory() as session:
+            assert session.get(Project, petr_pid).is_active is False
+            assert session.get(Project, ivan_pid).is_active is True
+
+
+# ---------------------------------------------------------------------------
 # Обзор и воронка
 # ---------------------------------------------------------------------------
 
@@ -165,6 +412,29 @@ class TestOverview:
         body = client.get("/growth/api/overview").json()
         assert body["project"] is None
         assert body["build_marker"]
+
+    def test_inactive_project_is_shown_and_marked(self, monkeypatch, tmp_path):
+        """Выключенный проект -- это не «проект не подключён». Раньше обзор
+        отвечал project: null, и человек шёл подключать проект второй раз."""
+        from app.models import Project
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        _login(client)
+        with session_factory() as session:
+            from sqlmodel import select
+            project = session.exec(select(Project)).first()
+            project.is_active = False
+            session.add(project)
+            session.commit()
+
+        body = client.get("/growth/api/overview").json()
+        assert body["project"] is not None
+        assert body["project"]["is_active"] is False
+
+    def test_active_project_marked_active(self, monkeypatch, tmp_path):
+        client, _ = _client(monkeypatch, tmp_path)
+        _login(client)
+        assert client.get("/growth/api/overview").json()["project"]["is_active"] is True
 
     def test_telegram_and_llm_status_from_config(self, monkeypatch, tmp_path):
         """Эти интеграции не источники метрик, цикл сбора их не обновляет --
@@ -235,7 +505,7 @@ class TestFunnel:
 
 
 def _alert(session, project_id, period, severity=None, title="Начатые оплаты без успешных"):
-    from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel
+    from app.models import Alert, AlertCategory, AlertSeverity, AlertStatus, ConfidenceLevel, ConfidenceLevel
 
     session.add(Alert(
         project_id=project_id,

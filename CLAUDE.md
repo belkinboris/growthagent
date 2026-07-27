@@ -12,7 +12,11 @@
 - `app/main.py` — FastAPI: `/health`, `/status`, Telegram webhook, монтирование
   платформы под `/growth`, запуск планировщика в startup.
 - `app/platform_api.py` — всё API веб-платформы (`/growth/api/*`).
-- `app/platform_auth.py` — вход владельца, HMAC-сессии.
+- `app/platform_auth.py` — вход, HMAC-сессии. Личность внутри подписанного
+  токена: `<срок>:u<id>` — аккаунт, `<срок>` без `:u` — владелец по паролю
+  из окружения.
+- `app/accounts.py` — пароли, регистрация, владение проектами
+  (`PlatformUser`, `ProjectMember`).
 - `app/static/platform/index.html` — весь интерфейс: один файл, ванильный JS,
   без сборщика. Тема одна (тёмная), цвета серий валидированы под тёмную
   поверхность.
@@ -37,11 +41,11 @@ OOM в `connectors/direct.py`, диагностика памяти в `scheduler
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080   # прод-команда (Timeweb)
-python3 -m pytest tests/ -q                        # 463 теста ядра
+python3 -m pytest tests/ -q                        # 662 теста, все зелёные
 ```
 
-Три теста в `tests/test_daily_review.py` падают из-за захардкоженного пути
-`/home/claude/growthagent-main` — это известная проблема (C2), не регрессия.
+Прогон должен быть чистым. Любое падение — регрессия, а не «известная
+проблема»: три теста с захардкоженным путём исправлены 27.07.2026 (C2).
 
 Локальная проверка интерфейса:
 

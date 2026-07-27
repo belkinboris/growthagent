@@ -1151,6 +1151,65 @@ def run_cycle_once_sync_with_timeout(
 
 
 
+def active_project_ids(session) -> list[int]:
+    """Проекты, по которым идёт сбор. Порядок по id -- чтобы очередь была
+    одинаковой от цикла к циклу и по логам было видно, где он застрял."""
+    rows = session.exec(
+        select(Project.id).where(Project.is_active == True).order_by(Project.id)  # noqa: E712
+    ).all()
+    return [int(r) for r in rows]
+
+
+async def run_cycle_for_all_active() -> dict[int, str]:
+    """
+    Один проход планировщика по ВСЕМ включённым проектам.
+
+    Раньше цикл брал `.first()` активный проект, то есть платформа собирала
+    данные ровно по одному проекту на всю базу. Пока владелец был один, это
+    работало; со вторым аккаунтом включение своего проекта останавливало
+    сбор у соседа, и платформе приходилось честно отказывать в активации.
+
+    Проекты обходятся ПО ОЧЕРЕДИ, а не параллельно: цикл ходит во внешние
+    API (Директ, Метрика, ЮKassa) и держит в памяти выгрузки — на маленьком
+    сервере параллельный обход уже приводил к OOM. Свой таймаут на каждый
+    проект: медленный чужой продукт не должен съедать окно у остальных.
+
+    Падение одного проекта не останавливает остальные: у каждого клиента
+    свой продукт, и чужая поломка не повод оставить всех без данных.
+    Возвращает {project_id: статус} — это же уходит в лог.
+    """
+    with get_session() as session:
+        project_ids = active_project_ids(session)
+
+    if not project_ids:
+        logger.info("Cycle skipped: нет включённых проектов")
+        return {}
+
+    outcomes: dict[int, str] = {}
+    for project_id in project_ids:
+        try:
+            result = await asyncio.wait_for(
+                run_cycle_once(project_id), timeout=RUN_CYCLE_TIMEOUT_SECONDS
+            )
+            outcomes[project_id] = "ok"
+            logger.info(
+                "Cycle complete (project=%s): notifiable=%s primary=%s",
+                project_id,
+                result.has_notifiable_changes,
+                result.primary_candidate.title if result.primary_candidate else None,
+            )
+        except asyncio.TimeoutError:
+            outcomes[project_id] = "timeout"
+            logger.warning(
+                "Cycle timed out (project=%s) after %.1f sec", project_id, RUN_CYCLE_TIMEOUT_SECONDS
+            )
+        except Exception:
+            outcomes[project_id] = "error"
+            logger.exception("Cycle failed (project=%s)", project_id)
+
+    return outcomes
+
+
 async def force_refresh_deep_diagnostics(project_id: int | None = None) -> dict:
     """
     Принудительный запуск deep diagnostics, минуя кэш -- используется
@@ -1816,17 +1875,7 @@ def start_scheduler() -> AsyncIOScheduler:
     _scheduler = AsyncIOScheduler()
 
     async def _job():
-        try:
-            result = await asyncio.wait_for(run_cycle_once(), timeout=RUN_CYCLE_TIMEOUT_SECONDS)
-            logger.info(
-                "Cycle complete: notifiable=%s primary=%s",
-                result.has_notifiable_changes,
-                result.primary_candidate.title if result.primary_candidate else None,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Scheduled cycle timed out after %.1f sec", RUN_CYCLE_TIMEOUT_SECONDS)
-        except Exception:
-            logger.exception("Scheduled cycle failed")
+        await run_cycle_for_all_active()
 
     _scheduler.add_job(_job, "interval", seconds=settings.watch_interval_seconds, id="watch_cycle")
     _scheduler.start()
