@@ -10,6 +10,25 @@
 8. /run не падает без direct_intelligence
 9. build_owner_report backward compat без direct_intelligence
 """
+
+# ---------------------------------------------------------------------------
+# Проверки по исходному тексту бота
+#
+# Раньше эти тесты звали grep по абсолютному пути /home/claude/growthagent-main
+# и падали везде, кроме одной машины. Хуже: тест на отсутствие строки
+# "проходил" именно потому, что файла нет -- grep возвращал 2, и assert
+# на "не найдено" срабатывал вхолостую. Читаем файл относительно самого теста.
+# ---------------------------------------------------------------------------
+
+from pathlib import Path as _Path
+
+
+def _telegram_bot_source() -> str:
+    path = _Path(__file__).resolve().parents[1] / "app" / "telegram_bot.py"
+    assert path.exists(), f"не найден исходник бота: {path}"
+    return path.read_text(encoding="utf-8")
+
+
 import pytest
 
 from app.query_classifier import (
@@ -1550,15 +1569,9 @@ class TestBannedTermsInOwnerMessages:
 
     def test_deep_direct_start_message_human_language(self):
         """Стартовое сообщение /deep_direct на человеческом языке."""
-        # Стартовое сообщение захардкожено в cmd_deep_direct
-        # Проверяем через grep что технических слов там нет
-        import subprocess
-        result = subprocess.run(
-            ["grep", "-n", "Запускаю глубокую диагностику", 
-             "/home/claude/growthagent-main/app/telegram_bot.py"],
-            capture_output=True, text=True
-        )
-        assert result.returncode != 0, \
+        # Стартовое сообщение захардкожено в cmd_deep_direct: проверяем,
+        # что технический оборот из старой версии в исходник не вернулся.
+        assert "Запускаю глубокую диагностику" not in _telegram_bot_source(), \
             "Старое стартовое сообщение с 'глубокую диагностику' ещё осталось"
 
 
@@ -2142,12 +2155,8 @@ class TestRawPostCountsFullyRemoved:
 
     def test_debug_command_has_raw_post_counts(self):
         """/debug (технический) всё ещё содержит raw метрику — она там уместна."""
-        import subprocess
-        result = subprocess.run(
-            ["grep", "-n", "raw activation_2", "/home/claude/growthagent-main/app/telegram_bot.py"],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0, "raw activation_2 должна остаться в /debug"
+        assert "raw activation_2" in _telegram_bot_source(), \
+            "raw activation_2 должна остаться в /debug"
 
 
 # ---------------------------------------------------------------------------
@@ -2158,22 +2167,19 @@ class TestStartCommand:
 
     def test_start_contains_today(self):
         """/start содержит /today в списке команд."""
-        import subprocess
-        result = subprocess.run(
-            ["grep", "-n", "/today", "/home/claude/growthagent-main/app/telegram_bot.py"],
-            capture_output=True, text=True,
-        )
-        assert "/today — что делаем сегодня" in result.stdout or result.returncode == 0
+        # Проверяем справку, а не файл целиком: «/today» встречается ещё и
+        # в комментариях, и такая проверка проходила бы даже после удаления
+        # команды из справки владельца.
+        source = _telegram_bot_source()
+        assert "/today = /board" in source, \
+            "/today пропал из списка алиасов в справке бота"
 
     def test_start_no_shtab_word(self):
         """/start не содержит слово 'штаб'."""
-        import subprocess
-        result = subprocess.run(
-            ["grep", "-in", "штаб", "/home/claude/growthagent-main/app/telegram_bot.py"],
-            capture_output=True, text=True,
-        )
-        # grep returncode=1 значит совпадений нет — это то что нужно
-        assert result.returncode == 1, f"Слово 'штаб' найдено: {result.stdout}"
+        # Слово из старого позиционирования («штаб») в текстах бота
+        # быть не должно: продукт говорит проще.
+        assert "штаб" not in _telegram_bot_source().lower(), \
+            "Слово 'штаб' вернулось в тексты бота"
 
     def test_start_function_source_has_required_commands(self):
         """Текст функции cmd_start содержит /board как главную команду + детали."""
