@@ -41,7 +41,7 @@ OOM в `connectors/direct.py`, диагностика памяти в `scheduler
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080   # прод-команда (Timeweb)
-python3 -m pytest tests/ -q                        # 708 тестов, все зелёные
+python3 -m pytest tests/ -q                        # 718 тестов, все зелёные
 ```
 
 Прогон должен быть чистым. Любое падение — регрессия, а не «известная
@@ -56,6 +56,9 @@ PLATFORM_ADMIN_PASSWORD=t PLATFORM_COOKIE_SECURE=false \
 
 Скриншоты — Playwright с предустановленным браузером:
 `executable_path="/opt/pw-browsers/chromium-1194/chrome-linux/chrome"`.
+Браузерные тесты интерфейса — `tests/test_ui_browser.py`: поднимают
+приложение на своём порту и ходят в него Chromium'ом. Без браузера в
+системе файл пропускается целиком.
 
 ## Соглашения
 
