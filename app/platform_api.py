@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1269,8 +1271,6 @@ COMPARE_MIN_SAMPLE = MIN_FOR_A_TREND
 @router.get("/api/compare", dependencies=[Depends(require_admin)])
 async def compare_periods(identity=Depends(require_admin)):
     """Неделя к предыдущей неделе по каждому шагу воронки."""
-    from datetime import timedelta
-
     from app.models import utcnow
     from app.service import extract_normalized_metrics_from_snapshot
 
@@ -1351,6 +1351,159 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
         "now": now_v, "was": was_v, "delta": delta, "percent": percent,
         "verdict": verdict,
         "reliable": bool(now_n is not None and was_n is not None and biggest >= COMPARE_MIN_SAMPLE),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Что изменилось после выкатки (D6)
+# ---------------------------------------------------------------------------
+#
+# Сравнение недель отвечает «стало лучше или хуже», но не отвечает на вопрос,
+# который человек задаёт на самом деле: помогло ли то, что я сделал. Календарь
+# не знает, когда была выкатка, и изменение, случившееся в среду, размазывается
+# по двум неделям сразу.
+#
+# Отметку ставит человек: аналитик не угадывает по излому графика, что именно
+# и когда выкатили. Догадка тут хуже пустоты -- на ней строится вывод «помогло».
+
+
+class ChangeIn(BaseModel):
+    title: str
+    description: str | None = None
+    at: str | None = None  # ISO-время; пусто -- значит «только что»
+
+
+@router.post("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
+async def add_project_change(project_id: int, payload: ChangeIn, identity=Depends(require_admin)):
+    """Владелец отмечает: «я выкатил X тогда-то»."""
+    from app.models import utcnow
+    from app.service import add_change_event
+
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Напишите, что именно вы изменили")
+
+    cutoff = utcnow()
+    if payload.at:
+        try:
+            cutoff = datetime.fromisoformat(payload.at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Не разобрал дату изменения")
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+    # Изменение «в будущем» -- это опечатка в дате, а не план: сравнение по
+    # такой отметке потом молча покажет пустоту вместо ошибки.
+    if cutoff > utcnow() + timedelta(minutes=5):
+        raise HTTPException(status_code=400, detail="Дата изменения — в будущем")
+
+    with get_session() as session:
+        _require_own_project_id(session, project_id, identity)
+        event = add_change_event(
+            session, project_id, title, cutoff,
+            description=(payload.description or "").strip() or None,
+            created_by="владелец",
+        )
+        _record_action(session, identity, "change_marked",
+                       f"Отметил изменение: {title}", project_id=project_id)
+        return {"ok": True, "id": event.id}
+
+
+@router.get("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
+async def list_project_changes(project_id: int, identity=Depends(require_admin)):
+    from app.models import ProjectChangeEvent
+
+    with get_session() as session:
+        _require_own_project_id(session, project_id, identity)
+        rows = session.exec(
+            select(ProjectChangeEvent)
+            .where(ProjectChangeEvent.project_id == project_id)
+            .order_by(ProjectChangeEvent.cutoff_at.desc())
+        ).all()
+        # База хранит время без часового пояса, но это UTC. Отдавать его
+        # «голым» нельзя: браузер прочитает такую строку как местное время
+        # и покажет выкатку на три часа раньше, чем она была.
+        return {"changes": [
+            {"id": r.id, "title": r.title, "description": r.description,
+             "at": _as_utc(r.cutoff_at).isoformat(), "by": r.created_by}
+            for r in rows
+        ]}
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+@router.get("/api/changes/{change_id}/effect", dependencies=[Depends(require_admin)])
+async def change_effect(change_id: int, identity=Depends(require_admin)):
+    """Что стало с воронкой после этой выкатки."""
+    from app.models import ProjectChangeEvent, utcnow
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        event = session.get(ProjectChangeEvent, change_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Изменение не найдено")
+        _require_own_project_id(session, event.project_id, identity)
+        stage_titles = load_stage_titles(session, event.project_id)
+
+        cutoff = _as_utc(event.cutoff_at)
+
+        def _snapshot(before=None, after=None):
+            query = (
+                select(MetricSnapshot)
+                .where(MetricSnapshot.project_id == event.project_id)
+                .where(MetricSnapshot.period_key == "7d")
+                .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+            )
+            if before is not None:
+                query = query.where(MetricSnapshot.created_at <= before)
+            if after is not None:
+                query = query.where(MetricSnapshot.created_at >= after)
+            order = MetricSnapshot.created_at.desc() if before is not None \
+                else MetricSnapshot.created_at.asc()
+            return session.exec(query.order_by(order)).first()
+
+        # «До» -- последний снимок, целиком лежащий до выкатки. «После» --
+        # первый снимок, чьё недельное окно началось уже после неё: иначе
+        # в одном окне смешаны старая и новая версии продукта, и разница
+        # показывает не изменение, а долю дней.
+        was = _snapshot(before=cutoff)
+        now = _snapshot(after=cutoff + timedelta(days=WINDOW_DAYS))
+
+        head = {"id": event.id, "title": event.title, "description": event.description,
+                "at": cutoff.isoformat()}
+
+        if was is None:
+            return {**head, "ok": False, "rows": [],
+                    "hint": "Снимка до этого изменения нет: аналитик начал наблюдать позже. "
+                            "Сравнивать не с чем."}
+        if now is None:
+            days_left = max(1, math.ceil(
+                (cutoff + timedelta(days=WINDOW_DAYS) - utcnow()).total_seconds() / 86400))
+            return {**head, "ok": False, "rows": [],
+                    "hint": f"Чистой недели после изменения ещё не набралось — осталось около "
+                            f"{days_left} дн. До этого срока в окне смешаны старая и новая версия."}
+
+        was_values = extract_normalized_metrics_from_snapshot(was)
+        now_values = extract_normalized_metrics_from_snapshot(now)
+
+    rows = []
+    for key in ("signup", "activation_1", "activation_2", "payment_started", "payment_success"):
+        now_v, was_v = now_values.get(key), was_values.get(key)
+        if now_v is None and was_v is None:
+            continue
+        rows.append(_compare_row(key, stage_titles.get(key, key), now_v, was_v))
+
+    return {
+        **head, "ok": True, "rows": rows,
+        "was_at": was.created_at.isoformat(), "now_at": now.created_at.isoformat(),
+        # Одна точка «до» и одна «после» -- это совпадение во времени, а не
+        # доказательство. Сказать это обязан сам экран: иначе владелец
+        # припишет изменению чужой результат и будет катить дальше вслепую.
+        "caution": "Это совпадение во времени, а не доказательство: в те же дни могли "
+                   "измениться реклама, сезон или что-то ещё. Чтобы проверить одну "
+                   "причину, запустите эксперимент — он держит остальное неизменным.",
+        "hint": None,
     }
 
 

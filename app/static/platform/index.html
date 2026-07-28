@@ -566,6 +566,29 @@
         он показывает выше.</p>
       <div id="actions-body">Загрузка…</div>
     </div>
+
+    <!-- Отметки выкаток. Аналитик не угадывает по излому графика, что и когда
+         выкатили: догадка тут хуже пустоты, на ней строится вывод «помогло». -->
+    <div class="card">
+      <h2>Что вы меняли в продукте</h2>
+      <p class="purpose" style="margin-top:0">Зачем: сравнение недель отвечает «стало лучше
+        или хуже», но не отвечает, помогло ли то, что вы сделали. Отметьте выкатку — и
+        аналитик сравнит чистую неделю после неё с неделей до. Знать о выкатке он может
+        только от вас.</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:220px">
+          <label>Что изменили</label>
+          <input id="change-title" placeholder="Переписал первый экран" style="margin-bottom:0">
+        </div>
+        <div>
+          <label>Когда <span class="muted">(пусто — значит сейчас)</span></label>
+          <input type="datetime-local" id="change-at" style="margin-bottom:0">
+        </div>
+        <button class="btn primary" id="change-add">Отметить</button>
+      </div>
+      <div class="muted" id="change-status" style="margin-top:8px"></div>
+      <div id="changes-body" style="margin-top:12px"></div>
+    </div>
   </div>
 
   <!-- ЛЕНТА -->
@@ -1756,8 +1779,90 @@ function fmtWhen(iso) {
   return d.toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
 }
 
+/* ---------------- Что вы меняли в продукте ---------------- */
+// Отметку ставит человек: аналитик не угадывает по излому графика, что и
+// когда выкатили. Догадка тут хуже пустоты -- на ней строится вывод «помогло».
+async function currentProjectId() {
+  if (window._activeProjectId) return window._activeProjectId;
+  const list = await api('/api/projects');
+  const chosen = (document.cookie.match(/(?:^|; )ga_platform_project=([^;]*)/) || [])[1];
+  const current = (chosen && list.find(p => String(p.id) === decodeURIComponent(chosen)))
+    || list.find(p => p.is_active) || list[0];
+  window._activeProjectId = current ? current.id : null;
+  return window._activeProjectId;
+}
+
+async function loadChanges() {
+  const box = $('changes-body');
+  box.innerHTML = skelLines(2);
+  try {
+    const id = await currentProjectId();
+    if (!id) { box.innerHTML = '<p class="muted">Сначала подключите проект.</p>'; return; }
+    const r = await api(`/api/projects/${id}/changes`);
+    if (!r.changes.length) {
+      box.innerHTML = '<p class="muted">Отметок пока нет. Отметьте ближайшую выкатку — '
+        + 'через неделю аналитик покажет, что изменилось в воронке после неё.</p>';
+      return;
+    }
+    box.innerHTML = r.changes.map(c => `<div class="item">
+      <div class="row" style="gap:8px">
+        <b>${esc(c.title)}</b>
+        <div style="flex:1"></div>
+        <span class="muted" style="white-space:nowrap">${esc(fmtWhen(c.at))}</span>
+      </div>
+      <div id="effect-${c.id}" class="muted" style="font-size:13px;margin-top:6px">Считаю…</div>
+    </div>`).join('');
+    r.changes.forEach(c => loadEffect(c.id));
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+async function loadEffect(changeId) {
+  const box = $('effect-' + changeId);
+  if (!box) return;
+  try {
+    const r = await api(`/api/changes/${changeId}/effect`);
+    if (!r.ok) { box.textContent = r.hint; return; }
+    const rows = r.rows.map(row => {
+      const sign = row.delta > 0 ? '+' : '';
+      const change = !row.reliable ? '—' : `${sign}${nf(row.delta)}`;
+      const color = !row.reliable ? 'var(--muted)'
+        : (row.delta > 0 ? 'var(--good)' : (row.delta < 0 ? 'var(--serious)' : 'var(--text-2)'));
+      return `<tr><td>${esc(row.title)}</td><td>${nf(row.was)} → ${nf(row.now)}</td>
+        <td style="color:${color};white-space:nowrap">${change}</td>
+        <td class="muted">${esc(row.verdict)}</td></tr>`;
+    }).join('');
+    // Предупреждение стоит под таблицей, а не в подсказке карточки: его
+    // должно быть видно рядом с цифрами, по которым делают вывод.
+    box.innerHTML = `<table class="stack"><tbody>${rows}</tbody></table>
+      <p class="muted" style="margin:8px 0 0">${esc(r.caution)}</p>`;
+  } catch (e) { if (e.message !== 'unauthorized') box.textContent = e.message; }
+}
+
+$('change-add').onclick = async () => {
+  const title = $('change-title').value.trim();
+  if (!title) { $('change-status').textContent = 'Напишите, что именно вы изменили.'; return; }
+  $('change-add').disabled = true;
+  try {
+    const id = await currentProjectId();
+    const raw = $('change-at').value;
+    // Поле datetime-local отдаёт местное время без пояса -- переводим в UTC
+    // сами, иначе выкатка уедет на разницу часовых поясов.
+    const at = raw ? new Date(raw).toISOString() : null;
+    await api(`/api/projects/${id}/changes`,
+              {method: 'POST', body: JSON.stringify({title, at})});
+    $('change-title').value = ''; $('change-at').value = '';
+    await loadChanges();
+    $('change-status').textContent = 'Отметил. Сравнение появится, когда после '
+      + 'изменения пройдёт чистая неделя.';
+  } catch (e) {
+    $('change-status').textContent = e.message;
+  } finally { $('change-add').disabled = false; }
+};
+
 async function loadHistory() {
   loadActions();
+  loadChanges();
   const box = $('history-body');
   box.innerHTML = skelLines(4);
   try {
