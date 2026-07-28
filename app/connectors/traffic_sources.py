@@ -184,6 +184,16 @@ def _aggregate_by_label(breakdown: dict[str, dict]) -> dict[str, dict]:
     return by_label
 
 
+def aggregate_by_label(breakdown: dict[str, dict]) -> dict[str, dict]:
+    """Публичная обёртка над группировкой по метке источника.
+
+    Платформа показывает те же источники на веб-экране, и метки обязаны
+    совпадать с текстовыми отчётами: «Яндекс.Директ» в одном месте и
+    `yandex_direct` в другом — это для владельца два разных источника.
+    """
+    return _aggregate_by_label(breakdown)
+
+
 def format_source_breakdown(breakdown: dict[str, dict] | None, total_pp: dict | None) -> str:
     """
     Форматирует source breakdown для /funnel или /today.

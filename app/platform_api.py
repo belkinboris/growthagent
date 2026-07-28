@@ -1347,6 +1347,140 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Когорты по источнику: доходят ли до оплаты по-разному (D3)
+# ---------------------------------------------------------------------------
+#
+# Суммарная воронка отвечает «сколько людей теряется», но не отвечает
+# «кого мы приводим». Источник, который даёт много регистраций и ноль
+# оплат, в общей сумме выглядит как польза: он поднимает верх воронки
+# и топит конверсию, а виноватым кажется продукт.
+#
+# Разбивку присылает сам продукт (`source_breakdown` в разборе пути до
+# оплаты) -- аналитик не додумывает источник за него: пометить человека
+# каналом может только тот, кто видел, откуда человек пришёл.
+
+# Доля оплат на маленьком числе пришедших -- случайность: один оплативший
+# из трёх даёт «33%», которые завтра станут нулём. Порог выше, чем в
+# сравнении недель (там считаются события, здесь -- доля от людей).
+SOURCE_MIN_SAMPLE = 10
+
+# Поле продукта → ключ воронки. Названия шагов берём общие, чтобы экран
+# источников звал их так же, как остальные экраны.
+_SOURCE_FIELDS = (
+    ("registrations", "signup"),
+    ("channels_created", "activation_1"),
+    ("payment_started", "payment_started"),
+    ("payment_success", "payment_success"),
+)
+
+
+@router.get("/api/sources", dependencies=[Depends(require_admin)])
+async def sources_cohorts(identity=Depends(require_admin)):
+    """Кто приходит из каждого канала и доходит ли до оплаты."""
+    from app.connectors.traffic_sources import aggregate_by_label, parse_source_breakdown
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+
+    titles = {key: stage_titles.get(key, key) for _, key in _SOURCE_FIELDS}
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False, "sources": [], "titles": titles, "summary": None, "checked_at": None,
+            "hint": "Разбор пути до оплаты ещё не собирался. Разбивка по источникам "
+                    "появится после первого полного цикла сбора.",
+        }
+
+    breakdown = parse_source_breakdown(cached.result_json or {})
+    checked_at = cached.created_at.isoformat() if cached.created_at else None
+    if not breakdown:
+        return {
+            "ok": False, "sources": [], "titles": titles, "summary": None,
+            "checked_at": checked_at,
+            # Честно называем, чего не хватает и на чьей стороне это чинится:
+            # источник знает только продукт, аналитик его не угадает.
+            "hint": "Продукт не присылает разбивку по источникам, поэтому все люди "
+                    "лежат в одной куче. Чтобы она появилась, сохраняйте utm_source "
+                    "(или start-параметр бота) при регистрации и отдавайте поле "
+                    "source_breakdown в ответе /api/internal/payment-path-diagnostics — "
+                    "формат описан в CONTRACT.md.",
+        }
+
+    rows = [_source_row(label, data) for label, data in aggregate_by_label(breakdown).items()]
+    # Сверху -- те, кто привёл больше людей: с них и начинается разговор.
+    rows.sort(key=lambda r: (-(r["signup"] or 0), r["label"]))
+
+    return {
+        "ok": True, "sources": rows, "titles": titles,
+        "summary": _sources_summary(rows),
+        "checked_at": checked_at,
+        "hint": None if rows else "За последнюю неделю из источников не пришёл никто.",
+    }
+
+
+def _source_row(label: str, data: dict) -> dict:
+    """Одна когорта. Долю оплат считаем только там, где она что-то значит."""
+    values = {key: (data.get(field) or 0) for field, key in _SOURCE_FIELDS}
+    came = values["signup"]
+    paid = values["payment_success"]
+    reliable = came >= SOURCE_MIN_SAMPLE
+
+    if not reliable:
+        note = (f"Пришло {came} — доля оплат на таких числах случайна."
+                if came else "Из этого канала пока никто не пришёл.")
+    elif paid == 0:
+        note = f"Из {came} до оплаты не дошёл никто."
+    else:
+        note = f"Оплатили {paid} из {came}."
+
+    return {
+        "label": label,
+        **values,
+        # Процент прячем, а не показываем серым: увиденное число остаётся
+        # в голове, даже когда рядом написано «не верьте ему».
+        "conversion": round(paid / came * 100, 1) if reliable and came else None,
+        "reliable": reliable,
+        "note": note,
+    }
+
+
+def _sources_summary(rows: list[dict]) -> str:
+    """Вывод словами. Аналитик называет разницу только когда она есть
+    на достаточных числах -- и не советует «отключить канал»: решение
+    про рекламу принимает человек."""
+    reliable = [r for r in rows if r["reliable"]]
+    if not rows:
+        return "Данных по источникам за эту неделю нет."
+    if len(reliable) < 2:
+        enough = f"хотя бы {SOURCE_MIN_SAMPLE} человек"
+        if not reliable:
+            return f"Сравнивать источники ещё рано: ни из одного не пришло {enough}."
+        return (f"Сравнивать не с чем: {enough} пришло только из одного канала "
+                f"«{reliable[0]['label']}».")
+
+    if all(r["payment_success"] == 0 for r in reliable):
+        return "До оплаты не дошёл никто ни из одного канала — сравнивать пока нечего."
+
+    best = max(reliable, key=lambda r: r["conversion"])
+    worst = min(reliable, key=lambda r: r["conversion"])
+    if best["conversion"] == worst["conversion"]:
+        return "Разницы между источниками не видно: доходят до оплаты одинаково."
+    return (f"Лучше всех доходит до оплаты «{best['label']}»: {_percent(best['conversion'])} "
+            f"из {best['signup']}. Хуже всех «{worst['label']}»: {_percent(worst['conversion'])} "
+            f"из {worst['signup']}. Что с этим делать — решать вам: "
+            f"аналитик рекламу не трогает.")
+
+
+def _percent(value: float) -> str:
+    """«10%», а не «10.0%»: в таблице рядом стоит то же число, и два разных
+    написания одной цифры выглядят как две разные цифры."""
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "%"
+
+
 @router.get("/api/ads/negative-keywords", dependencies=[Depends(require_admin)])
 async def negative_keywords(identity=Depends(require_admin)):
     """

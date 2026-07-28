@@ -240,6 +240,11 @@
     table.stack tr{border-bottom:1px solid var(--border);padding:12px 0}
     table.stack tr:last-child{border-bottom:none}
     table.stack td{border:none;padding:3px 0}
+    /* На телефоне строка разворачивается в столбик, и числа остаются без
+       заголовка -- «40 / 4 / 10%» не читается. Подпись переезжает внутрь
+       ячейки, а шапка убирается: иначе она висит отдельным непонятным блоком. */
+    table.stack thead{display:none}
+    table.stack td[data-label]::before{content:attr(data-label) ": ";color:var(--muted)}
   }
 </style>
 </head>
@@ -465,6 +470,19 @@
         посчитанными тем же способом. Где событий мало, аналитик говорит об этом словами
         и не показывает проценты: на двух событиях «рост вдвое» — это шум.</p>
       <div id="compare-body"></div>
+    </div>
+
+    <!-- Когорты по источнику. Канал с нулём оплат в общей сумме выглядит
+         пользой: он поднимает верх воронки и топит конверсию, а виноватым
+         кажется продукт. -->
+    <div class="card">
+      <h2>Откуда приходят те, кто платит<span class="spacer"></span>
+        <span class="muted" id="sources-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: суммарная воронка не показывает,
+        кого именно приводит каждый канал. Здесь видно, доходят ли до оплаты пришедшие
+        из разных источников по-разному. Долю оплат аналитик считает только там,
+        где людей достаточно; правки в рекламе делает человек сам.</p>
+      <div id="sources-body"></div>
     </div>
 
     <div class="card">
@@ -1022,6 +1040,7 @@ async function loadOverview() {
     renderFunnel($('funnel-window').value);
     renderDynamics(d);
     loadCompare();
+    loadSources();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
@@ -1456,6 +1475,38 @@ async function loadCompare() {
         <td class="muted">${esc(row.verdict)}</td>
       </tr>`;
     }).join('') + '</tbody></table>';
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+/* ---------------- Источники: кто доходит до оплаты ---------------- */
+async function loadSources() {
+  const box = $('sources-body');
+  box.innerHTML = skelLines(3);
+  $('sources-when').textContent = '';
+  try {
+    const r = await api('/api/sources');
+    if (!r.ok) {
+      // «Цикла ещё не было» и «продукт не присылает источник» -- разные
+      // состояния: во втором надо не ждать, а дописать поле у себя.
+      box.innerHTML = `<p class="muted">${esc(r.hint || 'Данных по источникам нет.')}</p>`;
+      return;
+    }
+    if (r.checked_at) $('sources-when').textContent =
+      'по данным на ' + r.checked_at.slice(0, 10).split('-').reverse().slice(0, 2).join('.');
+    const t = r.titles;
+    const head = `<tr><th>Источник</th><th>${esc(t.signup)}</th>` +
+      `<th>${esc(t.payment_success)}</th><th>Доля оплат</th><th></th></tr>`;
+    box.innerHTML = '<table class="stack"><thead>' + head + '</thead><tbody>' +
+      r.sources.map(s => `<tr>
+        <td><b>${esc(s.label)}</b></td>
+        <td data-label="${esc(t.signup)}">${nf(s.signup)}</td>
+        <td data-label="${esc(t.payment_success)}">${nf(s.payment_success)}</td>
+        <td data-label="Доля оплат">${s.conversion == null ? '<span class="muted">—</span>'
+          : s.conversion + '%'}</td>
+        <td class="muted">${esc(s.note)}</td>
+      </tr>`).join('') + '</tbody></table>' +
+      `<p class="purpose" style="margin-bottom:0">${esc(r.summary)}</p>`;
   } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
     `<p class="error-text">${esc(e.message)}</p>`; }
 }
