@@ -111,6 +111,9 @@ class ProjectCreateRequest(BaseModel):
 
 class ProjectUpdateRequest(BaseModel):
     name: Optional[str] = None
+    # Кому слать уведомления по этому проекту (Telegram chat id). Пусто --
+    # значит, канал не настроен: см. app/notify_targets.py.
+    notify_chat_ids: Optional[list[str]] = None
     base_url: Optional[str] = None
     internal_api_token: Optional[str] = None
     type: Optional[str] = None
@@ -1484,6 +1487,7 @@ def _project_to_dict(p: Project) -> dict:
         "funnel_mapping": sj.get("funnel_mapping") or {},
         "metrika_counter_id": sj.get("metrika_counter_id"),
         "direct_client_login": sj.get("direct_client_login"),
+        "notify_chat_ids": sj.get("notify_chat_ids") or [],
         "created_at": p.created_at.isoformat(),
     }
 
@@ -1566,6 +1570,10 @@ async def update_project(project_id: int, body: ProjectUpdateRequest, identity=D
             sj["metrika_counter_id"] = body.metrika_counter_id
         if body.direct_client_login is not None:
             sj["direct_client_login"] = body.direct_client_login
+        if body.notify_chat_ids is not None:
+            # Пустой список -- осознанный выбор «не слать никуда», а не
+            # ошибка: платформа тогда молчит и говорит об этом в интерфейсе.
+            sj["notify_chat_ids"] = [str(c).strip() for c in body.notify_chat_ids if str(c).strip()]
         project.settings_json = sj
 
         session.add(project)

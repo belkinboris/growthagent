@@ -573,6 +573,20 @@
     </div>
 
     <div class="card">
+      <h2>Куда слать уведомления</h2>
+      <p class="purpose" style="margin-top:0">Зачем: утренняя сводка и важные сигналы
+        приходят в Telegram. Адресат — у каждого проекта свой: сводка по вашему проекту
+        не должна уходить владельцу платформы. Chat id можно узнать у бота
+        <code>@userinfobot</code>; несколько — через запятую.</p>
+      <label>Telegram chat id</label>
+      <input id="notify-ids" placeholder="например 123456789">
+      <div class="row" style="margin-top:4px">
+        <button class="btn primary sm" id="notify-save">Сохранить</button>
+        <span class="muted" id="notify-status"></span>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Названия событий в ленте<span class="spacer"></span>
         <button class="btn sm" id="events-ai">Предложить названия</button></h2>
       <p class="purpose" style="margin-top:0">Зачем: шаги воронки у аналитика одни и те же,
@@ -1291,6 +1305,24 @@ $('stages-ai').onclick = async () => {
   } catch (e) { $('stages-status').textContent = e.message; }
 };
 
+/* ---------------- Адресаты уведомлений ---------------- */
+$('notify-save').onclick = async () => {
+  const id = window._activeProjectId;
+  if (!id) return;
+  const ids = $('notify-ids').value.split(',').map(v => v.trim()).filter(Boolean);
+  $('notify-status').textContent = 'Сохраняю…';
+  try {
+    await api(`/api/projects/${id}`, {method:'PATCH', body: JSON.stringify({notify_chat_ids: ids})});
+    // Список перечитываем ДО показа подтверждения: loadProjects заново
+    // выставляет строку состояния, и подтверждение, показанное раньше,
+    // тут же затиралось.
+    await loadProjects();
+    $('notify-status').textContent = ids.length
+      ? `Сохранено: ${ids.length} получател${ids.length === 1 ? 'ь' : 'я'}.`
+      : 'Сохранено: уведомления по этому проекту отправляться не будут.';
+  } catch (e) { $('notify-status').textContent = e.message; }
+};
+
 /* ---------------- Названия событий ленты ---------------- */
 async function loadEventTypes(projectId) {
   showSkeleton('events-body', skelLines(3, 'tall'));
@@ -1677,7 +1709,16 @@ async function loadProjects() {
     const current = (chosen && list.find(p => String(p.id) === decodeURIComponent(chosen)))
       || list.find(p => p.is_active) || list[0];
     window._activeProjectId = current ? current.id : null;
-    if (current) { loadStages(current.id); loadEventTypes(current.id); }
+    if (current) {
+      loadStages(current.id); loadEventTypes(current.id);
+      const ids = current.notify_chat_ids || [];
+      $('notify-ids').value = ids.join(', ');
+      // Пустое поле -- это не «ещё не загрузилось», а «уведомления никуда
+      // не уходят». Говорим об этом прямо, иначе владелец будет думать,
+      // что сводка приходит.
+      $('notify-status').textContent = ids.length
+        ? '' : 'Пока не задано — уведомления по этому проекту не отправляются.';
+    }
     else {
       $('stages-body').innerHTML =
         '<p class="muted">Сначала подключите проект и включите по нему сбор.</p>';

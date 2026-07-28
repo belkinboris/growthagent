@@ -1427,9 +1427,13 @@ def is_quiet_hour(settings, now_utc_hour: int | None = None) -> bool:
     return now_utc_hour >= start or now_utc_hour < end
 
 
-async def _send_telegram_notification(settings, text: str) -> bool:
-    """Общий helper отправки уведомления всем admin chat_ids. Не кидает исключений.
-    Пробует HTML (<b>жирный</b>); при ошибке парсинга откатывается к plain."""
+async def _send_telegram_notification(settings, text: str, chat_ids: list[str] | None = None) -> bool:
+    """Общий helper отправки уведомления. Не кидает исключений.
+    Пробует HTML (<b>жирный</b>); при ошибке парсинга откатывается к plain.
+
+    chat_ids задаётся явно, когда адресат зависит от проекта (см.
+    notify_targets.py): переменная окружения -- канал того, кто ставил
+    платформу, и слать туда сводку клиента нельзя."""
     import re
     import httpx
     if is_quiet_hour(settings):
@@ -1438,8 +1442,9 @@ async def _send_telegram_notification(settings, text: str) -> bool:
     api_url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
     plain = re.sub(r"</?(b|i|code|u|s)>", "", text)
     ok_any = False
+    targets = chat_ids if chat_ids is not None else settings.admin_chat_ids_list
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for chat_id in settings.admin_chat_ids_list:
+        for chat_id in targets:
             try:
                 resp = await client.post(api_url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
                 if resp.status_code != 200:
@@ -1896,6 +1901,111 @@ def stop_scheduler() -> None:
 DAILY_BOARD_EVENT_TYPE = "daily_board"
 
 
+async def _send_daily_board_for_project(
+    project_id: int,
+    day: str,
+    event_key: str,
+    force: bool,
+    *,
+    send,
+    session_factory,
+    settings,
+) -> bool:
+    """Утренняя сводка по одному проекту. Вынесено из send_daily_board,
+    когда сводка стала отправляться по всем включённым проектам."""
+    from app import growth_loop
+    from app.commercial_report import (
+        build_board_report,
+        build_daily_board_message,
+        build_morning_story,
+        experiment_one_liner,
+    )
+    from app.notify_targets import project_chat_ids
+    from app.service import (
+        claim_notification,
+        load_daily_counters_history,
+        mark_notified,
+        release_notification_claim,
+        save_daily_counters,
+        was_notified,
+    )
+
+    with session_factory() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            return False
+
+        # Адресата определяем ДО сборки отчёта: если слать некому, незачем
+        # и считать, а главное -- нельзя отправить сводку клиента владельцу
+        # платформы (переменная окружения -- его личный канал).
+        chat_ids, reason = project_chat_ids(session, project, settings)
+        if not chat_ids:
+            logger.info("Daily board skipped (project=%s): %s", project_id, reason)
+            return False
+
+        if not force and was_notified(session, project.id, event_key):
+            return False
+
+        # Заявка ДО отправки: между was_notified и mark_notified проходят
+        # секунды (сборка отчёта + запрос в Telegram), и второй процесс
+        # успевал проскочить проверку — владелец получал два одинаковых
+        # письма. Вставка с уникальным индексом атомарна: шлёт тот, кто
+        # её выиграл.
+        if not force and not claim_notification(session, project.id, event_key):
+            logger.info("Daily board: заявку уже взял другой процесс, молчим")
+            return False
+
+        pp_cached = get_cached_diagnostics(
+            session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY
+        )
+        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+
+        # Точка динамики за сегодня -- ДО чтения истории, чтобы сводка
+        # включала сегодняшний день. Идемпотентно на день.
+        save_daily_counters(session, project.id, pp_dict, day)
+        history = load_daily_counters_history(session, project.id, days=7)
+
+        # Состояние цикла -> строка эксперимента + что нужно от владельца.
+        experiment_line = None
+        owner_action = "ничего — копим данные."
+        running = growth_loop.get_running_experiment(session, project.id)
+        rec = growth_loop.get_active_recommendation(session, project.id)
+        if running is not None:
+            progress = growth_loop.experiment_progress(running, pp_dict)
+            experiment_line = experiment_one_liner(running, progress)
+            owner_action = "ничего — эксперимент копит данные, не менять запертые переменные."
+        elif rec is not None:
+            experiment_line = f"Ждёт твоего решения: «{rec.title}»."
+            owner_action = "открыть /board и нажать Принять / Отклонить."
+        else:
+            last = growth_loop.get_last_finished_experiment(session, project.id)
+            if last is not None and last.ended_at is not None:
+                experiment_line = f"Последний вердикт: {last.verdict} — «{last.title}»."
+
+        story = build_morning_story(history, experiment_line, owner_action)
+        board_text = build_board_report(
+            project.name,
+            None,  # NormalizedMetrics не обязателен: регистрации берём из payment_path
+            payment_path=pp_dict,
+            new_registrations_since_deploy=(pp_dict or {}).get("registrations"),
+            skip_decision=True,  # рассказ выше уже сказал, что происходит
+        )
+        text = story + "\n\n" + build_daily_board_message(board_text, history)
+
+    sent_ok = await send(settings, text, chat_ids)
+    with session_factory() as session:
+        if sent_ok and not force:
+            mark_notified(
+                session, project_id, event_key, DAILY_BOARD_EVENT_TYPE,
+                payload={"day": day},
+            )
+        elif not sent_ok and not force:
+            # Отправка не удалась — заявку отпускаем, иначе сводка за этот
+            # день не уйдёт уже никогда.
+            release_notification_claim(session, project_id, event_key)
+    return bool(sent_ok)
+
+
 async def send_daily_board(
     force: bool = False,
     *,
@@ -1950,76 +2060,29 @@ async def send_daily_board(
         day = datetime.now(timezone.utc).date().isoformat()
         event_key = f"{DAILY_BOARD_EVENT_TYPE}:{day}"
 
+        # Сводка шлётся по КАЖДОМУ включённому проекту, а не по первому:
+        # у каждого проекта свой владелец и свой адресат (см. B7 и B8).
         with session_factory() as session:
-            project = session.exec(
-                select(Project).where(Project.is_active == True)  # noqa: E712
-            ).first()
-            if project is None:
-                logger.info("Daily board skipped: no active project")
-                return False
+            project_ids = [
+                int(r) for r in session.exec(
+                    select(Project.id).where(Project.is_active == True).order_by(Project.id)  # noqa: E712
+                ).all()
+            ]
+        if not project_ids:
+            logger.info("Daily board skipped: no active project")
+            return False
 
-            if not force and was_notified(session, project.id, event_key):
-                return False
-
-            # Заявка ДО отправки: между was_notified и mark_notified проходят
-            # секунды (сборка отчёта + запрос в Telegram), и второй процесс
-            # успевал проскочить проверку — владелец получал два одинаковых
-            # письма. Вставка с уникальным индексом атомарна: шлёт тот, кто
-            # её выиграл.
-            if not force and not claim_notification(session, project.id, event_key):
-                logger.info("Daily board: заявку уже взял другой процесс, молчим")
-                return False
-
-            pp_cached = get_cached_diagnostics(
-                session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY
-            )
-            pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
-
-            # Точка динамики за сегодня -- ДО чтения истории, чтобы сводка
-            # включала сегодняшний день. Идемпотентно на день.
-            save_daily_counters(session, project.id, pp_dict, day)
-            history = load_daily_counters_history(session, project.id, days=7)
-
-            # Состояние цикла -> строка эксперимента + что нужно от владельца.
-            experiment_line = None
-            owner_action = "ничего — копим данные."
-            running = growth_loop.get_running_experiment(session, project.id)
-            rec = growth_loop.get_active_recommendation(session, project.id)
-            if running is not None:
-                progress = growth_loop.experiment_progress(running, pp_dict)
-                experiment_line = experiment_one_liner(running, progress)
-                owner_action = "ничего — эксперимент копит данные, не менять запертые переменные."
-            elif rec is not None:
-                experiment_line = f"Ждёт твоего решения: «{rec.title}»."
-                owner_action = "открыть /board и нажать Принять / Отклонить."
-            else:
-                last = growth_loop.get_last_finished_experiment(session, project.id)
-                if last is not None and last.ended_at is not None:
-                    experiment_line = f"Последний вердикт: {last.verdict} — «{last.title}»."
-
-            story = build_morning_story(history, experiment_line, owner_action)
-            board_text = build_board_report(
-                project.name,
-                None,  # NormalizedMetrics не обязателен: регистрации берём из payment_path
-                payment_path=pp_dict,
-                new_registrations_since_deploy=(pp_dict or {}).get("registrations"),
-                skip_decision=True,  # рассказ выше уже сказал, что происходит
-            )
-            text = story + "\n\n" + build_daily_board_message(board_text, history)
-            project_id = project.id
-
-        sent_ok = await send(settings, text)
-        with session_factory() as session:
-            if sent_ok and not force:
-                mark_notified(
-                    session, project_id, event_key, DAILY_BOARD_EVENT_TYPE,
-                    payload={"day": day},
-                )
-            elif not sent_ok and not force:
-                # Отправка не удалась — заявку отпускаем, иначе сводка за этот
-                # день не уйдёт уже никогда.
-                release_notification_claim(session, project_id, event_key)
-        return bool(sent_ok)
+        sent_any = False
+        for project_id in project_ids:
+            try:
+                sent_any = await _send_daily_board_for_project(
+                    project_id, day, event_key, force,
+                    send=send, session_factory=session_factory, settings=settings,
+                ) or sent_any
+            except Exception:
+                # Чужой проект не должен лишать сводки остальных.
+                logger.exception("Daily board failed (project=%s)", project_id)
+        return sent_any
     except Exception:
         logger.exception("Daily board failed")
         return False
