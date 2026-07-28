@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import select
@@ -1484,11 +1484,12 @@ class ChangeIn(BaseModel):
     at: str | None = None  # ISO-время; пусто -- значит «только что»
 
 
-@router.post("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
-async def add_project_change(project_id: int, payload: ChangeIn, identity=Depends(require_admin)):
-    """Владелец отмечает: «я выкатил X тогда-то»."""
+def _parse_change_payload(payload: ChangeIn) -> tuple[str, datetime]:
+    """Общая проверка для отметки об изменении -- одна и та же что для
+    владельца в интерфейсе, что для машины через входящий API (D7):
+    правило честности («дата не в будущем») не должно зависеть от того,
+    кто именно поставил отметку."""
     from app.models import utcnow
-    from app.service import add_change_event
 
     title = (payload.title or "").strip()
     if not title:
@@ -1506,6 +1507,15 @@ async def add_project_change(project_id: int, payload: ChangeIn, identity=Depend
     # такой отметке потом молча покажет пустоту вместо ошибки.
     if cutoff > utcnow() + timedelta(minutes=5):
         raise HTTPException(status_code=400, detail="Дата изменения — в будущем")
+    return title, cutoff
+
+
+@router.post("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
+async def add_project_change(project_id: int, payload: ChangeIn, identity=Depends(require_admin)):
+    """Владелец отмечает: «я выкатил X тогда-то»."""
+    from app.service import add_change_event
+
+    title, cutoff = _parse_change_payload(payload)
 
     with get_session() as session:
         _require_own_project_id(session, project_id, identity)
@@ -1516,6 +1526,74 @@ async def add_project_change(project_id: int, payload: ChangeIn, identity=Depend
         )
         _record_action(session, identity, "change_marked",
                        f"Отметил изменение: {title}", project_id=project_id)
+        return {"ok": True, "id": event.id}
+
+
+# ---------------------------------------------------------------------------
+# Вход для машины (D7): продукт или соседний агент сообщает о выкатке сам
+# ---------------------------------------------------------------------------
+#
+# До сих пор отметку мог поставить только человек руками -- удобно один
+# раз, но при частых релизах владелец либо забывает отмечать, либо
+# перестаёт это делать вовсе, и сравнение «до/после» остаётся неполным.
+#
+# Токен отдельный от `internal_api_token` (тем платформа ХОДИТ В продукт),
+# здесь наоборот -- продукт стучится В платформу, и это другое направление
+# доверия: чужой скрипт деплоя не должен получить доступ ни к чему, кроме
+# права поставить одну отметку. Хранится не сам токен, а его хэш (тем же
+# pbkdf2, что и пароли) -- утечка базы не должна означать утечку токенов.
+
+INBOUND_TOKEN_KEY = "inbound_token_hash"
+
+
+@router.post("/api/projects/{project_id}/inbound-token", dependencies=[Depends(require_admin)])
+async def rotate_inbound_token(project_id: int, identity=Depends(require_admin)):
+    """Выпускает новый токен для входящих отметок об изменениях, старый
+    (если был) перестаёт работать. Показывается один раз -- как обычно
+    для секретов, платформа хранит только хэш и не может показать снова."""
+    import secrets
+
+    from app import accounts
+
+    token = secrets.token_urlsafe(32)
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project.settings_json = {**(project.settings_json or {}), INBOUND_TOKEN_KEY: accounts.hash_password(token)}
+        session.add(project)
+        session.commit()
+        _record_action(session, identity, "inbound_token_rotated",
+                       "Выпустил новый токен для автоматических отметок об изменениях",
+                       project_id=project_id)
+
+    return {"ok": True, "token": token,
+            "hint": "Сохраните сейчас — второй раз показать не сможем."}
+
+
+@router.post("/api/public/projects/{project_id}/changes")
+async def add_project_change_public(project_id: int, payload: ChangeIn, authorization: str | None = Header(default=None)):
+    """Публичный (не требует входа владельца) вход для машины: продукт
+    сам сообщает о выкатке. Проверяется токеном проекта, не сессией."""
+    from app import accounts
+    from app.service import add_change_event
+
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужен заголовок Authorization: Bearer <токен>")
+
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        stored_hash = (project.settings_json or {}).get(INBOUND_TOKEN_KEY)
+        if not stored_hash or not accounts.verify_password(token, stored_hash):
+            raise HTTPException(status_code=401, detail="Неверный токен")
+
+        title, cutoff = _parse_change_payload(payload)
+        event = add_change_event(
+            session, project_id, title, cutoff,
+            description=(payload.description or "").strip() or None,
+            created_by="продукт (автоматически)",
+        )
         return {"ok": True, "id": event.id}
 
 

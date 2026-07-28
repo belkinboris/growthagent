@@ -589,6 +589,18 @@
       <div class="muted" id="change-status" style="margin-top:8px"></div>
       <div id="changes-body" style="margin-top:12px"></div>
     </div>
+
+    <!-- Вход для машины (D7): чтобы отметку не забывали ставить руками при
+         частых релизах, продукт может сообщать о выкатке сам. -->
+    <div class="card">
+      <h2>Автоматические отметки об изменениях</h2>
+      <p class="purpose" style="margin-top:0">Зачем: если выкатки частые, отметку
+        руками легко забыть — а без неё сравнение «до/после» неполное. Скрипт деплоя
+        вашего продукта может присылать отметку сам, одним запросом. Токен даёт право
+        только на это — доступа к данным он не открывает.</p>
+      <button class="btn sm" id="inbound-token-btn">Выпустить токен</button>
+      <div id="inbound-token-body" style="margin-top:10px"></div>
+    </div>
   </div>
 
   <!-- ЛЕНТА -->
@@ -1582,6 +1594,32 @@ async function loadReadiness() {
     `<p class="error-text">${esc(e.message)}</p>`; }
 }
 
+/* ---------------- Автоматические отметки об изменениях (D7) ---------------- */
+$('inbound-token-btn').onclick = async () => {
+  const btn = $('inbound-token-btn');
+  const box = $('inbound-token-body');
+  // Выпуск токена отзывает предыдущий -- предупреждаем до запроса, а не
+  // после: отменить уже нельзя.
+  if (btn.textContent === 'Выпустить токен' && box.dataset.issued === '1'
+      && !confirm('Прошлый токен перестанет работать. Выпустить новый?')) return;
+  btn.disabled = true;
+  try {
+    const id = await currentProjectId();
+    const r = await api(`/api/projects/${id}/inbound-token`, {method: 'POST'});
+    box.dataset.issued = '1';
+    box.innerHTML = `
+      <p class="muted">${esc(r.hint)}</p>
+      <pre class="code">${esc(r.token)}</pre>
+      <p class="purpose" style="margin:8px 0 0">Отправляйте POST на
+        <code>${esc(location.origin)}/growth/api/public/projects/${id}/changes</code>
+        с заголовком <code>Authorization: Bearer ${esc(r.token)}</code> и телом
+        <code>{"title": "что изменили"}</code> при каждом релизе.</p>`;
+    btn.textContent = 'Выпустить новый (старый перестанет работать)';
+  } catch (e) {
+    if (e.message !== 'unauthorized') box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+  } finally { btn.disabled = false; }
+};
+
 /* ---------------- Минус-фразы ---------------- */
 // Список берём из последней глубокой проверки, новую не запускаем: она
 // тяжёлая (до минуты), и открытие вкладки не должно её заказывать.
@@ -1817,7 +1855,7 @@ async function loadChanges() {
       <div class="row" style="gap:8px">
         <b>${esc(c.title)}</b>
         <div style="flex:1"></div>
-        <span class="muted" style="white-space:nowrap">${esc(fmtWhen(c.at))}</span>
+        <span class="muted" style="white-space:nowrap">${esc(fmtWhen(c.at))} · ${esc(c.by)}</span>
       </div>
       <div id="effect-${c.id}" class="muted" style="font-size:13px;margin-top:6px">Считаю…</div>
     </div>`).join('');
