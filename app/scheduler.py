@@ -1574,6 +1574,51 @@ async def _notify_project(project: "Project", settings, text: str) -> bool:
     return await _send_telegram_notification(settings, text, chat_ids)
 
 
+async def _notify_once(
+    project: "Project",
+    settings,
+    event_key: str,
+    event_type: str,
+    text: str,
+    user_id: str | None = None,
+) -> bool:
+    """Одно событие -- одно уведомление, даже если процессов два.
+
+    Раньше здесь было «проверил was_notified -- отправил -- записал». Между
+    проверкой и записью проходит запрос в Telegram, и второй процесс
+    (два воркера, наложение деплоя) успевал проскочить проверку: владелец
+    получал дубль. Ровно так дублировалась ежедневная сводка 27.07.2026 --
+    там это уже закрыто заявкой, здесь оставалось то же окно.
+
+    Заявка ставится ДО отправки: вставка с уникальным индексом атомарна,
+    шлёт тот, кто её выиграл. Не отправилось -- заявку снимаем, иначе
+    уведомление не уйдёт уже никогда.
+    """
+    from app.service import (
+        claim_notification,
+        mark_notified,
+        release_notification_claim,
+        was_notified,
+    )
+
+    with get_session() as session:
+        if was_notified(session, project.id, event_key):
+            return False
+        if not claim_notification(session, project.id, event_key):
+            logger.info("Уведомление уже взял другой процесс (project=%s, key=%s)",
+                        project.id, event_key)
+            return False
+
+    sent_ok = await _notify_project(project, settings, text)
+
+    with get_session() as session:
+        if sent_ok:
+            mark_notified(session, project.id, event_key, event_type, user_id=user_id)
+        else:
+            release_notification_claim(session, project.id, event_key)
+    return bool(sent_ok)
+
+
 async def _notify_from_events(project: Project, settings, events: list[dict], alert_mode: str) -> None:
     """
     Founder Live Feed (v2): дискретные события с dedup по event_id.
@@ -1607,13 +1652,8 @@ async def _notify_from_events(project: Project, settings, events: list[dict], al
         digest_text = format_feed_digest(relevant)
         digest_signature = "-".join(sorted(e.get("event_id", "") for e in relevant))[:200]
         event_key = f"feed_digest:{project.id}:{hash(digest_signature)}"
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                return
-            sent_ok = await _notify_project(project, settings, digest_text)
-            if sent_ok:
-                mark_notified(session, project.id, event_key, "feed_digest")
-                logger.info("Live notification sent: feed digest (project_id=%s, count=%s)", project.id, len(relevant))
+        if await _notify_once(project, settings, event_key, "feed_digest", digest_text):
+            logger.info("Live notification sent: feed digest (project_id=%s, count=%s)", project.id, len(relevant))
         return
 
     # Батч-проверка dedup одним запросом
@@ -1634,16 +1674,14 @@ async def _notify_from_events(project: Project, settings, events: list[dict], al
         text = format_feed_event(event)
         if text is None:
             continue
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                continue  # защита от гонки
-            sent_ok = await _notify_project(project, settings, text)
-            if sent_ok:
-                mark_notified(session, project.id, event_key, event.get("event_type", "user_event"), user_id=event.get("user_key"))
-                logger.info(
-                    "Live notification sent: %s (project_id=%s, user_key=%s)",
-                    event.get("event_type"), project.id, event.get("user_key"),
-                )
+        if await _notify_once(
+            project, settings, event_key,
+            event.get("event_type", "user_event"), text, user_id=event.get("user_key"),
+        ):
+            logger.info(
+                "Live notification sent: %s (project_id=%s, user_key=%s)",
+                event.get("event_type"), project.id, event.get("user_key"),
+            )
 
 
 async def _notify_from_journeys(project: Project, settings, journeys: list[dict]) -> None:
@@ -1672,13 +1710,8 @@ async def _notify_from_journeys(project: Project, settings, journeys: list[dict]
         )
         digest_signature = "-".join(sorted(j.get("user_key", "") for j in journeys))[:200]
         event_key = f"journey_digest:{project.id}:{hash(digest_signature)}"
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                return
-            sent_ok = await _notify_project(project, settings, digest_text)
-            if sent_ok:
-                mark_notified(session, project.id, event_key, "journey_digest")
-                logger.info("Live notification sent: journey digest (project_id=%s, count=%s)", project.id, len(journeys))
+        if await _notify_once(project, settings, event_key, "journey_digest", digest_text):
+            logger.info("Live notification sent: journey digest (project_id=%s, count=%s)", project.id, len(journeys))
         return
 
     # Не дайджест -- проверяем какие event_key уже отправлены, одним запросом
@@ -1711,18 +1744,13 @@ async def _notify_from_journeys(project: Project, settings, journeys: list[dict]
     pending = build_journey_notifications(journeys, already_notified)
 
     for event_key, text in pending:
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                continue  # на случай гонки между чтением candidate_keys и отправкой
-            sent_ok = await _notify_project(project, settings, text)
-            if sent_ok:
-                # event_type для NotificationLog -- извлекаем из event_key
-                # (формат journey:<user_key>:<step>:<ts>), без user_id PII в event_type поле
-                parts = event_key.split(":")
-                step = parts[2] if len(parts) > 2 else "journey"
-                user_key = parts[1] if len(parts) > 1 else None
-                mark_notified(session, project.id, event_key, f"journey_{step}", user_id=user_key)
-                logger.info("Live notification sent: journey_%s (project_id=%s)", step, project.id)
+        # event_type для NotificationLog -- извлекаем из event_key
+        # (формат journey:<user_key>:<step>:<ts>), без user_id PII в event_type поле
+        parts = event_key.split(":")
+        step = parts[2] if len(parts) > 2 else "journey"
+        user_key = parts[1] if len(parts) > 1 else None
+        if await _notify_once(project, settings, event_key, f"journey_{step}", text, user_id=user_key):
+            logger.info("Live notification sent: journey_%s (project_id=%s)", step, project.id)
 
 
 async def _notify_from_deltas(project: Project, settings, current_payment_path: dict) -> None:
@@ -1748,28 +1776,18 @@ async def _notify_from_deltas(project: Project, settings, current_payment_path: 
     if batch.is_digest:
         digest_signature = ":".join(f"{d.event_type}={d.current_value}" for d in sorted(deltas, key=lambda x: x.event_type))
         event_key = f"digest:{project.id}:{digest_signature}"
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                return
-            sent_ok = await _notify_project(project, settings, batch.digest_text)
-            if sent_ok:
-                mark_notified(session, project.id, event_key, "digest")
-                logger.info("Live notification sent: digest (project_id=%s)", project.id)
+        if await _notify_once(project, settings, event_key, "digest", batch.digest_text):
+            logger.info("Live notification sent: digest (project_id=%s)", project.id)
         return
 
     for delta in deltas:
         event_key = build_event_key(project.id, delta.event_type, delta.current_value)
-        with get_session() as session:
-            if was_notified(session, project.id, event_key):
-                continue
-            text = format_notification(delta)
-            sent_ok = await _notify_project(project, settings, text)
-            if sent_ok:
-                mark_notified(session, project.id, event_key, delta.event_type)
-                logger.info(
-                    "Live notification sent: %s (project_id=%s, value=%s)",
-                    delta.event_type, project.id, delta.current_value,
-                )
+        if await _notify_once(project, settings, event_key, delta.event_type,
+                              format_notification(delta)):
+            logger.info(
+                "Live notification sent: %s (project_id=%s, value=%s)",
+                delta.event_type, project.id, delta.current_value,
+            )
 
 
 async def run_payment_path_diagnostics_for_project(
