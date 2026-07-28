@@ -647,3 +647,34 @@ class OwnerAction(SQLModel, table=True):
     action: str = Field(index=True)   # код действия: collection_on, stages_renamed…
     summary: str = ""        # человеческая строка для экрана
     created_at: datetime = Field(default_factory=utcnow, index=True)
+
+
+class PlatformSubscription(SQLModel, table=True):
+    """
+    Оплаченный тариф аккаунта (задачи E1/E2).
+
+    Одноразовая оплата на фиксированный срок, а не автосписание: у
+    аналитика пока нет ни одного платящего клиента, и рекуррентные
+    списания без наблюдаемой практики — риск списать чужие деньги молча
+    при ошибке в логике продления. Проще и честнее: платёж продлевает
+    `paid_until`, а по истечении аккаунт тихо возвращается на free
+    (лимиты см. app/plans.py) — без сюрпризов на карте.
+
+    `status`: pending (создан платёж, ждём вебхук) | active (оплачен) |
+    failed (YooKassa отказала) — pending и failed не считаются активной
+    подпиской, `current_plan()` их не видит.
+
+    Новая таблица, а не колонка в PlatformUser — то же правило репозитория,
+    что и у ProjectMember: `ALTER TABLE` на живой базе запрещён.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="platformuser.id", index=True)
+    plan: str = "pro"
+    status: str = Field(default="pending", index=True)
+    price_rub: float = 0
+    # id платежа YooKassa -- по нему сверяем вебхук и не активируем дважды
+    # один и тот же платёж (см. app/billing_platform.py).
+    payment_id: str = Field(default="", index=True)
+    paid_until: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utcnow, index=True)

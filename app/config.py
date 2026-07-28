@@ -218,9 +218,19 @@ class Settings(BaseSettings):
     # Если не задан -- классификация winner/safe_negative только по семантике.
     direct_registration_goal_id: Optional[int] = None   # goal_id для "регистрация"
 
-    # --- YooKassa ---
+    # --- YooKassa (читаем оплаты АНАЛИЗИРУЕМОГО продукта, не свои) ---
     yookassa_shop_id: Optional[str] = None
     yookassa_secret_key: Optional[str] = None
+
+    # --- Коммерция самой платформы (задачи E1/E2) ---
+    # Выключено по умолчанию: пока аналитик обслуживает только своего
+    # владельца, лимитов и оплаты нет вообще -- не "функция недоделана",
+    # а осознанное "продавать пока некому". Включается одной переменной,
+    # без правки кода, когда владелец решит отдавать платформу другим.
+    commercial_mode: bool = False
+    platform_yookassa_shop_id: Optional[str] = None
+    platform_yookassa_secret_key: Optional[str] = None
+    platform_yookassa_return_url: Optional[str] = None
 
     # --- Планировщик ---
     watch_interval_seconds: int = 10800  # 3 часа

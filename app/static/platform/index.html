@@ -644,6 +644,15 @@
       <p class="muted" id="projects-who" style="margin-top:-6px"></p>
       <table id="projects-table" class="stack"><tbody></tbody></table>
     </div>
+
+    <!-- Тариф. Показывается только когда владелец платформы включил продажу
+         (COMMERCIAL_MODE) -- пока аналитик обслуживает только его самого,
+         разговор про тарифы был бы неуместен. -->
+    <div class="card hidden" id="billing-card">
+      <h2>Тариф</h2>
+      <div id="billing-body">Загрузка…</div>
+    </div>
+
     <div class="card">
       <h2>Названия этапов воронки<span class="spacer"></span>
         <button class="btn sm" id="stages-ai">Предложить названия по сайту</button></h2>
@@ -2073,8 +2082,47 @@ $('chat-input').addEventListener('keydown', e => {
 });
 
 /* ---------------- Проекты ---------------- */
+/* ---------------- Тариф ---------------- */
+async function loadBilling() {
+  try {
+    const b = await api('/api/billing/plans');
+    // Пока владелец платформы не включил продажу -- карточки тарифа
+    // не должно быть на экране вообще, не только пустой.
+    if (!b.commercial_mode) { $('billing-card').classList.add('hidden'); return; }
+    $('billing-card').classList.remove('hidden');
+
+    const plan = b.plans.find(p => p.key === b.current_plan) || {};
+    const usage = b.usage.projects == null ? '' :
+      `Проектов подключено: ${b.usage.projects}` +
+      (plan.max_projects ? ` из ${plan.max_projects}` : ' (без ограничения)') + '.';
+
+    const upgrade = b.current_plan === 'free' ? `
+      <button class="btn primary sm" id="billing-upgrade" style="margin-top:8px">
+        Перейти на Pro — ${b.plans.find(p => p.key === 'pro').price_rub} ₽/мес</button>
+      <div class="muted" id="billing-status" style="margin-top:6px"></div>` : '';
+
+    $('billing-body').innerHTML = `
+      <p>Сейчас: <b>${esc(plan.title || b.current_plan)}</b></p>
+      <p class="muted">${usage}</p>
+      ${upgrade}`;
+
+    const btn = $('billing-upgrade');
+    if (btn) btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const r = await api('/api/billing/checkout', {method: 'POST', body: JSON.stringify({plan: 'pro'})});
+        location.href = r.confirmation_url;
+      } catch (e) {
+        $('billing-status').textContent = e.message;
+        btn.disabled = false;
+      }
+    };
+  } catch (e) { if (e.message !== 'unauthorized') $('billing-card').classList.add('hidden'); }
+}
+
 async function loadProjects() {
   $('projects-table').tBodies[0].innerHTML = `<tr><td>${skelLines(2)}</td></tr>`;
+  loadBilling();
   try {
     const list = await api('/api/projects');
     // Названия этапов и событий настраиваются у того проекта, который

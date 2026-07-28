@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import select
@@ -1355,6 +1355,117 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Тариф платформы (E1/E2)
+# ---------------------------------------------------------------------------
+#
+# COMMERCIAL_MODE выключен по умолчанию -- пока платформа обслуживает
+# только своего владельца, лимитов и оплаты нет вообще. Когда владелец
+# решит отдавать аналитик другим фаундерам за деньги, включение одной
+# переменной делает лимиты и кнопку оплаты видимыми, без правок кода.
+
+
+@router.get("/api/billing/plans", dependencies=[Depends(require_admin)])
+async def billing_plans(identity=Depends(require_admin)):
+    from app import accounts
+    from app.plans import PLANS, current_plan
+
+    settings = get_settings()
+    with get_session() as session:
+        plan = current_plan(session, identity.user_id)
+        owned = len(accounts.user_project_ids(session, identity.user_id)) if identity.user_id else None
+
+    return {
+        "commercial_mode": settings.commercial_mode,
+        "current_plan": plan,
+        "plans": [{"key": key, **info} for key, info in PLANS.items()],
+        "usage": {"projects": owned},
+    }
+
+
+class CheckoutRequest(BaseModel):
+    plan: str
+
+
+@router.post("/api/billing/checkout", dependencies=[Depends(require_admin)])
+async def billing_checkout(body: CheckoutRequest, identity=Depends(require_admin)):
+    from app import billing_platform
+    from app.models import PlatformSubscription
+    from app.plans import PLANS
+
+    settings = get_settings()
+    if not settings.commercial_mode:
+        raise HTTPException(status_code=404, detail="Оплата тарифов сейчас не предлагается")
+    if identity.user_id is None:
+        raise HTTPException(status_code=400, detail="Оплата привязывается к аккаунту — войдите по почте")
+    plan_info = PLANS.get(body.plan)
+    if plan_info is None or body.plan == "free":
+        raise HTTPException(status_code=400, detail="Неизвестный или бесплатный тариф")
+
+    try:
+        payment = await billing_platform.create_checkout(
+            settings, user_id=identity.user_id, plan=body.plan,
+            price_rub=plan_info["price_rub"],
+            description=f"Аналитик Воронки — тариф {plan_info['title']}",
+        )
+    except billing_platform.YooKassaError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    with get_session() as session:
+        session.add(PlatformSubscription(
+            user_id=identity.user_id, plan=body.plan, status="pending",
+            price_rub=plan_info["price_rub"], payment_id=payment["id"],
+        ))
+        session.commit()
+
+    return {"ok": True, "confirmation_url": payment["confirmation"]["confirmation_url"]}
+
+
+@router.post("/api/billing/yookassa/notify")
+async def billing_yookassa_notify(request: Request):
+    """Вебхук ЮKassa. Без require_admin -- вызывает ЮKassa, не владелец.
+
+    Вебхуку самому не доверяем (его можно подделать): по payment_id из
+    тела запрашиваем актуальный статус напрямую у ЮKassa и начисляем
+    тариф только по её ответу.
+    """
+    from datetime import timedelta
+
+    from app import billing_platform
+    from app.models import PlatformSubscription, utcnow
+
+    body = await request.json()
+    payment_id = ((body.get("object") or {}).get("id")) or ""
+    if not payment_id:
+        return {"ok": True}  # нечего обрабатывать, но и падать незачем
+
+    settings = get_settings()
+    try:
+        payment = await billing_platform.get_payment(settings, payment_id)
+    except billing_platform.YooKassaError:
+        logger.exception("billing: не удалось проверить платёж %s в ЮKassa", payment_id)
+        return {"ok": True}
+
+    with get_session() as session:
+        sub = session.exec(
+            select(PlatformSubscription).where(PlatformSubscription.payment_id == payment_id)
+        ).first()
+        if sub is None:
+            return {"ok": True}  # платёж не наш (или уже не найти) -- не ошибка вебхука
+        if sub.status == "active":
+            return {"ok": True}  # уже начислено -- вебхук может прийти повторно
+
+        if payment.get("status") == "succeeded" and payment.get("paid"):
+            sub.status = "active"
+            sub.paid_until = utcnow() + timedelta(days=30)
+        elif payment.get("status") in ("canceled",):
+            sub.status = "failed"
+        session.add(sub)
+        session.commit()
+
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Что изменилось после выкатки (D6)
 # ---------------------------------------------------------------------------
 #
@@ -2110,6 +2221,14 @@ async def list_projects(identity=Depends(require_admin)):
 @router.post("/api/projects", dependencies=[Depends(require_admin)])
 async def create_project(body: ProjectCreateRequest, identity=Depends(require_admin)):
     from app.connectors.truepost import DEFAULT_FUNNEL_MAPPING
+    from app.plans import can_create_project
+
+    with get_session() as session:
+        # Лимит тарифа проверяем ДО тяжёлой проверки подключения: если всё
+        # равно откажем, незачем дёргать чужой /api/internal/metrics.
+        allowed, reason = can_create_project(session, identity.user_id, get_settings())
+        if not allowed:
+            raise HTTPException(status_code=402, detail=reason)
 
     probe = await _probe_internal_api(body.base_url, body.internal_api_token)
     if not probe["ok"]:
