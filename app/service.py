@@ -13,6 +13,7 @@ Service layer (вызывается из scheduler.py после analyzer.py).
 MetricSnapshot, Alert как универсальными моделями.
 """
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -38,6 +39,9 @@ from app.models import (
     Project,
     ProjectChangeEvent,
 )
+
+
+logger = logging.getLogger("growth_agent.service")
 
 
 def utcnow() -> datetime:
@@ -1316,6 +1320,14 @@ RETENTION_DAYS = {
     "DeepDiagnosticsCache": 14,      # кэш, старше -- мусор
     "ProjectChangeEvent": 90,        # события изменений: нужны для истории
     "Alert": 60,
+    # Журнал действий владельца: полгода. Он нужен, чтобы объяснить излом
+    # на графике месячной давности, и весит копейки -- несколько строк
+    # в неделю на проект.
+    "OwnerAction": 180,
+    # Заявки на отправку живут ровно до тех пор, пока имеет смысл защищать
+    # от повторной отправки того же события. Их создаётся столько же,
+    # сколько уведомлений, поэтому без ретенции таблица растёт вечно.
+    "NotificationClaim": 30,
 }
 
 
@@ -1343,7 +1355,9 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int
         DeepDiagnosticsCache,
         DirectGranularSnapshot,
         MetricSnapshot,
+        NotificationClaim,
         NotificationLog,
+        OwnerAction,
         ProjectChangeEvent,
     )
 
@@ -1352,6 +1366,8 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int
         "DirectGranularSnapshot": DirectGranularSnapshot,
         "AgentRun": AgentRun,
         "NotificationLog": NotificationLog,
+        "NotificationClaim": NotificationClaim,
+        "OwnerAction": OwnerAction,
         "DeepDiagnosticsCache": DeepDiagnosticsCache,
         "ProjectChangeEvent": ProjectChangeEvent,
         "Alert": Alert,
@@ -1363,7 +1379,7 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int
         # Поле времени у моделей разное (created_at / sent_at / first_seen_at) --
         # находим первое подходящее, а не предполагаем created_at.
         time_field = next(
-            (f for f in ("created_at", "sent_at", "first_seen_at", "occurred_at")
+            (f for f in ("created_at", "sent_at", "first_seen_at", "occurred_at", "claimed_at")
              if hasattr(model, f)),
             None,
         )

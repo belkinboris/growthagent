@@ -157,7 +157,7 @@ class TestNotificationClaim:
 
         sent = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             await asyncio.sleep(0.05)  # окно, в которое проскакивал второй процесс
             sent.append(text)
             return True
@@ -187,7 +187,7 @@ class TestNotificationClaim:
             _project(session)
         sent = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             sent.append(text)
             return True
 

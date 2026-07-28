@@ -36,6 +36,14 @@ from app.config import (
     get_settings,
 )
 from app import accounts, connect_snippets
+from app.error_text import humanize_error
+from app.readiness import (
+    CHECKS,
+    ENOUGH_FOR_A_CONCLUSION,
+    MIN_FOR_A_TREND,
+    WINDOW_DAYS,
+    assess,
+)
 from app.db import get_session, _ensure_integrations
 from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
@@ -111,6 +119,9 @@ class ProjectCreateRequest(BaseModel):
 
 class ProjectUpdateRequest(BaseModel):
     name: Optional[str] = None
+    # Кому слать уведомления по этому проекту (Telegram chat id). Пусто --
+    # значит, канал не настроен: см. app/notify_targets.py.
+    notify_chat_ids: Optional[list[str]] = None
     base_url: Optional[str] = None
     internal_api_token: Optional[str] = None
     type: Optional[str] = None
@@ -270,6 +281,17 @@ def _find_project(session, identity) -> Optional[Project]:
     def _scoped(query):
         return query if visible is None else query.where(Project.id.in_(visible))
 
+    # Выбор в шапке важнее «первого включённого»: человек смотрит на тот
+    # проект, который выбрал, даже если сбор по нему сейчас выключен.
+    chosen_id = getattr(identity, "selected_project_id", None)
+    if chosen_id is not None:
+        chosen = session.exec(_scoped(select(Project).where(Project.id == chosen_id))).first()
+        if chosen is not None:
+            return chosen
+        # Выбранного проекта больше нет или он чужой -- молча падаем на
+        # обычный выбор, а не показываем пустоту: cookie мог остаться
+        # от удалённого проекта или от другого аккаунта на том же браузере.
+
     project = session.exec(
         _scoped(select(Project).where(Project.is_active == True))  # noqa: E712
     ).first()
@@ -354,6 +376,10 @@ async def overview(identity=Depends(require_admin)):
                     "status": live_status.get(i.type.value, i.status.value),
                     "last_sync_at": i.last_sync_at.isoformat() if i.last_sync_at else None,
                     "last_error": i.last_error,
+                    # Человеческое объяснение рядом с исходной строкой:
+                    # владельцу -- смысл, в подсказке -- факт для поддержки.
+                    "error_human": (humanize_error(i.last_error, i.type.value)
+                                    if i.status.value == "error" else None),
                 }
                 for i in integrations
             ],
@@ -762,11 +788,18 @@ async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = 
 
         if action == "accept":
             exp = growth_loop.accept_recommendation(session, rec, pp)
+            _record_action(session, identity, "recommendation_accepted",
+                           f"Принял предложение «{rec.title}» — началась проверка", project.id)
             return {"ok": True, "experiment_id": exp.id if exp else None}
         if action == "defer":
             growth_loop.defer_recommendation(session, rec, days=body.days)
+            _record_action(session, identity, "recommendation_deferred",
+                           f"Отложил предложение «{rec.title}» на {body.days} дн.", project.id)
             return {"ok": True}
         growth_loop.reject_recommendation(session, rec, reason=body.reason)
+        _record_action(session, identity, "recommendation_rejected",
+                       f"Отклонил предложение «{rec.title}»"
+                       + (f": {body.reason}" if body.reason else ""), project.id)
         return {"ok": True}
 
 
@@ -781,6 +814,9 @@ async def growth_cancel(exp_id: int, body: GrowthDecision | None = None, identit
             raise HTTPException(status_code=404, detail="Проверка не найдена")
         _require_own_project_id(session, exp.project_id, identity)
         growth_loop.cancel_experiment(session, exp, reason=(body.reason if body else ""))
+        _record_action(session, identity, "experiment_cancelled",
+                       f"Остановил проверку «{exp.title}»"
+                       + (f": {body.reason}" if body and body.reason else ""), exp.project_id)
         return {"ok": True}
 
 
@@ -883,7 +919,36 @@ async def update_stages(project_id: int, body: StagesUpdate, identity=Depends(re
             project.settings_json = sj
             session.add(project)
         session.commit()
+        parts = []
+        if body.titles:
+            parts.append(f"названия шагов воронки ({len(body.titles)})")
+        if body.event_labels:
+            parts.append(f"названия событий ленты ({len(body.event_labels)})")
+        if parts:
+            _record_action(session, identity, "names_changed",
+                           "Изменил " + " и ".join(parts), project_id)
         return {"ok": True, "stages": (await get_stages(project_id, identity))["stages"]}
+
+
+async def _project_page_text(base_url: Optional[str]) -> str:
+    """Текст главной страницы проекта для подсказок ИИ. Сайт недоступен --
+    возвращаем пустую строку: называть шаги по одним только кодам метрик
+    хуже, но честнее, чем врать про недоступность."""
+    import re
+
+    if not base_url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(base_url)
+    except httpx.HTTPError:
+        logger.info("autoname: сайт проекта недоступен")
+        return ""
+    if resp.status_code != 200:
+        return ""
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", resp.text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text).strip()[:3000]
 
 
 @router.post("/api/projects/{project_id}/stages/autoname", dependencies=[Depends(require_admin)])
@@ -908,18 +973,7 @@ async def autoname_stages(project_id: int, identity=Depends(require_admin)):
         project_name = project.name
         mapping = (project.settings_json or {}).get("funnel_mapping") or {}
 
-    page_text = ""
-    if base_url:
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(base_url)
-            if resp.status_code == 200:
-                html = resp.text
-                html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
-                page_text = re.sub(r"<[^>]+>", " ", html)
-                page_text = re.sub(r"\s+", " ", page_text).strip()[:3000]
-        except httpx.HTTPError:
-            logger.info("autoname: сайт проекта недоступен, назовём этапы по метрикам")
+    page_text = await _project_page_text(base_url)
 
     stages_to_name = [k for k in STAGE_ORDER if k.startswith("activation_") or k in mapping]
     prompt = (
@@ -954,6 +1008,129 @@ async def autoname_stages(project_id: int, identity=Depends(require_admin)):
 
 
 # ---------------------------------------------------------------------------
+# Названия событий живой ленты (B5)
+# ---------------------------------------------------------------------------
+#
+# Шаги воронки у аналитика фиксированные, а типы событий -- нет: продукт
+# присылает свои коды (`user_registered`, `trial_extended`, что угодно).
+# Незнакомый код показывался владельцу как есть -- английский snake_case
+# в русском интерфейсе. Придумывать перевод самим нельзя: код может значить
+# что угодно, и выдуманное название врало бы про продукт. Поэтому: собираем
+# коды, которые ПРИСЛАЛ продукт, а называет их владелец -- руками или
+# приняв предложение ИИ.
+
+EVENT_TYPES_PERIOD_MINUTES = 7 * 24 * 60  # неделя: за сутки редкие события не попадаются
+
+
+async def _observed_event_types(project: Project) -> tuple[list[str], Optional[str]]:
+    """Типы событий, реально присланные продуктом. Второй элемент -- причина,
+    по которой список пуст (её показываем владельцу вместо пустоты)."""
+    from app.connectors.user_events import fetch_user_events
+
+    result = await fetch_user_events(
+        project.base_url,
+        project_internal_api_token(project),
+        period_minutes=EVENT_TYPES_PERIOD_MINUTES,
+        limit=500,
+    )
+    if not result.get("ok"):
+        hint = {
+            "not_configured": "У проекта не задан адрес или токен внутреннего API.",
+            "not_found": "Продукт не отдаёт /api/internal/user-events — событий в ленте не будет.",
+            "timeout": "Продукт не ответил вовремя.",
+        }.get(result.get("status"), "Продукт не отдал события.")
+        return [], hint
+
+    types = sorted({e.get("event_type") for e in (result.get("events") or []) if e.get("event_type")})
+    if not types:
+        return [], "За последнюю неделю продукт не прислал ни одного события."
+    return types, None
+
+
+@router.get("/api/projects/{project_id}/events", dependencies=[Depends(require_admin)])
+async def project_event_types(project_id: int, identity=Depends(require_admin)):
+    """Типы событий проекта и их названия. Уже названные показываем всегда,
+    даже если за неделю такое событие не приходило: иначе имя, данное
+    владельцем, пропадало бы из настроек вместе с затишьем в продукте."""
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        labels = (project.settings_json or {}).get("event_labels") or {}
+        detached = Project(
+            id=project.id, name=project.name, type=project.type,
+            base_url=project.base_url, settings_json=dict(project.settings_json or {}),
+        )
+
+    observed, hint = await _observed_event_types(detached)
+    all_types = sorted(set(observed) | set(labels))
+    return {
+        "types": [
+            {"key": key, "label": labels.get(key, ""), "observed": key in observed}
+            for key in all_types
+        ],
+        "hint": hint if not all_types else None,
+        "period_days": EVENT_TYPES_PERIOD_MINUTES // (24 * 60),
+    }
+
+
+@router.post("/api/projects/{project_id}/events/autoname", dependencies=[Depends(require_admin)])
+async def autoname_event_types(project_id: int, identity=Depends(require_admin)):
+    """ИИ предлагает русские названия для кодов событий. Ничего не
+    сохраняет: подтверждает владелец -- аналитик не решает за него."""
+    import json
+    import re
+
+    from app import ask as ask_module
+
+    settings = get_settings()
+    if not ask_module.is_configured(settings):
+        raise HTTPException(status_code=503, detail="Для автоназвания нужен настроенный LLM (LLM_PROVIDER=yandex)")
+
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project_name = project.name
+        base_url = project.base_url
+        detached = Project(
+            id=project.id, name=project.name, type=project.type,
+            base_url=project.base_url, settings_json=dict(project.settings_json or {}),
+        )
+
+    observed, hint = await _observed_event_types(detached)
+    if not observed:
+        raise HTTPException(status_code=422, detail=hint or "Продукт не прислал ни одного события")
+
+    page_text = await _project_page_text(base_url)
+    prompt = (
+        f"Проект «{project_name}», сайт: {base_url or 'неизвестен'}.\n"
+        f"Текст главной страницы: {page_text or '(недоступен)'}\n\n"
+        f"Продукт присылает события таких типов: {', '.join(observed)}.\n\n"
+        f"Назови каждое событие простыми русскими словами — так, как владелец "
+        f"продукта рассказал бы, что сделал человек: «Зарегистрировался», "
+        f"«Открыл тарифы», «Оплатил». Если по коду непонятно, что произошло, "
+        f"не выдумывай — пропусти этот ключ.\n"
+        f"Ответь ТОЛЬКО JSON-объектом вида {{\"код\": \"Название\"}}, без пояснений. "
+        f"Название — 1-3 слова."
+    )
+    answer = await ask_module.answer_question(
+        prompt, "Ты помогаешь назвать события продукта для живой ленты.", settings,
+    )
+    if not answer:
+        raise HTTPException(status_code=502, detail="LLM не ответил, попробуйте ещё раз")
+
+    match = re.search(r"\{.*\}", answer, re.S)
+    if not match:
+        raise HTTPException(status_code=502, detail="LLM вернул ответ не в формате JSON")
+    try:
+        proposed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Не удалось разобрать ответ LLM")
+
+    # Только те коды, которые продукт действительно присылал: иначе ИИ
+    # придумает события, которых нет, и владелец решит, что они есть.
+    proposed = {k: str(v)[:60] for k, v in proposed.items() if k in observed and v}
+    return {"ok": True, "proposed": proposed, "site_used": bool(page_text)}
+
+
+# ---------------------------------------------------------------------------
 # Реклама: деньги и результат в одной таблице
 # ---------------------------------------------------------------------------
 
@@ -976,7 +1153,12 @@ async def ads_overview(identity=Depends(require_admin)):
         # просто не знает про деньги и трафик. Интерфейс должен объяснять
         # это точно, а не догадываться по отсутствию чисел.
         optional_sources = {
-            i.type.value: {"status": i.status.value, "last_error": i.last_error}
+            i.type.value: {
+                "status": i.status.value,
+                "last_error": i.last_error,
+                "error_human": (humanize_error(i.last_error, i.type.value)
+                                if i.status.value == "error" else None),
+            }
             for i in session.exec(
                 select(Integration).where(Integration.project_id == project.id)
             ).all()
@@ -1067,8 +1249,416 @@ async def ads_deep_check(identity=Depends(require_admin)):
 
 
 # ---------------------------------------------------------------------------
+# Сравнение периодов: неделя к неделе (D2)
+# ---------------------------------------------------------------------------
+#
+# Одно число «за 7 дней» не отвечает на вопрос, ради которого владелец
+# открывает экран: стало лучше или хуже. Раньше это можно было понять
+# только по графику динамики глазами, а глаз на четырёх точках ошибается.
+#
+# Сравниваем снимок недельного окна сейчас и такой же снимок недельной
+# давности: тогда «предыдущая неделя» -- это ровно предыдущие семь дней,
+# посчитанные тем же способом, а не пересобранные задним числом.
+
+# Ниже этого числа событий разница почти наверняка случайна, и показывать
+# проценты как факт нельзя. Порог общий для всей платформы (app/readiness.py):
+# продукт должен говорить об уверенности одинаково во всех местах.
+COMPARE_MIN_SAMPLE = MIN_FOR_A_TREND
+
+
+@router.get("/api/compare", dependencies=[Depends(require_admin)])
+async def compare_periods(identity=Depends(require_admin)):
+    """Неделя к предыдущей неделе по каждому шагу воронки."""
+    from datetime import timedelta
+
+    from app.models import utcnow
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+
+        def _snapshot(before=None):
+            query = (
+                select(MetricSnapshot)
+                .where(MetricSnapshot.project_id == project.id)
+                .where(MetricSnapshot.period_key == "7d")
+                .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+            )
+            if before is not None:
+                query = query.where(MetricSnapshot.created_at <= before)
+            return session.exec(query.order_by(MetricSnapshot.created_at.desc())).first()
+
+        current = _snapshot()
+        previous = _snapshot(before=utcnow() - timedelta(days=7))
+
+        if current is None:
+            return {"ok": False, "rows": [],
+                    "hint": "Снимков ещё нет. Первое сравнение появится, когда аналитик "
+                            "соберёт данные хотя бы один раз."}
+        if previous is None:
+            return {
+                "ok": False, "rows": [],
+                "hint": "Сравнивать пока не с чем: аналитик наблюдает меньше двух недель. "
+                        "Сравнение появится, когда накопится вторая неделя.",
+            }
+
+        now_values = extract_normalized_metrics_from_snapshot(current)
+        was_values = extract_normalized_metrics_from_snapshot(previous)
+
+    rows = []
+    for key in ("signup", "activation_1", "activation_2", "payment_started", "payment_success"):
+        now_v, was_v = now_values.get(key), was_values.get(key)
+        if now_v is None and was_v is None:
+            continue
+        rows.append(_compare_row(key, stage_titles.get(key, key), now_v, was_v))
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "current_at": current.created_at.isoformat(),
+        "previous_at": previous.created_at.isoformat(),
+        "hint": None,
+    }
+
+
+def _compare_row(key: str, title: str, now_v, was_v) -> dict:
+    """Одна строка сравнения. Проценты считаем, только когда они что-то
+    значат: на двух событиях «рост на 100%» -- это шум, а не рост."""
+    now_n = None if now_v is None else float(now_v)
+    was_n = None if was_v is None else float(was_v)
+    delta = None if (now_n is None or was_n is None) else now_n - was_n
+    percent = None
+    if delta is not None and was_n:
+        percent = round(delta / was_n * 100)
+
+    biggest = max(now_n or 0, was_n or 0)
+    if now_n is None or was_n is None:
+        verdict = "Не с чем сравнить: данных за одну из недель нет."
+    elif biggest < COMPARE_MIN_SAMPLE:
+        # Честность про выборку -- часть продукта: маленькие числа
+        # колеблются сами по себе, и называть это динамикой нельзя.
+        verdict = "Событий слишком мало, чтобы говорить о динамике."
+    elif delta == 0:
+        verdict = "Без изменений."
+    elif delta > 0:
+        verdict = "Стало больше."
+    else:
+        verdict = "Стало меньше."
+
+    return {
+        "key": key, "title": title,
+        "now": now_v, "was": was_v, "delta": delta, "percent": percent,
+        "verdict": verdict,
+        "reliable": bool(now_n is not None and was_n is not None and biggest >= COMPARE_MIN_SAMPLE),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Когда выводам можно будет верить (D4)
+# ---------------------------------------------------------------------------
+#
+# «Событий слишком мало» аналитик пишет в трёх местах, а когда станет
+# достаточно -- не писал нигде. Ожидание без срока выглядит бесконечным,
+# и человек либо перестаёт верить экрану, либо принимает решение по числу,
+# про которое ему честно сказали «не верьте».
+
+
+@router.get("/api/readiness", dependencies=[Depends(require_admin)])
+async def readiness(identity=Depends(require_admin)):
+    """Готов ли каждый вывод и, если нет, чего ждать."""
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+
+        query = (
+            select(MetricSnapshot)
+            .where(MetricSnapshot.project_id == project.id)
+            .where(MetricSnapshot.period_key == "7d")
+            .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+        )
+        latest = session.exec(query.order_by(MetricSnapshot.created_at.desc())).first()
+        first = session.exec(query.order_by(MetricSnapshot.created_at.asc())).first()
+
+    if latest is None:
+        return {
+            "ok": False, "checks": [], "observed_days": None,
+            "hint": "Аналитик ещё не собрал ни одного снимка. Готовность выводов "
+                    "появится после первого цикла сбора.",
+        }
+
+    # Сколько мы вообще наблюдаем: недельное окно у проекта, подключённого
+    # вчера, заполнено на день, и мерить его порогом недели -- обман.
+    observed_days = (latest.created_at - first.created_at).total_seconds() / 86400.0
+    values = extract_normalized_metrics_from_snapshot(latest)
+
+    checks = []
+    for check in CHECKS:
+        row = assess(check, values.get(check.metric), observed_days)
+        row["metric_title"] = stage_titles.get(check.metric, check.metric)
+        checks.append(row)
+
+    return {
+        "ok": True, "checks": checks,
+        "observed_days": round(observed_days, 1),
+        "window_days": WINDOW_DAYS,
+        "hint": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Когорты по источнику: доходят ли до оплаты по-разному (D3)
+# ---------------------------------------------------------------------------
+#
+# Суммарная воронка отвечает «сколько людей теряется», но не отвечает
+# «кого мы приводим». Источник, который даёт много регистраций и ноль
+# оплат, в общей сумме выглядит как польза: он поднимает верх воронки
+# и топит конверсию, а виноватым кажется продукт.
+#
+# Разбивку присылает сам продукт (`source_breakdown` в разборе пути до
+# оплаты) -- аналитик не додумывает источник за него: пометить человека
+# каналом может только тот, кто видел, откуда человек пришёл.
+
+# Доля оплат на маленьком числе пришедших -- случайность: один оплативший
+# из трёх даёт «33%», которые завтра станут нулём. Порог выше, чем в
+# сравнении недель (там считаются события, здесь -- доля от людей).
+SOURCE_MIN_SAMPLE = ENOUGH_FOR_A_CONCLUSION
+
+# Поле продукта → ключ воронки. Названия шагов берём общие, чтобы экран
+# источников звал их так же, как остальные экраны.
+_SOURCE_FIELDS = (
+    ("registrations", "signup"),
+    ("channels_created", "activation_1"),
+    ("payment_started", "payment_started"),
+    ("payment_success", "payment_success"),
+)
+
+
+@router.get("/api/sources", dependencies=[Depends(require_admin)])
+async def sources_cohorts(identity=Depends(require_admin)):
+    """Кто приходит из каждого канала и доходит ли до оплаты."""
+    from app.connectors.traffic_sources import aggregate_by_label, parse_source_breakdown
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+
+    titles = {key: stage_titles.get(key, key) for _, key in _SOURCE_FIELDS}
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False, "sources": [], "titles": titles, "summary": None, "checked_at": None,
+            "hint": "Разбор пути до оплаты ещё не собирался. Разбивка по источникам "
+                    "появится после первого полного цикла сбора.",
+        }
+
+    breakdown = parse_source_breakdown(cached.result_json or {})
+    checked_at = cached.created_at.isoformat() if cached.created_at else None
+    if not breakdown:
+        return {
+            "ok": False, "sources": [], "titles": titles, "summary": None,
+            "checked_at": checked_at,
+            # Честно называем, чего не хватает и на чьей стороне это чинится:
+            # источник знает только продукт, аналитик его не угадает.
+            "hint": "Продукт не присылает разбивку по источникам, поэтому все люди "
+                    "лежат в одной куче. Чтобы она появилась, сохраняйте utm_source "
+                    "(или start-параметр бота) при регистрации и отдавайте поле "
+                    "source_breakdown в ответе /api/internal/payment-path-diagnostics — "
+                    "формат описан в CONTRACT.md.",
+        }
+
+    rows = [_source_row(label, data) for label, data in aggregate_by_label(breakdown).items()]
+    # Сверху -- те, кто привёл больше людей: с них и начинается разговор.
+    rows.sort(key=lambda r: (-(r["signup"] or 0), r["label"]))
+
+    return {
+        "ok": True, "sources": rows, "titles": titles,
+        "summary": _sources_summary(rows),
+        "checked_at": checked_at,
+        "hint": None if rows else "За последнюю неделю из источников не пришёл никто.",
+    }
+
+
+def _source_row(label: str, data: dict) -> dict:
+    """Одна когорта. Долю оплат считаем только там, где она что-то значит."""
+    values = {key: (data.get(field) or 0) for field, key in _SOURCE_FIELDS}
+    came = values["signup"]
+    paid = values["payment_success"]
+    reliable = came >= SOURCE_MIN_SAMPLE
+
+    if not reliable:
+        note = (f"Пришло {came} — доля оплат на таких числах случайна."
+                if came else "Из этого канала пока никто не пришёл.")
+    elif paid == 0:
+        note = f"Из {came} до оплаты не дошёл никто."
+    else:
+        note = f"Оплатили {paid} из {came}."
+
+    return {
+        "label": label,
+        **values,
+        # Процент прячем, а не показываем серым: увиденное число остаётся
+        # в голове, даже когда рядом написано «не верьте ему».
+        "conversion": round(paid / came * 100, 1) if reliable and came else None,
+        "reliable": reliable,
+        "note": note,
+    }
+
+
+def _sources_summary(rows: list[dict]) -> str:
+    """Вывод словами. Аналитик называет разницу только когда она есть
+    на достаточных числах -- и не советует «отключить канал»: решение
+    про рекламу принимает человек."""
+    reliable = [r for r in rows if r["reliable"]]
+    if not rows:
+        return "Данных по источникам за эту неделю нет."
+    if len(reliable) < 2:
+        enough = f"хотя бы {SOURCE_MIN_SAMPLE} человек"
+        if not reliable:
+            return f"Сравнивать источники ещё рано: ни из одного не пришло {enough}."
+        return (f"Сравнивать не с чем: {enough} пришло только из одного канала "
+                f"«{reliable[0]['label']}».")
+
+    if all(r["payment_success"] == 0 for r in reliable):
+        return "До оплаты не дошёл никто ни из одного канала — сравнивать пока нечего."
+
+    best = max(reliable, key=lambda r: r["conversion"])
+    worst = min(reliable, key=lambda r: r["conversion"])
+    if best["conversion"] == worst["conversion"]:
+        return "Разницы между источниками не видно: доходят до оплаты одинаково."
+    return (f"Лучше всех доходит до оплаты «{best['label']}»: {_percent(best['conversion'])} "
+            f"из {best['signup']}. Хуже всех «{worst['label']}»: {_percent(worst['conversion'])} "
+            f"из {worst['signup']}. Что с этим делать — решать вам: "
+            f"аналитик рекламу не трогает.")
+
+
+def _percent(value: float) -> str:
+    """«10%», а не «10.0%»: в таблице рядом стоит то же число, и два разных
+    написания одной цифры выглядят как две разные цифры."""
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+@router.get("/api/ads/negative-keywords", dependencies=[Depends(require_admin)])
+async def negative_keywords(identity=Depends(require_admin)):
+    """
+    Готовый список минус-фраз по данным последней глубокой проверки Директа.
+
+    Аналитик их НЕ применяет: правки рекламы делает человек своими руками —
+    это сознательное ограничение продукта. Задача платформы — собрать
+    список, объяснить, почему каждая фраза туда попала, и дать скопировать
+    одним движением.
+
+    Новую тяжёлую проверку здесь не запускаем: читаем то, что уже посчитано
+    (кнопка «Проверить глубже» стоит рядом). Иначе открытие вкладки
+    заказывало бы десятки секунд работы Директа.
+    """
+    from app.service import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        cached = get_cached_diagnostics(
+            session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        )
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False,
+            "phrases": [],
+            "hint": "Глубокой проверки Директа ещё не было. Нажмите «Проверить глубже» — "
+                    "аналитик посмотрит поисковые запросы и соберёт список.",
+        }
+
+    data = dict(cached.result_json or {})
+    rows = data.get("safe_negatives") or []
+    phrases = [
+        {
+            "query": r.get("query"),
+            "clicks": r.get("clicks"),
+            "cost": r.get("cost"),
+            # Почему фраза в списке -- показываем словами. Без причины это
+            # просьба доверять аналитику вслепую, а решение принимает человек.
+            "reason": r.get("reason") or "",
+            "campaign": r.get("campaign_name"),
+        }
+        for r in rows if r.get("query")
+    ]
+    total_cost = round(sum(float(p["cost"] or 0) for p in phrases), 2)
+    return {
+        "ok": True,
+        "phrases": phrases,
+        "text": "\n".join(p["query"] for p in phrases),
+        "total_cost": total_cost,
+        "period_label": data.get("period_label"),
+        "checked_at": cached.created_at.isoformat() if cached.created_at else None,
+        # Атрибуция регистраций ненадёжна -- об этом надо сказать до того,
+        # как человек вырежет фразы: без неё «нет регистраций» может
+        # означать «мы их не увидели».
+        "attribution_note": data.get("registration_attribution_note") or "",
+        "has_registration_attribution": bool(data.get("has_registration_attribution")),
+        "hint": None if phrases else
+                "Фраз, которые можно безопасно отминусовать, аналитик не нашёл: "
+                "либо все запросы приносят результат, либо данных пока мало.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # История решений: что предлагали, что приняли, чем кончилось
 # ---------------------------------------------------------------------------
+
+
+def _record_action(session, identity, action: str, summary: str, project_id=None) -> None:
+    """Записывает действие владельца в журнал.
+
+    Журнал не должен ронять само действие: если запись не удалась, человек
+    всё равно сделал то, что хотел, и получить ошибку вместо результата
+    было бы хуже, чем остаться без строчки в истории.
+    """
+    from app.models import OwnerAction
+
+    try:
+        user_id = getattr(identity, "user_id", None)
+        actor = "владелец платформы"
+        if user_id is not None:
+            user = session.get(PlatformUser, user_id)
+            actor = user.email if user is not None else f"аккаунт #{user_id}"
+        session.add(OwnerAction(
+            project_id=project_id, user_id=user_id, actor=actor,
+            action=action, summary=summary,
+        ))
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("не удалось записать действие владельца: %s", action)
+
+
+@router.get("/api/actions", dependencies=[Depends(require_admin)])
+async def owner_actions(limit: int = 50, identity=Depends(require_admin)):
+    """Журнал действий владельца по выбранному проекту."""
+    from app.models import OwnerAction
+
+    with get_session() as session:
+        project = _find_project(session, identity)
+        if project is None:
+            return {"actions": []}
+        rows = session.exec(
+            select(OwnerAction)
+            .where(OwnerAction.project_id == project.id)
+            .order_by(OwnerAction.created_at.desc())
+            .limit(max(1, min(limit, 200)))
+        ).all()
+        return {"actions": [
+            {
+                "actor": a.actor,
+                "action": a.action,
+                "summary": a.summary,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in rows
+        ]}
 
 
 @router.get("/api/history", dependencies=[Depends(require_admin)])
@@ -1213,6 +1803,13 @@ async def alert_action(alert_id: int, action: str, identity=Depends(require_admi
             alert.snooze_until = utcnow() + timedelta(hours=24)
         session.add(alert)
         session.commit()
+        _record_action(
+            session, identity,
+            "alert_acknowledged" if action == "ack" else "alert_snoozed",
+            ("Отметил сигнал «{}» как понятный" if action == "ack"
+             else "Отложил сигнал «{}» на сутки").format(alert.title),
+            alert.project_id,
+        )
         return {"ok": True, "status": alert.status.value}
 
 
@@ -1340,6 +1937,7 @@ def _project_to_dict(p: Project) -> dict:
         "funnel_mapping": sj.get("funnel_mapping") or {},
         "metrika_counter_id": sj.get("metrika_counter_id"),
         "direct_client_login": sj.get("direct_client_login"),
+        "notify_chat_ids": sj.get("notify_chat_ids") or [],
         "created_at": p.created_at.isoformat(),
     }
 
@@ -1398,6 +1996,8 @@ async def create_project(body: ProjectCreateRequest, identity=Depends(require_ad
         # аккаунта может не быть, и связывать не с кем.
         if identity is not None and identity.user_id is not None:
             accounts.grant_project(session, project.id, identity.user_id)
+        _record_action(session, identity, "project_connected",
+                       f"Подключил проект «{project.name}» ({project.base_url})", project.id)
         return {"ok": True, "project": _project_to_dict(project), "probe": probe}
 
 
@@ -1422,11 +2022,27 @@ async def update_project(project_id: int, body: ProjectUpdateRequest, identity=D
             sj["metrika_counter_id"] = body.metrika_counter_id
         if body.direct_client_login is not None:
             sj["direct_client_login"] = body.direct_client_login
+        if body.notify_chat_ids is not None:
+            # Пустой список -- осознанный выбор «не слать никуда», а не
+            # ошибка: платформа тогда молчит и говорит об этом в интерфейсе.
+            sj["notify_chat_ids"] = [str(c).strip() for c in body.notify_chat_ids if str(c).strip()]
         project.settings_json = sj
 
         session.add(project)
         session.commit()
         session.refresh(project)
+        # Перечисляем, что именно поменяли: «изменил настройки» через неделю
+        # не объясняет, почему числа стали другими.
+        changed = [name for name, value in (
+            ("название", body.name), ("адрес", body.base_url), ("токен", body.internal_api_token),
+            ("тип", body.type), ("разметку воронки", body.funnel_mapping),
+            ("счётчик Метрики", body.metrika_counter_id), ("логин Директа", body.direct_client_login),
+            ("адресатов уведомлений", body.notify_chat_ids),
+        ) if value is not None]
+        if changed:
+            _record_action(session, identity, "project_updated",
+                           "Изменил " + ", ".join(changed) + f" у проекта «{project.name}»",
+                           project.id)
         return {"ok": True, "project": _project_to_dict(project)}
 
 
@@ -1445,6 +2061,8 @@ async def activate_project(project_id: int, identity=Depends(require_admin)):
         project.is_active = True
         session.add(project)
         session.commit()
+        _record_action(session, identity, "collection_on",
+                       f"Включил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": True}
 
 
@@ -1458,6 +2076,8 @@ async def pause_project(project_id: int, identity=Depends(require_admin)):
         project.is_active = False
         session.add(project)
         session.commit()
+        _record_action(session, identity, "collection_off",
+                       f"Выключил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": False}
 
 

@@ -26,6 +26,8 @@ from fastapi import HTTPException, Request
 from app.config import get_settings
 
 SESSION_COOKIE = "ga_platform_session"
+# Выбранный проект. Обычная cookie, читается интерфейсом и сервером.
+PROJECT_COOKIE = "ga_platform_project"
 
 _runtime_secret: Optional[str] = None
 
@@ -64,10 +66,23 @@ class Identity:
 
     user_id: Optional[int] = None
     is_owner: bool = True
+    # Какой проект человек выбрал в шапке. Не в подписанном токене, а в
+    # отдельной cookie: это не право доступа, а настройка интерфейса --
+    # подделывать её бессмысленно, доступ всё равно проверяется по
+    # ProjectMember. В токен её класть нельзя: смена проекта не должна
+    # выписывать новую сессию.
+    selected_project_id: Optional[int] = None
 
     @property
     def is_env_owner(self) -> bool:
         return self.user_id is None
+
+    def with_selected_project(self, project_id: Optional[int]) -> "Identity":
+        return Identity(
+            user_id=self.user_id,
+            is_owner=self.is_owner,
+            selected_project_id=project_id,
+        )
 
 
 def issue_session_token(user_id: Optional[int] = None) -> str:
@@ -144,7 +159,17 @@ def require_admin(request: Request) -> Identity:
         # Пароль владельца убрали из окружения -- старые «владельческие»
         # сессии обязаны умереть вместе с ним.
         raise HTTPException(status_code=401, detail="Не авторизован")
-    return identity
+    return identity.with_selected_project(_selected_project_from_request(request))
+
+
+def _selected_project_from_request(request: Request) -> Optional[int]:
+    """Мусор в cookie -- это «проект не выбран», а не ошибка: испорченная
+    настройка интерфейса не должна ронять все экраны в 500."""
+    raw = request.cookies.get(PROJECT_COOKIE)
+    try:
+        return int(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _has_any_account() -> bool:

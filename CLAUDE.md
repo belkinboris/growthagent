@@ -35,13 +35,17 @@
 удалён, три потерянных при той загрузке исправления восстановлены (защита от
 OOM в `connectors/direct.py`, диагностика памяти в `scheduler.py`, endpoint
 `/api/memory`). Рабочий код только в `app/`; примеры endpoint'ов для стороны
-продукта — в `examples/`.
+продукта — в `examples/`. 28.07.2026 разобраны последние следы той порчи
+(C8, C9): `CONTRACT.md` написан заново по коду, состояние проекта вернулось
+в `PROJECT_STATE_GROWTHAGENT.md` как исторический снимок, две спеки-обманки
+удалены. `tests/test_root_docs.py` следит, чтобы документ в корне оставался
+документом.
 
 ## Как запускать и проверять
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080   # прод-команда (Timeweb)
-python3 -m pytest tests/ -q                        # 662 теста, все зелёные
+python3 -m pytest tests/ -q                        # 820 тестов, все зелёные
 ```
 
 Прогон должен быть чистым. Любое падение — регрессия, а не «известная
@@ -56,6 +60,9 @@ PLATFORM_ADMIN_PASSWORD=t PLATFORM_COOKIE_SECURE=false \
 
 Скриншоты — Playwright с предустановленным браузером:
 `executable_path="/opt/pw-browsers/chromium-1194/chrome-linux/chrome"`.
+Браузерные тесты интерфейса — `tests/test_ui_browser.py`: поднимают
+приложение на своём порту и ходят в него Chromium'ом. Без браузера в
+системе файл пропускается целиком.
 
 ## Соглашения
 

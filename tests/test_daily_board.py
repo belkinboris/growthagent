@@ -234,7 +234,7 @@ class TestSendDailyBoard:
 
         sent_texts = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             sent_texts.append(text)
             return True
 
@@ -258,7 +258,7 @@ class TestSendDailyBoard:
 
         sent = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             sent.append(text)
             return True
 
@@ -276,7 +276,7 @@ class TestSendDailyBoard:
             project = _make_project(session)
             project_id = project.id
 
-        async def failing_send(settings, text):
+        async def failing_send(settings, text, chat_ids=None):
             return False
 
         ok = self._run(send_daily_board(
@@ -290,7 +290,7 @@ class TestSendDailyBoard:
             assert was_notified(session, project_id, f"daily_board:{day}") is False
 
         # Теперь успешная отправка проходит
-        async def ok_send(settings, text):
+        async def ok_send(settings, text, chat_ids=None):
             return True
 
         ok = self._run(send_daily_board(
@@ -305,7 +305,7 @@ class TestSendDailyBoard:
 
         called = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             called.append(text)
             return True
 
@@ -330,7 +330,7 @@ class TestSendDailyBoard:
 
         factory = _make_session_factory()  # проект не создаём
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             return True
 
         ok = self._run(send_daily_board(
@@ -345,7 +345,7 @@ class TestSendDailyBoard:
             project = _make_project(session)
             project_id = project.id
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             return True
 
         self._run(send_daily_board(
@@ -523,7 +523,7 @@ class TestQuietHours:
 
         sent = []
 
-        async def fake_send(settings, text):
+        async def fake_send(settings, text, chat_ids=None):
             # реальный _send_telegram_notification при тихих часах вернул бы False;
             # здесь моделируем его контрактом
             return False
@@ -534,7 +534,7 @@ class TestQuietHours:
         ok = asyncio.run(send_daily_board(_send=fake_send, _session_factory=factory, _settings=S()))
         assert ok is False
         # Повторная попытка с успешной отправкой проходит (дедуп не сработал)
-        async def ok_send(settings, text):
+        async def ok_send(settings, text, chat_ids=None):
             sent.append(text)
             return True
         ok = asyncio.run(send_daily_board(_send=ok_send, _session_factory=factory, _settings=S()))

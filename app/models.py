@@ -620,3 +620,30 @@ class ProjectMember(SQLModel, table=True):
     user_id: int = Field(foreign_key="platformuser.id", index=True)
     role: str = Field(default="owner")
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class OwnerAction(SQLModel, table=True):
+    """
+    Что владелец сделал руками и когда (задача C5).
+
+    Зачем. «История» показывает, что предлагал аналитик и чем кончились
+    проверки, но не показывает действий человека: кто включил сбор, кто
+    переименовал этапы, кто отклонил рекомендацию. Через неделю уже не
+    вспомнить, почему числа изменились — а с аккаунтами появился и второй
+    вопрос: кто именно это сделал.
+
+    `user_id` пуст, если вошли по паролю из окружения: у владельца
+    платформы аккаунта может не быть. Поэтому рядом лежит `actor` —
+    подпись, которую и показываем: она переживёт удаление аккаунта.
+
+    Новая таблица, а не колонки в существующих: `ALTER TABLE` на живой
+    базе здесь запрещён (правило из прод-инцидентов).
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: Optional[int] = Field(default=None, foreign_key="project.id", index=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="platformuser.id", index=True)
+    actor: str = ""          # «ivan@example.com» или «владелец платформы»
+    action: str = Field(index=True)   # код действия: collection_on, stages_renamed…
+    summary: str = ""        # человеческая строка для экрана
+    created_at: datetime = Field(default_factory=utcnow, index=True)
