@@ -36,6 +36,11 @@
      элемента съедали место у вкладок. На телефоне прячется -- там та же
      строка есть на вкладке «Проекты». */
   header .who{color:var(--muted);font-size:12px;white-space:nowrap}
+  /* Переключатель проектов. Появляется только когда проектов больше
+     одного: с единственным проектом это лишний орган управления. */
+  header select#hdr-switch{width:auto;max-width:190px;margin:0;padding:5px 8px;
+    font-size:13px;background:var(--surface-2)}
+  header select#hdr-switch.hidden{display:none}
   /* Вкладок больше, чем влезает на телефон. Прокрутка есть, но о ней надо
      сообщить — иначе половина разделов выглядит несуществующей. */
   .nav-wrap{position:relative;min-width:0;flex:0 1 auto;display:flex;justify-content:flex-end}
@@ -207,6 +212,9 @@
       border-top:1px solid var(--border)}
     header .proj{display:none}
     header .who{display:none}
+    /* На телефоне переключатель -- единственный указатель проекта
+       (строка .proj скрыта), но он не должен съедать вкладки. */
+    header select#hdr-switch{max-width:120px}
     /* Слово «Аналитик» съедало треть шапки, а вкладки из-за этого не влезали. */
     header .logo-text{display:none}
     header{gap:8px;padding:12px 14px}
@@ -228,6 +236,7 @@
 
 <header>
   <span class="logo">📊<span class="logo-text"> Аналитик</span></span>
+  <select id="hdr-switch" class="hidden" title="Проект, который вы смотрите"></select>
   <span class="proj" id="hdr-project"></span>
   <span class="who" id="hdr-user"></span>
   <div class="nav-wrap" id="nav-wrap">
@@ -616,6 +625,7 @@ function showLogin() {
   $('tabs').classList.add('hidden');
   $('hdr-project').textContent = '';
   $('hdr-user').textContent = '';
+  $('hdr-switch').classList.add('hidden');
   // Сообщение о том, что произошло внутри платформы, на экране входа
   // выглядит чужим -- гасим вместе с выходом.
   clearTimeout(toastTimer); $('toast').classList.add('hidden');
@@ -624,9 +634,47 @@ function showLogin() {
 function showApp() {
   $('login-view').classList.add('hidden');
   $('tabs').classList.remove('hidden');
-  switchTab('overview');
+  // Переключатель грузим ДО первой отрисовки: обзор смотрит, виден ли он,
+  // чтобы не дублировать название проекта. Иначе получалась гонка --
+  // название то появлялось, то нет.
+  loadProjectSwitch().then(() => switchTab('overview'));
   loadWho();
 }
+
+/* ---- Переключатель проектов в шапке ---- */
+// Выбор хранится в обычной cookie и читается сервером: так он переживает
+// перезагрузку страницы и действует сразу на всех экранах, а не только
+// на том, где переключили. Право доступа это не даёт -- сервер всё равно
+// показывает только свои проекты.
+const PROJECT_COOKIE = 'ga_platform_project';
+function setProjectCookie(id) {
+  document.cookie = `${PROJECT_COOKIE}=${encodeURIComponent(id)}; path=/; max-age=${60*60*24*365}; samesite=lax`;
+}
+
+async function loadProjectSwitch() {
+  const sel = $('hdr-switch');
+  try {
+    const list = await api('/api/projects');
+    // Один проект -- переключать нечего, лишний орган управления только
+    // отвлекает. Название проекта и так есть в строке рядом.
+    if (list.length < 2) { sel.classList.add('hidden'); sel.innerHTML = ''; return; }
+    const current = (document.cookie.match(/(?:^|; )ga_platform_project=([^;]*)/) || [])[1];
+    sel.innerHTML = list.map(p =>
+      `<option value="${p.id}">${esc(p.name)}${p.is_active ? '' : ' — сбор выключен'}</option>`).join('');
+    if (current && list.some(p => String(p.id) === decodeURIComponent(current))) {
+      sel.value = decodeURIComponent(current);
+    }
+    sel.classList.remove('hidden');
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+
+$('hdr-switch').onchange = () => {
+  setProjectCookie($('hdr-switch').value);
+  // Перерисовываем текущую вкладку, а не всю страницу: человек остаётся
+  // там, где был, и сразу видит данные выбранного проекта.
+  const activeTab = document.querySelector('#tabs button.active');
+  switchTab(activeTab ? activeTab.dataset.tab : 'overview');
+};
 
 // Кто вошёл. Спрашиваем у сервера, а не запоминаем ответ формы: после
 // перезагрузки страницы сессия живёт в cookie, а интерфейс о ней не знает.
@@ -818,7 +866,11 @@ async function loadOverview() {
     }
     $('overview-empty').classList.add('hidden');
     $('overview-content').classList.remove('hidden');
-    $('hdr-project').textContent = `${o.project.name} · ${o.project.base_url || ''} · ${o.build_marker}`;
+    // Когда переключатель виден, название проекта в нём же -- дублировать
+    // его во второй раз незачем.
+    const switchVisible = !$('hdr-switch').classList.contains('hidden');
+    $('hdr-project').textContent = [switchVisible ? null : o.project.name,
+      o.project.base_url || null, o.build_marker].filter(Boolean).join(' · ');
     $('project-inactive').classList.toggle('hidden', o.project.is_active !== false);
 
     // allSettled, а не all: если один источник отвалился, остальные панели
@@ -1496,8 +1548,14 @@ async function loadProjects() {
 // Сбор включается и выключается у каждого проекта отдельно: планировщик
 // обходит все включённые, поэтому «включить свой» больше не значит
 // «выключить чужой».
-window.activate = async id => { await api(`/api/projects/${id}/activate`, {method:'POST'}); loadProjects(); };
-window.pause = async id => { await api(`/api/projects/${id}/pause`, {method:'POST'}); loadProjects(); };
+window.activate = async id => {
+  await api(`/api/projects/${id}/activate`, {method:'POST'});
+  loadProjects(); loadProjectSwitch();
+};
+window.pause = async id => {
+  await api(`/api/projects/${id}/pause`, {method:'POST'});
+  loadProjects(); loadProjectSwitch();
+};
 window.retest = async id => {
   const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
   alert(r.ok ? 'Связь есть. Endpoints: ' + r.available_endpoints.join(', ')
@@ -1577,7 +1635,7 @@ $('np-create').onclick = async () => {
     box.innerHTML = `<div class="ok-text">Проект «${esc(r.project.name)}» подключён.</div>`;
     ['np-name','np-url','np-token','np-metrika','np-direct'].forEach(id => $(id).value = '');
     $('np-create').disabled = true;
-    loadProjects();
+    loadProjects(); loadProjectSwitch();
   } catch (e) { box.innerHTML = `<div class="error-text">${esc(e.message)}</div>`; }
 };
 

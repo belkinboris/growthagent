@@ -386,6 +386,35 @@ class TestOwnerIsolation:
             assert session.get(Project, ivan_pid).is_active is True
             assert session.get(Project, petr_pid).is_active is True
 
+    def test_selected_project_is_honoured(self, monkeypatch, tmp_path):
+        """Переключатель в шапке (B4): выбор живёт в обычной cookie и
+        действует сразу на всех экранах."""
+        client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.post(f"/growth/api/projects/{petr_pid}/activate")
+        client.post("/growth/api/logout")
+        _login(client)  # владелец платформы видит оба проекта
+
+        assert client.get("/growth/api/overview").json()["project"]["id"] == ivan_pid
+        client.cookies.set("ga_platform_project", str(petr_pid))
+        assert client.get("/growth/api/overview").json()["project"]["id"] == petr_pid
+
+    def test_selecting_foreign_project_falls_back(self, monkeypatch, tmp_path):
+        """Чужой номер в cookie -- не дыра и не пустой экран: показываем
+        свой проект, как будто выбора не было."""
+        client, _, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.cookies.set("ga_platform_project", str(ivan_pid))
+        assert client.get("/growth/api/overview").json()["project"]["id"] == petr_pid
+
+    # Кириллицу в cookie браузер шлёт уже процентно-закодированной, поэтому
+    # проверяем именно то, что реально долетит до сервера.
+    @pytest.mark.parametrize("garbage", ["%D0%B0%D0%B1%D0%B2", "", "12x", "-"])
+    def test_garbage_in_cookie_does_not_break_screens(self, monkeypatch, tmp_path, garbage):
+        client, _, _, petr_pid = self._two_tenants(monkeypatch, tmp_path)
+        client.cookies.set("ga_platform_project", garbage)
+        resp = client.get("/growth/api/overview")
+        assert resp.status_code == 200
+        assert resp.json()["project"]["id"] == petr_pid
+
     def test_pause_stops_only_own_project(self, monkeypatch, tmp_path):
         client, session_factory, ivan_pid, petr_pid = self._two_tenants(monkeypatch, tmp_path)
         client.post(f"/growth/api/projects/{petr_pid}/activate")

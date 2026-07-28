@@ -270,6 +270,17 @@ def _find_project(session, identity) -> Optional[Project]:
     def _scoped(query):
         return query if visible is None else query.where(Project.id.in_(visible))
 
+    # Выбор в шапке важнее «первого включённого»: человек смотрит на тот
+    # проект, который выбрал, даже если сбор по нему сейчас выключен.
+    chosen_id = getattr(identity, "selected_project_id", None)
+    if chosen_id is not None:
+        chosen = session.exec(_scoped(select(Project).where(Project.id == chosen_id))).first()
+        if chosen is not None:
+            return chosen
+        # Выбранного проекта больше нет или он чужой -- молча падаем на
+        # обычный выбор, а не показываем пустоту: cookie мог остаться
+        # от удалённого проекта или от другого аккаунта на том же браузере.
+
     project = session.exec(
         _scoped(select(Project).where(Project.is_active == True))  # noqa: E712
     ).first()
