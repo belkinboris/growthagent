@@ -508,6 +508,21 @@
     </div>
 
     <div class="card">
+      <h2>Названия событий в ленте<span class="spacer"></span>
+        <button class="btn sm" id="events-ai">Предложить названия</button></h2>
+      <p class="purpose" style="margin-top:0">Зачем: шаги воронки у аналитика одни и те же,
+        а события продукт присылает свои — кодами вроде <code>user_registered</code>.
+        Знакомые коды лента показывает по-русски сама, незнакомые — как есть: выдумывать
+        за продукт, что означает код, аналитик не станет. Назовите их здесь, и лента
+        станет читаемой.</p>
+      <div id="events-body">Загрузка…</div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary sm" id="events-save">Сохранить названия</button>
+        <span class="muted" id="events-status"></span>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Подключить проект</h2>
       <p class="muted">Заполните три поля — остальное аналитик определит сам: проверит
         связь, найдёт доступные endpoints, поставит разметку воронки.
@@ -1211,6 +1226,67 @@ $('stages-ai').onclick = async () => {
   } catch (e) { $('stages-status').textContent = e.message; }
 };
 
+/* ---------------- Названия событий ленты ---------------- */
+async function loadEventTypes(projectId) {
+  showSkeleton('events-body', skelLines(3, 'tall'));
+  try {
+    const r = await api(`/api/projects/${projectId}/events`);
+    if (!r.types.length) {
+      // Пустоту объясняем словами: «нет событий» и «продукт не отдаёт
+      // ленту» — это разные вещи, и делать с ними надо разное.
+      $('events-body').innerHTML = `<p class="muted">${esc(r.hint || 'Событий пока нет.')}</p>`;
+      return;
+    }
+    $('events-body').innerHTML = r.types.map(t => {
+      const known = EVENT_META[t.key];
+      const note = t.observed
+        ? (known && !t.label ? 'аналитик знает это событие' : '')
+        : 'за ' + r.period_days + ' дней не приходило';
+      return `<div class="stage-row">
+        <span class="stage-key">${esc(t.key)}</span>
+        <input data-event="${esc(t.key)}" value="${esc(t.label || (known ? known.label : ''))}"
+               placeholder="${esc(known ? known.label : 'как назвать это событие')}">
+        <span class="stage-note">${esc(note)}</span></div>`;
+    }).join('');
+  } catch (e) { if (e.message !== 'unauthorized') $('events-body').innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+$('events-save').onclick = async () => {
+  const id = window._activeProjectId;
+  if (!id) return;
+  const event_labels = {};
+  document.querySelectorAll('#events-body input[data-event]').forEach(i => {
+    const v = i.value.trim();
+    if (v) event_labels[i.dataset.event] = v;
+  });
+  if (!Object.keys(event_labels).length) {
+    $('events-status').textContent = 'Нечего сохранять: все поля пустые.'; return;
+  }
+  $('events-status').textContent = 'Сохраняю…';
+  try {
+    await api(`/api/projects/${id}/stages`, {method:'PUT', body: JSON.stringify({event_labels})});
+    $('events-status').textContent = 'Сохранено — лента будет называть события так.';
+    loadEventTypes(id);
+  } catch (e) { $('events-status').textContent = e.message; }
+};
+$('events-ai').onclick = async () => {
+  const id = window._activeProjectId;
+  if (!id) return;
+  $('events-status').textContent = 'ИИ смотрит сайт проекта и коды событий…';
+  try {
+    const r = await api(`/api/projects/${id}/events/autoname`, {method:'POST'});
+    let applied = 0;
+    Object.entries(r.proposed || {}).forEach(([key, title]) => {
+      const input = document.querySelector(`#events-body input[data-event="${key}"]`);
+      if (input) { input.value = title; applied++; }
+    });
+    // Предложение не сохраняется само: решение за владельцем.
+    $('events-status').textContent = applied
+      ? `Предложено ${applied} названий${r.site_used ? ' по тексту сайта' : ''} — проверьте и сохраните.`
+      : 'ИИ не смог предложить названия — назовите события сами.';
+  } catch (e) { $('events-status').textContent = e.message; }
+};
+
 /* ---------------- Реклама ---------------- */
 // Директ и Метрика — необязательные источники. Без них аналитик работает,
 // просто не знает про деньги и внешний трафик. Показать таблицу прочерков
@@ -1529,10 +1605,20 @@ async function loadProjects() {
   $('projects-table').tBodies[0].innerHTML = `<tr><td>${skelLines(2)}</td></tr>`;
   try {
     const list = await api('/api/projects');
-    const active = list.find(p => p.is_active);
-    window._activeProjectId = active ? active.id : null;
-    if (active) loadStages(active.id); else $('stages-body').innerHTML =
-      '<p class="muted">Сначала подключите проект и включите по нему сбор.</p>';
+    // Названия этапов и событий настраиваются у того проекта, который
+    // человек выбрал в шапке, а не у первого включённого: иначе он правил
+    // бы названия не тому проекту, на который смотрит.
+    const chosen = (document.cookie.match(/(?:^|; )ga_platform_project=([^;]*)/) || [])[1];
+    const current = (chosen && list.find(p => String(p.id) === decodeURIComponent(chosen)))
+      || list.find(p => p.is_active) || list[0];
+    window._activeProjectId = current ? current.id : null;
+    if (current) { loadStages(current.id); loadEventTypes(current.id); }
+    else {
+      $('stages-body').innerHTML =
+        '<p class="muted">Сначала подключите проект и включите по нему сбор.</p>';
+      $('events-body').innerHTML =
+        '<p class="muted">События появятся, когда проект начнёт их присылать.</p>';
+    }
     $('projects-table').tBodies[0].innerHTML = list.length ? list.map(p =>
       `<tr><td><b>${esc(p.name)}</b><div class="muted">${esc(p.base_url || '—')}</div></td>
        <td>${p.is_active

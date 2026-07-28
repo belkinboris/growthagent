@@ -897,6 +897,27 @@ async def update_stages(project_id: int, body: StagesUpdate, identity=Depends(re
         return {"ok": True, "stages": (await get_stages(project_id, identity))["stages"]}
 
 
+async def _project_page_text(base_url: Optional[str]) -> str:
+    """Текст главной страницы проекта для подсказок ИИ. Сайт недоступен --
+    возвращаем пустую строку: называть шаги по одним только кодам метрик
+    хуже, но честнее, чем врать про недоступность."""
+    import re
+
+    if not base_url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(base_url)
+    except httpx.HTTPError:
+        logger.info("autoname: сайт проекта недоступен")
+        return ""
+    if resp.status_code != 200:
+        return ""
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", resp.text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text).strip()[:3000]
+
+
 @router.post("/api/projects/{project_id}/stages/autoname", dependencies=[Depends(require_admin)])
 async def autoname_stages(project_id: int, identity=Depends(require_admin)):
     """
@@ -919,18 +940,7 @@ async def autoname_stages(project_id: int, identity=Depends(require_admin)):
         project_name = project.name
         mapping = (project.settings_json or {}).get("funnel_mapping") or {}
 
-    page_text = ""
-    if base_url:
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(base_url)
-            if resp.status_code == 200:
-                html = resp.text
-                html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
-                page_text = re.sub(r"<[^>]+>", " ", html)
-                page_text = re.sub(r"\s+", " ", page_text).strip()[:3000]
-        except httpx.HTTPError:
-            logger.info("autoname: сайт проекта недоступен, назовём этапы по метрикам")
+    page_text = await _project_page_text(base_url)
 
     stages_to_name = [k for k in STAGE_ORDER if k.startswith("activation_") or k in mapping]
     prompt = (
@@ -961,6 +971,129 @@ async def autoname_stages(project_id: int, identity=Depends(require_admin)):
         raise HTTPException(status_code=502, detail="Не удалось разобрать ответ LLM")
 
     proposed = {k: str(v)[:60] for k, v in proposed.items() if k in STAGE_ORDER and v}
+    return {"ok": True, "proposed": proposed, "site_used": bool(page_text)}
+
+
+# ---------------------------------------------------------------------------
+# Названия событий живой ленты (B5)
+# ---------------------------------------------------------------------------
+#
+# Шаги воронки у аналитика фиксированные, а типы событий -- нет: продукт
+# присылает свои коды (`user_registered`, `trial_extended`, что угодно).
+# Незнакомый код показывался владельцу как есть -- английский snake_case
+# в русском интерфейсе. Придумывать перевод самим нельзя: код может значить
+# что угодно, и выдуманное название врало бы про продукт. Поэтому: собираем
+# коды, которые ПРИСЛАЛ продукт, а называет их владелец -- руками или
+# приняв предложение ИИ.
+
+EVENT_TYPES_PERIOD_MINUTES = 7 * 24 * 60  # неделя: за сутки редкие события не попадаются
+
+
+async def _observed_event_types(project: Project) -> tuple[list[str], Optional[str]]:
+    """Типы событий, реально присланные продуктом. Второй элемент -- причина,
+    по которой список пуст (её показываем владельцу вместо пустоты)."""
+    from app.connectors.user_events import fetch_user_events
+
+    result = await fetch_user_events(
+        project.base_url,
+        project_internal_api_token(project),
+        period_minutes=EVENT_TYPES_PERIOD_MINUTES,
+        limit=500,
+    )
+    if not result.get("ok"):
+        hint = {
+            "not_configured": "У проекта не задан адрес или токен внутреннего API.",
+            "not_found": "Продукт не отдаёт /api/internal/user-events — событий в ленте не будет.",
+            "timeout": "Продукт не ответил вовремя.",
+        }.get(result.get("status"), "Продукт не отдал события.")
+        return [], hint
+
+    types = sorted({e.get("event_type") for e in (result.get("events") or []) if e.get("event_type")})
+    if not types:
+        return [], "За последнюю неделю продукт не прислал ни одного события."
+    return types, None
+
+
+@router.get("/api/projects/{project_id}/events", dependencies=[Depends(require_admin)])
+async def project_event_types(project_id: int, identity=Depends(require_admin)):
+    """Типы событий проекта и их названия. Уже названные показываем всегда,
+    даже если за неделю такое событие не приходило: иначе имя, данное
+    владельцем, пропадало бы из настроек вместе с затишьем в продукте."""
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        labels = (project.settings_json or {}).get("event_labels") or {}
+        detached = Project(
+            id=project.id, name=project.name, type=project.type,
+            base_url=project.base_url, settings_json=dict(project.settings_json or {}),
+        )
+
+    observed, hint = await _observed_event_types(detached)
+    all_types = sorted(set(observed) | set(labels))
+    return {
+        "types": [
+            {"key": key, "label": labels.get(key, ""), "observed": key in observed}
+            for key in all_types
+        ],
+        "hint": hint if not all_types else None,
+        "period_days": EVENT_TYPES_PERIOD_MINUTES // (24 * 60),
+    }
+
+
+@router.post("/api/projects/{project_id}/events/autoname", dependencies=[Depends(require_admin)])
+async def autoname_event_types(project_id: int, identity=Depends(require_admin)):
+    """ИИ предлагает русские названия для кодов событий. Ничего не
+    сохраняет: подтверждает владелец -- аналитик не решает за него."""
+    import json
+    import re
+
+    from app import ask as ask_module
+
+    settings = get_settings()
+    if not ask_module.is_configured(settings):
+        raise HTTPException(status_code=503, detail="Для автоназвания нужен настроенный LLM (LLM_PROVIDER=yandex)")
+
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project_name = project.name
+        base_url = project.base_url
+        detached = Project(
+            id=project.id, name=project.name, type=project.type,
+            base_url=project.base_url, settings_json=dict(project.settings_json or {}),
+        )
+
+    observed, hint = await _observed_event_types(detached)
+    if not observed:
+        raise HTTPException(status_code=422, detail=hint or "Продукт не прислал ни одного события")
+
+    page_text = await _project_page_text(base_url)
+    prompt = (
+        f"Проект «{project_name}», сайт: {base_url or 'неизвестен'}.\n"
+        f"Текст главной страницы: {page_text or '(недоступен)'}\n\n"
+        f"Продукт присылает события таких типов: {', '.join(observed)}.\n\n"
+        f"Назови каждое событие простыми русскими словами — так, как владелец "
+        f"продукта рассказал бы, что сделал человек: «Зарегистрировался», "
+        f"«Открыл тарифы», «Оплатил». Если по коду непонятно, что произошло, "
+        f"не выдумывай — пропусти этот ключ.\n"
+        f"Ответь ТОЛЬКО JSON-объектом вида {{\"код\": \"Название\"}}, без пояснений. "
+        f"Название — 1-3 слова."
+    )
+    answer = await ask_module.answer_question(
+        prompt, "Ты помогаешь назвать события продукта для живой ленты.", settings,
+    )
+    if not answer:
+        raise HTTPException(status_code=502, detail="LLM не ответил, попробуйте ещё раз")
+
+    match = re.search(r"\{.*\}", answer, re.S)
+    if not match:
+        raise HTTPException(status_code=502, detail="LLM вернул ответ не в формате JSON")
+    try:
+        proposed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Не удалось разобрать ответ LLM")
+
+    # Только те коды, которые продукт действительно присылал: иначе ИИ
+    # придумает события, которых нет, и владелец решит, что они есть.
+    proposed = {k: str(v)[:60] for k, v in proposed.items() if k in observed and v}
     return {"ok": True, "proposed": proposed, "site_used": bool(page_text)}
 
 
