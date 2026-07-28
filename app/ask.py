@@ -39,9 +39,9 @@ COOLDOWN_SECONDS = 3.0
 
 _last_call_ts: float = 0.0
 
-SYSTEM_PROMPT = """Ты — Аналитик Воронки, продакт-помощник владельца стартапа АвтоПост \
-(ИИ-сервис для ведения Telegram-канала). Владелец — Борис, соло-фаундер, \
-общается по-простому, часто голосом.
+SYSTEM_PROMPT = """Ты — Аналитик Воронки, продакт-помощник владельца подключённого продукта. \
+Платформа работает с любым продуктом, не только с тем, что описан в контексте ниже — \
+не додумывай детали, которых там нет. Владелец общается по-простому, часто голосом.
 
 Твои принципы (нарушать нельзя):
 1. Данные важнее мнений. Каждый вывод опирайся на цифры из контекста ниже. \
@@ -50,8 +50,8 @@ SYSTEM_PROMPT = """Ты — Аналитик Воронки, продакт-по
 сигнал», «данных недостаточно». Никогда не изображай уверенность на 3-5 событиях.
 3. Одна переменная за раз. Если идёт эксперимент — напоминай, что заперто \
 («Не менять»), и отговаривай трогать эти переменные до вердикта.
-4. Ты не применяешь изменения. Решения принимаются кнопками на /board, \
-код меняется по спекам в отдельных чатах. Ты объясняешь и советуешь.
+4. Ты не применяешь изменения. Решения принимаются кнопками в интерфейсе, \
+код меняется отдельно. Ты объясняешь и советуешь.
 5. Простой русский. Без MBA-жаргона, без «confidence interval», без \
 «decision engine». Коротко: 2-6 абзацев максимум, без списков где можно без них.
 6. Если вопрос про то, «что делать» — сначала посмотри на активную \
@@ -59,8 +59,111 @@ SYSTEM_PROMPT = """Ты — Аналитик Воронки, продакт-по
 эксперименту довестись», и это правильный ответ, а не отписка.
 7. Не льсти. Если владелец предлагает плохое (менять всё сразу, лить бюджет \
 в неработающий канал, менять переменные во время теста) — скажи прямо и объясни почему.
+8. Называй конкретный экран. Если цифра или вывод, о которых ты говоришь, есть на одной \
+из карточек платформы (раздел «ЭКРАНЫ ПЛАТФОРМЫ» ниже) — назови вкладку и карточку \
+(«на Обзоре, в карточке ...»), а не только само число: владелец должен уметь найти это глазами.
 
 Тебе дают снимок текущих данных проекта. Отвечай на вопрос владельца."""
+
+# Известный по имени продукт, для которого в playbook есть специфичные факты
+# (см. app/truepost_playbook.PROJECT_FACTS). Ядро не знает продуктовой
+# специфики -- поэтому эти факты нельзя подмешивать в контекст ЛЮБОГО
+# подключённого проекта, только когда это действительно он.
+_AUTOPOST_MARKERS = ("автопост", "truepost")
+
+
+def _is_autopost_project(project) -> bool:
+    haystack = f"{project.name or ''} {project.base_url or ''}".lower()
+    return any(marker in haystack for marker in _AUTOPOST_MARKERS)
+
+
+# Что где смотреть глазами -- статический список карточек интерфейса.
+# Меняется вместе с интерфейсом (app/static/platform/index.html), поэтому
+# лежит рядом с остальным разговорным контекстом, а не генерируется.
+SCREENS_REFERENCE = """ЭКРАНЫ ПЛАТФОРМЫ (что где смотреть):
+— Обзор: карточка «Неделя к неделе» — какой шаг воронки просел или вырос \
+за последние 7 дней против предыдущих 7. «Откуда приходят те, кто платит» — \
+доходят ли до оплаты люди из разных источников по-разному. «Когда выводам \
+можно будет верить» — честный ответ, хватает ли данных для вывода или нужно ждать.
+— Реклама: минус-фразы — список запросов, которые жгут бюджет и не приводят \
+людей (человек решает сам, аналитик рекламу не трогает).
+— История: «Что вы меняли в продукте» — сравнение чистой недели после отметки \
+владельца о выкатке с неделей до неё. «Что делали руками» — журнал действий \
+владельца. «История решений» — что предлагал аналитик и чем кончилось.
+— Лента: путь конкретного (анонимного) человека, если обрыв не виден на средних числах.
+— Отчёты: полные текстовые версии доски, воронки, пути к оплате."""
+
+
+def _live_screens_summary(session, project) -> str:
+    """Те же числа и вердикты, что видит владелец на «Обзоре» сейчас.
+
+    Считает теми же чистыми функциями, что и сами endpoint'ы (`_compare_row`,
+    `_source_row`, `assess`) -- если поменяется порог малой выборки, чат
+    и экран не разойдутся в оценке одних и тех же данных.
+    """
+    from datetime import timedelta
+
+    from sqlmodel import select
+
+    from app.models import MetricSnapshot, utcnow
+    from app.platform_api import (
+        _compare_row, _source_row, _sources_summary, load_stage_titles,
+    )
+    from app.connectors.traffic_sources import aggregate_by_label, parse_source_breakdown
+    from app.readiness import CHECKS, assess
+    from app.service import (
+        PAYMENT_PATH_CACHE_PERIOD_KEY, extract_normalized_metrics_from_snapshot,
+        get_cached_diagnostics,
+    )
+
+    lines: list[str] = []
+    try:
+        stage_titles = load_stage_titles(session, project.id)
+        query = (
+            select(MetricSnapshot)
+            .where(MetricSnapshot.project_id == project.id)
+            .where(MetricSnapshot.period_key == "7d")
+            .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+        )
+        latest = session.exec(query.order_by(MetricSnapshot.created_at.desc())).first()
+        first = session.exec(query.order_by(MetricSnapshot.created_at.asc())).first()
+        previous = session.exec(
+            query.where(MetricSnapshot.created_at <= utcnow() - timedelta(days=7))
+                 .order_by(MetricSnapshot.created_at.desc())
+        ).first()
+
+        if latest is not None:
+            now_values = extract_normalized_metrics_from_snapshot(latest)
+
+            if previous is not None:
+                was_values = extract_normalized_metrics_from_snapshot(previous)
+                rows = [_compare_row(k, stage_titles.get(k, k), now_values.get(k), was_values.get(k))
+                        for k in ("signup", "activation_1", "activation_2",
+                                 "payment_started", "payment_success")
+                        if now_values.get(k) is not None or was_values.get(k) is not None]
+                if rows:
+                    lines.append("КАРТОЧКА «НЕДЕЛЯ К НЕДЕЛЕ» (Обзор): " + "; ".join(
+                        f"{r['title']}: {r['was']}→{r['now']} ({r['verdict']})" for r in rows))
+
+            if first is not None:
+                observed_days = (latest.created_at - first.created_at).total_seconds() / 86400.0
+                readiness_rows = [assess(c, now_values.get(c.metric), observed_days) for c in CHECKS]
+                lines.append("КАРТОЧКА «КОГДА ВЫВОДАМ МОЖНО БУДЕТ ВЕРИТЬ» (Обзор): " + "; ".join(
+                    f"{r['question']} — {'готово' if r['ready'] else 'нет'}" for r in readiness_rows))
+
+        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        if cached is not None and cached.ok:
+            breakdown = parse_source_breakdown(cached.result_json or {})
+            if breakdown:
+                source_rows = [_source_row(label, data)
+                               for label, data in aggregate_by_label(breakdown).items()]
+                if source_rows:
+                    lines.append('КАРТОЧКА «ОТКУДА ПРИХОДЯТ ТЕ, КТО ПЛАТИТ» (Обзор): '
+                                + _sources_summary(source_rows))
+    except Exception:
+        logger.exception("ask: live screens summary failed")
+
+    return "\n".join(lines)
 
 
 def build_context(session, project) -> str:
@@ -83,7 +186,7 @@ def build_context(session, project) -> str:
         load_daily_counters_history,
     )
 
-    parts: list[str] = []
+    parts: list[str] = [f"ПРОЕКТ: {project.name}"]
 
     pp_dict = None
     try:
@@ -177,12 +280,25 @@ def build_context(session, project) -> str:
         "автогенерация), по ним выводов о вовлечённости не делать."
     )
 
-    # Факты о проекте (TruePost-specific, живут в playbook)
-    try:
-        from app.truepost_playbook import PROJECT_FACTS
-        parts.append(PROJECT_FACTS)
-    except Exception:
-        logger.exception("ask: project facts failed")
+    # Факты о проекте -- специфичны для АвтоПоста/TruePost, живут в playbook.
+    # Подмешивать их в контекст ЧУЖОГО подключённого продукта нельзя: ядро
+    # не знает продуктовой специфики, а факт «Telegram Ads на паузе»
+    # применительно к другому бизнесу -- не честная неточность, а выдумка.
+    if _is_autopost_project(project):
+        try:
+            from app.truepost_playbook import PROJECT_FACTS
+            parts.append(PROJECT_FACTS)
+        except Exception:
+            logger.exception("ask: project facts failed")
+
+    parts.append(SCREENS_REFERENCE)
+
+    # Живые числа тех же карточек, что видит владелец на «Обзоре» -- чтобы
+    # отвечать не общими словами, а теми же цифрами, что на экране, и
+    # называть карточку, где их можно перепроверить (принцип 8 выше).
+    live = _live_screens_summary(session, project)
+    if live:
+        parts.append(live)
 
     # Динамика по дням
     try:
