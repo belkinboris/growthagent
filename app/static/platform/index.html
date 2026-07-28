@@ -927,7 +927,13 @@ function renderIntegrations(list) {
     const required = REQUIRED_SOURCES.includes(i.type);
     const title = SOURCE_TITLES[i.type] || i.type;
     if (i.status === 'ok') return `<span class="tag good">✓ ${esc(title)}</span>`;
-    if (i.status === 'error') return `<span class="tag critical" title="${esc(i.last_error || '')}">✕ ${esc(title)}</span>`;
+    if (i.status === 'error') {
+      // Владельцу -- смысл на его языке, исходная строка коннектора
+      // остаётся в подсказке: с ней идут к разработчику источника.
+      const h = i.error_human || {};
+      // short -- без повтора названия: оно уже стоит в самой плашке.
+      return `<span class="tag critical" title="${esc(h.raw || i.last_error || '')}">✕ ${esc(title)}: ${esc(h.short || h.text || 'источник не ответил')}</span>`;
+    }
     if (i.status === 'stale') return `<span class="tag warning">! ${esc(title)}: данные устарели</span>`;
     return required
       ? `<span class="tag critical">✕ ${esc(title)}: без этого источника аналитик слеп</span>`
@@ -1413,7 +1419,8 @@ function renderOptionalSources(sources, hasDirectData) {
   // видно в «Источниках данных» на обзоре.
   const missing = (sources.direct && sources.direct.status !== 'ok' && !hasDirectData)
     ? [{key: 'direct', meta: OPTIONAL_SOURCES.direct,
-        status: sources.direct.status, error: sources.direct.last_error}]
+        status: sources.direct.status, human: sources.direct.error_human,
+        error: sources.direct.last_error}]
     : [];
   if (!missing.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
   box.classList.remove('hidden');
@@ -1422,7 +1429,11 @@ function renderOptionalSources(sources, hasDirectData) {
     return `<div class="card" style="border-left:3px solid var(--${broken ? 'serious' : 'series-1'})">
       <h2>${esc(m.meta.name)}: ${broken ? 'источник отвечает с ошибкой' : 'не подключён — это нормально'}</h2>
       <p style="margin:0">${broken
-        ? 'Аналитик не смог получить данные: ' + esc(m.error || 'источник не ответил') + '.'
+        ? esc((m.human && m.human.text) || 'Аналитик не смог получить данные.')
+          + (m.human && m.human.action ? ' ' + esc(m.human.action) : '')
+          + (m.human && m.human.raw
+             ? `<br><span class="muted" style="font-size:12px">Ответ источника: ${esc(m.human.raw)}</span>`
+             : '')
         : 'Подключать не обязательно. С ним видно ' + esc(m.meta.gives) + '.'}</p>
       <p class="muted" style="margin:8px 0 0">Без него ${esc(m.meta.without)}.</p>
     </div>`;
@@ -1557,8 +1568,9 @@ function renderFirstRun(o, hasSnapshots) {
            : (linkFailed ? 'Связь с продуктом не работает'
                          : 'Связь ещё не проверялась'),
       note: linkFailed
-        ? (product.last_error || 'Продукт не отвечает на запросы аналитика.')
-          + ' Проверьте адрес и токен на вкладке «Проекты» — кнопка «перепроверить».'
+        ? [(product.error_human && product.error_human.text) || 'Продукт не отвечает на запросы аналитика.',
+           (product.error_human && product.error_human.action) ||
+             'Проверьте адрес и токен на вкладке «Проекты» — кнопка «перепроверить».'].join(' ')
         : (linkOk ? 'Продукт отвечает на запросы аналитика.'
                   : 'Аналитик проверит её при первом сборе данных. Проверить сразу '
                     + 'можно на вкладке «Проекты» — кнопка «перепроверить».'),

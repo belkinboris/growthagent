@@ -36,6 +36,7 @@ from app.config import (
     get_settings,
 )
 from app import accounts, connect_snippets
+from app.error_text import humanize_error
 from app.db import get_session, _ensure_integrations
 from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
@@ -368,6 +369,10 @@ async def overview(identity=Depends(require_admin)):
                     "status": live_status.get(i.type.value, i.status.value),
                     "last_sync_at": i.last_sync_at.isoformat() if i.last_sync_at else None,
                     "last_error": i.last_error,
+                    # Человеческое объяснение рядом с исходной строкой:
+                    # владельцу -- смысл, в подсказке -- факт для поддержки.
+                    "error_human": (humanize_error(i.last_error, i.type.value)
+                                    if i.status.value == "error" else None),
                 }
                 for i in integrations
             ],
@@ -1123,7 +1128,12 @@ async def ads_overview(identity=Depends(require_admin)):
         # просто не знает про деньги и трафик. Интерфейс должен объяснять
         # это точно, а не догадываться по отсутствию чисел.
         optional_sources = {
-            i.type.value: {"status": i.status.value, "last_error": i.last_error}
+            i.type.value: {
+                "status": i.status.value,
+                "last_error": i.last_error,
+                "error_human": (humanize_error(i.last_error, i.type.value)
+                                if i.status.value == "error" else None),
+            }
             for i in session.exec(
                 select(Integration).where(Integration.project_id == project.id)
             ).all()
