@@ -485,6 +485,18 @@
       <div id="sources-body"></div>
     </div>
 
+    <!-- «Событий слишком мало» написано на трёх экранах, а срока не было
+         нигде: ожидание без срока выглядит бесконечным. -->
+    <div class="card">
+      <h2>Когда выводам можно будет верить<span class="spacer"></span>
+        <span class="muted" id="readiness-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: аналитик честно пишет «событий слишком
+        мало» — и должен так же честно отвечать, когда станет достаточно. Если окна в семь
+        дней не хватает при нынешнем потоке, здесь будет написано именно это, а не
+        «подождите ещё».</p>
+      <div id="readiness-body"></div>
+    </div>
+
     <div class="card">
       <h2>Сигналы<span class="spacer"></span><span class="muted" id="alerts-count"></span></h2>
       <p class="purpose" style="margin-top:0">Зачем: аналитик проверяет правила на каждом цикле
@@ -1041,6 +1053,7 @@ async function loadOverview() {
     renderDynamics(d);
     loadCompare();
     loadSources();
+    loadReadiness();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
@@ -1507,6 +1520,32 @@ async function loadSources() {
         <td class="muted">${esc(s.note)}</td>
       </tr>`).join('') + '</tbody></table>' +
       `<p class="purpose" style="margin-bottom:0">${esc(r.summary)}</p>`;
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+/* ---------------- Когда выводам можно будет верить ---------------- */
+async function loadReadiness() {
+  const box = $('readiness-body');
+  box.innerHTML = skelLines(3);
+  $('readiness-when').textContent = '';
+  try {
+    const r = await api('/api/readiness');
+    if (!r.ok) {
+      box.innerHTML = `<p class="muted">${esc(r.hint || 'Оценить готовность пока не по чему.')}</p>`;
+      return;
+    }
+    $('readiness-when').textContent = 'наблюдаем ' + nf(r.observed_days) + ' дн.';
+    box.innerHTML = '<table class="stack"><tbody>' + r.checks.map(c => {
+      // Готовность -- это да/нет, и значок читается быстрее слова.
+      const mark = c.ready ? '<span style="color:var(--good)">готово</span>'
+                           : '<span class="muted">ждём</span>';
+      return `<tr>
+        <td><b>${esc(c.question)}</b><div class="muted" style="font-size:13px">${esc(c.why)}</div></td>
+        <td data-label="Готовность" style="white-space:nowrap">${mark}</td>
+        <td>${esc(c.verdict)}</td>
+      </tr>`;
+    }).join('') + '</tbody></table>';
   } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
     `<p class="error-text">${esc(e.message)}</p>`; }
 }

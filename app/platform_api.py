@@ -37,6 +37,13 @@ from app.config import (
 )
 from app import accounts, connect_snippets
 from app.error_text import humanize_error
+from app.readiness import (
+    CHECKS,
+    ENOUGH_FOR_A_CONCLUSION,
+    MIN_FOR_A_TREND,
+    WINDOW_DAYS,
+    assess,
+)
 from app.db import get_session, _ensure_integrations
 from app.models import Alert, Integration, MetricSnapshot, PlatformUser, Project
 from app.platform_auth import (
@@ -1254,9 +1261,9 @@ async def ads_deep_check(identity=Depends(require_admin)):
 # посчитанные тем же способом, а не пересобранные задним числом.
 
 # Ниже этого числа событий разница почти наверняка случайна, и показывать
-# проценты как факт нельзя. Порог тот же, что в growth_loop для вердикта:
+# проценты как факт нельзя. Порог общий для всей платформы (app/readiness.py):
 # продукт должен говорить об уверенности одинаково во всех местах.
-COMPARE_MIN_SAMPLE = 3
+COMPARE_MIN_SAMPLE = MIN_FOR_A_TREND
 
 
 @router.get("/api/compare", dependencies=[Depends(require_admin)])
@@ -1348,6 +1355,60 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Когда выводам можно будет верить (D4)
+# ---------------------------------------------------------------------------
+#
+# «Событий слишком мало» аналитик пишет в трёх местах, а когда станет
+# достаточно -- не писал нигде. Ожидание без срока выглядит бесконечным,
+# и человек либо перестаёт верить экрану, либо принимает решение по числу,
+# про которое ему честно сказали «не верьте».
+
+
+@router.get("/api/readiness", dependencies=[Depends(require_admin)])
+async def readiness(identity=Depends(require_admin)):
+    """Готов ли каждый вывод и, если нет, чего ждать."""
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+
+        query = (
+            select(MetricSnapshot)
+            .where(MetricSnapshot.project_id == project.id)
+            .where(MetricSnapshot.period_key == "7d")
+            .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+        )
+        latest = session.exec(query.order_by(MetricSnapshot.created_at.desc())).first()
+        first = session.exec(query.order_by(MetricSnapshot.created_at.asc())).first()
+
+    if latest is None:
+        return {
+            "ok": False, "checks": [], "observed_days": None,
+            "hint": "Аналитик ещё не собрал ни одного снимка. Готовность выводов "
+                    "появится после первого цикла сбора.",
+        }
+
+    # Сколько мы вообще наблюдаем: недельное окно у проекта, подключённого
+    # вчера, заполнено на день, и мерить его порогом недели -- обман.
+    observed_days = (latest.created_at - first.created_at).total_seconds() / 86400.0
+    values = extract_normalized_metrics_from_snapshot(latest)
+
+    checks = []
+    for check in CHECKS:
+        row = assess(check, values.get(check.metric), observed_days)
+        row["metric_title"] = stage_titles.get(check.metric, check.metric)
+        checks.append(row)
+
+    return {
+        "ok": True, "checks": checks,
+        "observed_days": round(observed_days, 1),
+        "window_days": WINDOW_DAYS,
+        "hint": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Когорты по источнику: доходят ли до оплаты по-разному (D3)
 # ---------------------------------------------------------------------------
 #
@@ -1363,7 +1424,7 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
 # Доля оплат на маленьком числе пришедших -- случайность: один оплативший
 # из трёх даёт «33%», которые завтра станут нулём. Порог выше, чем в
 # сравнении недель (там считаются события, здесь -- доля от людей).
-SOURCE_MIN_SAMPLE = 10
+SOURCE_MIN_SAMPLE = ENOUGH_FOR_A_CONCLUSION
 
 # Поле продукта → ключ воронки. Названия шагов берём общие, чтобы экран
 # источников звал их так же, как остальные экраны.
