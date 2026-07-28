@@ -1241,6 +1241,112 @@ async def ads_deep_check(identity=Depends(require_admin)):
     }
 
 
+# ---------------------------------------------------------------------------
+# Сравнение периодов: неделя к неделе (D2)
+# ---------------------------------------------------------------------------
+#
+# Одно число «за 7 дней» не отвечает на вопрос, ради которого владелец
+# открывает экран: стало лучше или хуже. Раньше это можно было понять
+# только по графику динамики глазами, а глаз на четырёх точках ошибается.
+#
+# Сравниваем снимок недельного окна сейчас и такой же снимок недельной
+# давности: тогда «предыдущая неделя» -- это ровно предыдущие семь дней,
+# посчитанные тем же способом, а не пересобранные задним числом.
+
+# Ниже этого числа событий разница почти наверняка случайна, и показывать
+# проценты как факт нельзя. Порог тот же, что в growth_loop для вердикта:
+# продукт должен говорить об уверенности одинаково во всех местах.
+COMPARE_MIN_SAMPLE = 3
+
+
+@router.get("/api/compare", dependencies=[Depends(require_admin)])
+async def compare_periods(identity=Depends(require_admin)):
+    """Неделя к предыдущей неделе по каждому шагу воронки."""
+    from datetime import timedelta
+
+    from app.models import utcnow
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        stage_titles = load_stage_titles(session, project.id)
+
+        def _snapshot(before=None):
+            query = (
+                select(MetricSnapshot)
+                .where(MetricSnapshot.project_id == project.id)
+                .where(MetricSnapshot.period_key == "7d")
+                .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+            )
+            if before is not None:
+                query = query.where(MetricSnapshot.created_at <= before)
+            return session.exec(query.order_by(MetricSnapshot.created_at.desc())).first()
+
+        current = _snapshot()
+        previous = _snapshot(before=utcnow() - timedelta(days=7))
+
+        if current is None:
+            return {"ok": False, "rows": [],
+                    "hint": "Снимков ещё нет. Первое сравнение появится, когда аналитик "
+                            "соберёт данные хотя бы один раз."}
+        if previous is None:
+            return {
+                "ok": False, "rows": [],
+                "hint": "Сравнивать пока не с чем: аналитик наблюдает меньше двух недель. "
+                        "Сравнение появится, когда накопится вторая неделя.",
+            }
+
+        now_values = extract_normalized_metrics_from_snapshot(current)
+        was_values = extract_normalized_metrics_from_snapshot(previous)
+
+    rows = []
+    for key in ("signup", "activation_1", "activation_2", "payment_started", "payment_success"):
+        now_v, was_v = now_values.get(key), was_values.get(key)
+        if now_v is None and was_v is None:
+            continue
+        rows.append(_compare_row(key, stage_titles.get(key, key), now_v, was_v))
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "current_at": current.created_at.isoformat(),
+        "previous_at": previous.created_at.isoformat(),
+        "hint": None,
+    }
+
+
+def _compare_row(key: str, title: str, now_v, was_v) -> dict:
+    """Одна строка сравнения. Проценты считаем, только когда они что-то
+    значат: на двух событиях «рост на 100%» -- это шум, а не рост."""
+    now_n = None if now_v is None else float(now_v)
+    was_n = None if was_v is None else float(was_v)
+    delta = None if (now_n is None or was_n is None) else now_n - was_n
+    percent = None
+    if delta is not None and was_n:
+        percent = round(delta / was_n * 100)
+
+    biggest = max(now_n or 0, was_n or 0)
+    if now_n is None or was_n is None:
+        verdict = "Не с чем сравнить: данных за одну из недель нет."
+    elif biggest < COMPARE_MIN_SAMPLE:
+        # Честность про выборку -- часть продукта: маленькие числа
+        # колеблются сами по себе, и называть это динамикой нельзя.
+        verdict = "Событий слишком мало, чтобы говорить о динамике."
+    elif delta == 0:
+        verdict = "Без изменений."
+    elif delta > 0:
+        verdict = "Стало больше."
+    else:
+        verdict = "Стало меньше."
+
+    return {
+        "key": key, "title": title,
+        "now": now_v, "was": was_v, "delta": delta, "percent": percent,
+        "verdict": verdict,
+        "reliable": bool(now_n is not None and was_n is not None and biggest >= COMPARE_MIN_SAMPLE),
+    }
+
+
 @router.get("/api/ads/negative-keywords", dependencies=[Depends(require_admin)])
 async def negative_keywords(identity=Depends(require_admin)):
     """

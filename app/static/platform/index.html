@@ -454,6 +454,19 @@
       <div id="dynamics-body"></div>
     </div>
 
+    <!-- Сравнение недели с предыдущей. График показывает форму, но ответ
+         на вопрос «стало лучше или хуже» человек по нему достраивает сам
+         и часто ошибается на четырёх точках. -->
+    <div class="card">
+      <h2>Неделя к неделе<span class="spacer"></span>
+        <span class="muted" id="compare-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: одно число «за 7 дней» не отвечает,
+        стало лучше или хуже. Здесь те же семь дней сравниваются с предыдущими семью,
+        посчитанными тем же способом. Где событий мало, аналитик говорит об этом словами
+        и не показывает проценты: на двух событиях «рост вдвое» — это шум.</p>
+      <div id="compare-body"></div>
+    </div>
+
     <div class="card">
       <h2>Сигналы<span class="spacer"></span><span class="muted" id="alerts-count"></span></h2>
       <p class="purpose" style="margin-top:0">Зачем: аналитик проверяет правила на каждом цикле
@@ -1008,6 +1021,7 @@ async function loadOverview() {
     renderDecision(g);
     renderFunnel($('funnel-window').value);
     renderDynamics(d);
+    loadCompare();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
@@ -1409,6 +1423,42 @@ $('events-ai').onclick = async () => {
       : 'ИИ не смог предложить названия — назовите события сами.';
   } catch (e) { $('events-status').textContent = e.message; }
 };
+
+/* ---------------- Неделя к неделе ---------------- */
+async function loadCompare() {
+  const box = $('compare-body');
+  box.innerHTML = skelLines(3);
+  $('compare-when').textContent = '';
+  try {
+    const r = await api('/api/compare');
+    if (!r.ok) {
+      // Пустоту объясняем словами: «мало наблюдаем» и «снимков нет» --
+      // разные состояния, и ждать в них надо разного.
+      box.innerHTML = `<p class="muted">${esc(r.hint || 'Сравнить пока не с чем.')}</p>`;
+      return;
+    }
+    // Дата снимка, с которым сравниваем: без неё «предыдущая неделя» --
+    // абстракция, и непонятно, свежее сравнение или трёхдневной давности.
+    const was = r.previous_at.slice(0, 10).split('-').reverse().slice(0, 2).join('.');
+    $('compare-when').textContent = 'сравниваем со снимком от ' + was;
+    box.innerHTML = '<table class="stack"><tbody>' + r.rows.map(row => {
+      const sign = row.delta > 0 ? '+' : '';
+      // Проценты показываем только там, где они что-то значат.
+      const change = !row.reliable ? '<span class="muted">—</span>'
+        : `${sign}${nf(row.delta)}` + (row.percent == null ? '' :
+            ` <span class="muted">(${sign}${row.percent}%)</span>`);
+      const color = !row.reliable ? 'var(--muted)'
+        : (row.delta > 0 ? 'var(--good)' : (row.delta < 0 ? 'var(--serious)' : 'var(--text-2)'));
+      return `<tr>
+        <td><b>${esc(row.title)}</b></td>
+        <td>${nf(row.was)} → ${nf(row.now)}</td>
+        <td style="color:${color};white-space:nowrap">${change}</td>
+        <td class="muted">${esc(row.verdict)}</td>
+      </tr>`;
+    }).join('') + '</tbody></table>';
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
 
 /* ---------------- Минус-фразы ---------------- */
 // Список берём из последней глубокой проверки, новую не запускаем: она
