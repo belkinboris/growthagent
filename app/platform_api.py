@@ -781,11 +781,18 @@ async def growth_decide(rec_id: int, action: str, body: GrowthDecision | None = 
 
         if action == "accept":
             exp = growth_loop.accept_recommendation(session, rec, pp)
+            _record_action(session, identity, "recommendation_accepted",
+                           f"Принял предложение «{rec.title}» — началась проверка", project.id)
             return {"ok": True, "experiment_id": exp.id if exp else None}
         if action == "defer":
             growth_loop.defer_recommendation(session, rec, days=body.days)
+            _record_action(session, identity, "recommendation_deferred",
+                           f"Отложил предложение «{rec.title}» на {body.days} дн.", project.id)
             return {"ok": True}
         growth_loop.reject_recommendation(session, rec, reason=body.reason)
+        _record_action(session, identity, "recommendation_rejected",
+                       f"Отклонил предложение «{rec.title}»"
+                       + (f": {body.reason}" if body.reason else ""), project.id)
         return {"ok": True}
 
 
@@ -800,6 +807,9 @@ async def growth_cancel(exp_id: int, body: GrowthDecision | None = None, identit
             raise HTTPException(status_code=404, detail="Проверка не найдена")
         _require_own_project_id(session, exp.project_id, identity)
         growth_loop.cancel_experiment(session, exp, reason=(body.reason if body else ""))
+        _record_action(session, identity, "experiment_cancelled",
+                       f"Остановил проверку «{exp.title}»"
+                       + (f": {body.reason}" if body and body.reason else ""), exp.project_id)
         return {"ok": True}
 
 
@@ -902,6 +912,14 @@ async def update_stages(project_id: int, body: StagesUpdate, identity=Depends(re
             project.settings_json = sj
             session.add(project)
         session.commit()
+        parts = []
+        if body.titles:
+            parts.append(f"названия шагов воронки ({len(body.titles)})")
+        if body.event_labels:
+            parts.append(f"названия событий ленты ({len(body.event_labels)})")
+        if parts:
+            _record_action(session, identity, "names_changed",
+                           "Изменил " + " и ".join(parts), project_id)
         return {"ok": True, "stages": (await get_stages(project_id, identity))["stages"]}
 
 
@@ -1228,6 +1246,57 @@ async def ads_deep_check(identity=Depends(require_admin)):
 # ---------------------------------------------------------------------------
 
 
+def _record_action(session, identity, action: str, summary: str, project_id=None) -> None:
+    """Записывает действие владельца в журнал.
+
+    Журнал не должен ронять само действие: если запись не удалась, человек
+    всё равно сделал то, что хотел, и получить ошибку вместо результата
+    было бы хуже, чем остаться без строчки в истории.
+    """
+    from app.models import OwnerAction
+
+    try:
+        user_id = getattr(identity, "user_id", None)
+        actor = "владелец платформы"
+        if user_id is not None:
+            user = session.get(PlatformUser, user_id)
+            actor = user.email if user is not None else f"аккаунт #{user_id}"
+        session.add(OwnerAction(
+            project_id=project_id, user_id=user_id, actor=actor,
+            action=action, summary=summary,
+        ))
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("не удалось записать действие владельца: %s", action)
+
+
+@router.get("/api/actions", dependencies=[Depends(require_admin)])
+async def owner_actions(limit: int = 50, identity=Depends(require_admin)):
+    """Журнал действий владельца по выбранному проекту."""
+    from app.models import OwnerAction
+
+    with get_session() as session:
+        project = _find_project(session, identity)
+        if project is None:
+            return {"actions": []}
+        rows = session.exec(
+            select(OwnerAction)
+            .where(OwnerAction.project_id == project.id)
+            .order_by(OwnerAction.created_at.desc())
+            .limit(max(1, min(limit, 200)))
+        ).all()
+        return {"actions": [
+            {
+                "actor": a.actor,
+                "action": a.action,
+                "summary": a.summary,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in rows
+        ]}
+
+
 @router.get("/api/history", dependencies=[Depends(require_admin)])
 async def decisions_history(limit: int = 50, identity=Depends(require_admin)):
     """
@@ -1370,6 +1439,13 @@ async def alert_action(alert_id: int, action: str, identity=Depends(require_admi
             alert.snooze_until = utcnow() + timedelta(hours=24)
         session.add(alert)
         session.commit()
+        _record_action(
+            session, identity,
+            "alert_acknowledged" if action == "ack" else "alert_snoozed",
+            ("Отметил сигнал «{}» как понятный" if action == "ack"
+             else "Отложил сигнал «{}» на сутки").format(alert.title),
+            alert.project_id,
+        )
         return {"ok": True, "status": alert.status.value}
 
 
@@ -1556,6 +1632,8 @@ async def create_project(body: ProjectCreateRequest, identity=Depends(require_ad
         # аккаунта может не быть, и связывать не с кем.
         if identity is not None and identity.user_id is not None:
             accounts.grant_project(session, project.id, identity.user_id)
+        _record_action(session, identity, "project_connected",
+                       f"Подключил проект «{project.name}» ({project.base_url})", project.id)
         return {"ok": True, "project": _project_to_dict(project), "probe": probe}
 
 
@@ -1589,6 +1667,18 @@ async def update_project(project_id: int, body: ProjectUpdateRequest, identity=D
         session.add(project)
         session.commit()
         session.refresh(project)
+        # Перечисляем, что именно поменяли: «изменил настройки» через неделю
+        # не объясняет, почему числа стали другими.
+        changed = [name for name, value in (
+            ("название", body.name), ("адрес", body.base_url), ("токен", body.internal_api_token),
+            ("тип", body.type), ("разметку воронки", body.funnel_mapping),
+            ("счётчик Метрики", body.metrika_counter_id), ("логин Директа", body.direct_client_login),
+            ("адресатов уведомлений", body.notify_chat_ids),
+        ) if value is not None]
+        if changed:
+            _record_action(session, identity, "project_updated",
+                           "Изменил " + ", ".join(changed) + f" у проекта «{project.name}»",
+                           project.id)
         return {"ok": True, "project": _project_to_dict(project)}
 
 
@@ -1607,6 +1697,8 @@ async def activate_project(project_id: int, identity=Depends(require_admin)):
         project.is_active = True
         session.add(project)
         session.commit()
+        _record_action(session, identity, "collection_on",
+                       f"Включил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": True}
 
 
@@ -1620,6 +1712,8 @@ async def pause_project(project_id: int, identity=Depends(require_admin)):
         project.is_active = False
         session.add(project)
         session.commit()
+        _record_action(session, identity, "collection_off",
+                       f"Выключил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": False}
 
 

@@ -1320,6 +1320,10 @@ RETENTION_DAYS = {
     "DeepDiagnosticsCache": 14,      # кэш, старше -- мусор
     "ProjectChangeEvent": 90,        # события изменений: нужны для истории
     "Alert": 60,
+    # Журнал действий владельца: полгода. Он нужен, чтобы объяснить излом
+    # на графике месячной давности, и весит копейки -- несколько строк
+    # в неделю на проект.
+    "OwnerAction": 180,
     # Заявки на отправку живут ровно до тех пор, пока имеет смысл защищать
     # от повторной отправки того же события. Их создаётся столько же,
     # сколько уведомлений, поэтому без ретенции таблица растёт вечно.
@@ -1353,6 +1357,7 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int
         MetricSnapshot,
         NotificationClaim,
         NotificationLog,
+        OwnerAction,
         ProjectChangeEvent,
     )
 
@@ -1362,6 +1367,7 @@ def cleanup_old_data(session: Session, *, dry_run: bool = False, batch_size: int
         "AgentRun": AgentRun,
         "NotificationLog": NotificationLog,
         "NotificationClaim": NotificationClaim,
+        "OwnerAction": OwnerAction,
         "DeepDiagnosticsCache": DeepDiagnosticsCache,
         "ProjectChangeEvent": ProjectChangeEvent,
         "Alert": Alert,

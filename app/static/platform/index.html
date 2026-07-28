@@ -503,6 +503,14 @@
       <h2>История решений</h2>
       <div id="history-body">Загрузка…</div>
     </div>
+    <div class="card">
+      <h2>Что делали руками</h2>
+      <p class="purpose" style="margin-top:0">Зачем: через неделю не вспомнить, почему числа
+        изменились. Здесь видно, кто и когда включил сбор, переименовал шаги, принял или
+        отклонил предложение — аналитик записывает только действия человека, свои решения
+        он показывает выше.</p>
+      <div id="actions-body">Загрузка…</div>
+    </div>
   </div>
 
   <!-- ЛЕНТА -->
@@ -1499,7 +1507,39 @@ const REC_STATUS = {proposed:'ждёт решения', accepted:'принято
   deferred:'отложено', superseded:'заменено новым'};
 const EXP_STATUS = {running:'идёт', enough_data:'данных достаточно', won:'сработало',
   lost:'не сработало', inconclusive:'без вывода', cancelled:'отменено'};
+async function loadActions() {
+  const box = $('actions-body');
+  box.innerHTML = skelLines(3);
+  try {
+    const r = await api('/api/actions?limit=50');
+    if (!r.actions.length) {
+      box.innerHTML = '<p class="muted">Пока пусто: ни одного действия владельца не записано. '
+        + 'Записи появятся, как только вы что-нибудь измените — включите сбор, '
+        + 'переименуете шаги, примете предложение.</p>';
+      return;
+    }
+    box.innerHTML = r.actions.map(a => `<div class="item">
+      <div class="row" style="gap:8px">
+        <span>${esc(a.summary)}</span>
+        <div style="flex:1"></div>
+        <span class="muted" style="white-space:nowrap">${esc(fmtWhen(a.created_at))}</span>
+      </div>
+      <div class="muted" style="font-size:12px">${esc(a.actor)}</div>
+    </div>`).join('');
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+// Дата действия: показываем и день, и время -- «вчера» без времени не
+// поможет сопоставить действие с изломом на графике.
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+}
+
 async function loadHistory() {
+  loadActions();
   const box = $('history-body');
   box.innerHTML = skelLines(4);
   try {
