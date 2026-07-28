@@ -1555,6 +1555,25 @@ async def notify_product_signal_deltas(project: Project, settings, current_payme
     await _notify_from_deltas(project, settings, current_payment_path)
 
 
+async def _notify_project(project: "Project", settings, text: str) -> bool:
+    """Уведомление по проекту -- ЕГО адресату.
+
+    Раньше все живые уведомления уходили в `BOT_ADMIN_CHAT_IDS` из
+    окружения. Для проекта клиента это тот же дефект, что закрыт в B8 для
+    утренней сводки: его события ушли бы владельцу платформы. Некому
+    слать -- молчим и пишем причину в лог, а не отправляем чужому.
+    """
+    from app.notify_targets import project_chat_ids
+
+    with get_session() as session:
+        fresh = session.get(Project, project.id) or project
+        chat_ids, reason = project_chat_ids(session, fresh, settings)
+    if not chat_ids:
+        logger.info("Уведомление не отправлено (project=%s): %s", project.id, reason)
+        return False
+    return await _send_telegram_notification(settings, text, chat_ids)
+
+
 async def _notify_from_events(project: Project, settings, events: list[dict], alert_mode: str) -> None:
     """
     Founder Live Feed (v2): дискретные события с dedup по event_id.
@@ -1591,7 +1610,7 @@ async def _notify_from_events(project: Project, settings, events: list[dict], al
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 return
-            sent_ok = await _send_telegram_notification(settings, digest_text)
+            sent_ok = await _notify_project(project, settings, digest_text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, "feed_digest")
                 logger.info("Live notification sent: feed digest (project_id=%s, count=%s)", project.id, len(relevant))
@@ -1618,7 +1637,7 @@ async def _notify_from_events(project: Project, settings, events: list[dict], al
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 continue  # защита от гонки
-            sent_ok = await _send_telegram_notification(settings, text)
+            sent_ok = await _notify_project(project, settings, text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, event.get("event_type", "user_event"), user_id=event.get("user_key"))
                 logger.info(
@@ -1656,7 +1675,7 @@ async def _notify_from_journeys(project: Project, settings, journeys: list[dict]
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 return
-            sent_ok = await _send_telegram_notification(settings, digest_text)
+            sent_ok = await _notify_project(project, settings, digest_text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, "journey_digest")
                 logger.info("Live notification sent: journey digest (project_id=%s, count=%s)", project.id, len(journeys))
@@ -1695,7 +1714,7 @@ async def _notify_from_journeys(project: Project, settings, journeys: list[dict]
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 continue  # на случай гонки между чтением candidate_keys и отправкой
-            sent_ok = await _send_telegram_notification(settings, text)
+            sent_ok = await _notify_project(project, settings, text)
             if sent_ok:
                 # event_type для NotificationLog -- извлекаем из event_key
                 # (формат journey:<user_key>:<step>:<ts>), без user_id PII в event_type поле
@@ -1732,7 +1751,7 @@ async def _notify_from_deltas(project: Project, settings, current_payment_path: 
         with get_session() as session:
             if was_notified(session, project.id, event_key):
                 return
-            sent_ok = await _send_telegram_notification(settings, batch.digest_text)
+            sent_ok = await _notify_project(project, settings, batch.digest_text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, "digest")
                 logger.info("Live notification sent: digest (project_id=%s)", project.id)
@@ -1744,7 +1763,7 @@ async def _notify_from_deltas(project: Project, settings, current_payment_path: 
             if was_notified(session, project.id, event_key):
                 continue
             text = format_notification(delta)
-            sent_ok = await _send_telegram_notification(settings, text)
+            sent_ok = await _notify_project(project, settings, text)
             if sent_ok:
                 mark_notified(session, project.id, event_key, delta.event_type)
                 logger.info(
@@ -2113,6 +2132,7 @@ async def growth_loop_tick_and_notify(
     Никогда не бросает исключения наружу.
     """
     from app import growth_loop
+    from app.notify_targets import project_chat_ids
     from app.truepost_playbook import truepost_playbook
     from app.service import mark_notified, was_notified
 
@@ -2148,6 +2168,14 @@ async def growth_loop_tick_and_notify(
                     "action": new_rec.action,
                 }
             project_id = db_project.id
+            # Адресат -- у проекта свой (B8): вердикт по проекту клиента
+            # не должен уходить владельцу платформы.
+            chat_ids, no_recipients_reason = project_chat_ids(session, db_project, settings)
+
+        if not chat_ids and (finished_payload is not None or rec_payload is not None):
+            logger.info("Growth Loop: уведомление не отправлено (project=%s): %s",
+                        project_id, no_recipients_reason)
+            return outcome
 
         if finished_payload is not None:
             key = f"gl_verdict:{finished_payload['id']}"
@@ -2160,7 +2188,7 @@ async def growth_loop_tick_and_notify(
                     f"{finished_payload['summary']}\n\n"
                     f"Следующий шаг: /board"
                 )
-                if await send(settings, text):
+                if await send(settings, text, chat_ids):
                     with session_factory() as session:
                         mark_notified(session, project_id, key, "gl_verdict")
                     outcome["verdict_sent"] = True
@@ -2176,7 +2204,7 @@ async def growth_loop_tick_and_notify(
                     f"{rec_payload['action']}\n\n"
                     f"Принять/отклонить: /board"
                 )
-                if await send(settings, text):
+                if await send(settings, text, chat_ids):
                     with session_factory() as session:
                         mark_notified(session, project_id, key, "gl_proposed")
                     outcome["proposal_sent"] = True

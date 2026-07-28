@@ -371,7 +371,8 @@ class TestTickAndNotify:
 
         sent = []
 
-        async def fake_send(settings, text):
+        # Адресат передаётся явно (B8/B10): у каждого проекта свой канал.
+        async def fake_send(settings, text, chat_ids=None):
             sent.append(text)
             return True
 

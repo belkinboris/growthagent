@@ -108,6 +108,85 @@ class TestRecipients:
         assert "BOT_ADMIN_CHAT_IDS" in reason
 
 
+class TestLiveAndGrowthLoopUseProjectChannel:
+    """B10: живая лента и Growth Loop раньше слали в канал из окружения --
+    для проекта клиента это та же утечка, что закрыта в B8 для сводки."""
+
+    def test_live_notification_goes_to_project_channel(self, factory, monkeypatch):
+        with factory() as session:
+            project = _project(session, chat_ids=["777"])
+
+        monkeypatch.setattr(scheduler, "get_session", factory)
+        sent = []
+
+        async def fake_send(settings, text, chat_ids=None):
+            sent.append((chat_ids, text))
+            return True
+
+        monkeypatch.setattr(scheduler, "_send_telegram_notification", fake_send)
+        ok = asyncio.run(scheduler._notify_project(project, _Settings(), "Событие"))
+        assert ok is True
+        assert sent == [(["777"], "Событие")]
+
+    def test_live_notification_is_silent_without_recipients(self, factory, monkeypatch):
+        with factory() as session:
+            accounts.create_user(session, "boss@example.com", "qwerty12")
+            client_user = accounts.create_user(session, "client@example.com", "qwerty12")
+            project = _project(session, name="Магазин клиента")
+            project_id = project.id
+            accounts.grant_project(session, project_id, client_user.id)
+
+        # grant_project коммитит и «протухает» объект проекта, поэтому
+        # передаём в отправку такую же заглушку, как приходит из цикла:
+        # внутри всё равно перечитывается свежая запись.
+        class _Project:
+            id = project_id
+
+        project = _Project()
+        monkeypatch.setattr(scheduler, "get_session", factory)
+        sent = []
+
+        async def fake_send(settings, text, chat_ids=None):
+            sent.append(chat_ids)
+            return True
+
+        monkeypatch.setattr(scheduler, "_send_telegram_notification", fake_send)
+        ok = asyncio.run(scheduler._notify_project(project, _Settings(), "Событие"))
+        assert ok is False
+        assert sent == [], "событие клиента ушло в чужой канал"
+
+    def test_growth_loop_verdict_uses_project_channel(self, factory, monkeypatch):
+        """Вердикт эксперимента -- такое же уведомление, как остальные."""
+        from app import growth_loop
+        from app.truepost_playbook import truepost_playbook
+
+        with factory() as session:
+            project = _project(session, chat_ids=["555"])
+            project_id = project.id
+
+        sent = []
+
+        async def fake_send(settings, text, chat_ids=None):
+            sent.append(chat_ids)
+            return True
+
+        payment_path = {
+            "registrations": 20, "channels_created": 16,
+            "first_post_feedback_good": 7, "first_post_feedback_bad": 3,
+            "pricing_viewed": 2, "payment_started": 0, "payment_success": 0,
+        }
+
+        class FakeProject:
+            id = project_id
+
+        result = asyncio.run(scheduler.growth_loop_tick_and_notify(
+            FakeProject(), _Settings(), payment_path,
+            _send=fake_send, _session_factory=factory))
+        if not (result["verdict_sent"] or result["proposal_sent"]):
+            pytest.skip("движок в этом состоянии ничего не предлагает")
+        assert sent == [["555"]]
+
+
 class TestDailyBoardPerProject:
     def _run_board(self, factory, sent):
         async def fake_send(settings, text, chat_ids=None):
