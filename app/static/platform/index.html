@@ -493,6 +493,18 @@
       </div>
       <div class="report" id="deep-body" style="margin-top:12px"></div>
     </div>
+
+    <!-- Готовый список минус-фраз. Аналитик его НЕ применяет: правки
+         рекламы делает человек своими руками -- это сознательное
+         ограничение продукта. -->
+    <div class="card">
+      <h2>Минус-фразы: готовый список<span class="spacer"></span>
+        <button class="btn sm" id="neg-copy">Скопировать список</button></h2>
+      <p class="purpose" style="margin-top:0">Зачем: по данным глубокой проверки видно, какие
+        запросы жгут бюджет и не приводят людей. Список можно вставить в минус-фразы кампании
+        в Яндекс.Директе. Аналитик сам рекламу не меняет — решение и кнопка ваши.</p>
+      <div id="neg-body">Загрузка…</div>
+    </div>
   </div>
 
   <!-- ИСТОРИЯ -->
@@ -1398,6 +1410,71 @@ $('events-ai').onclick = async () => {
   } catch (e) { $('events-status').textContent = e.message; }
 };
 
+/* ---------------- Минус-фразы ---------------- */
+// Список берём из последней глубокой проверки, новую не запускаем: она
+// тяжёлая (до минуты), и открытие вкладки не должно её заказывать.
+let negativeText = '';
+
+// «2 фраз» и «34 кликов» -- мелочь, но именно по таким мелочам текст
+// читается как машинный.
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+
+async function loadNegatives() {
+  const box = $('neg-body');
+  box.innerHTML = skelLines(3);
+  try {
+    const r = await api('/api/ads/negative-keywords');
+    negativeText = r.text || '';
+    if (!r.phrases.length) {
+      box.innerHTML = `<p class="muted">${esc(r.hint || 'Список пуст.')}</p>`;
+      return;
+    }
+    const when = r.checked_at ? r.checked_at.slice(0, 16).replace('T', ' ') : '';
+    box.innerHTML =
+      `<p class="muted" style="margin-top:0">${r.phrases.length} ${
+        plural(r.phrases.length, 'фраза', 'фразы', 'фраз')}${
+        r.total_cost ? `, на них ушло ${nf(r.total_cost)} ₽` : ''}${
+        r.period_label ? ' за ' + esc(r.period_label) : ''}${
+        when ? '. Проверка от ' + esc(when) : ''}.</p>`
+      // Ненадёжная атрибуция -- предупреждение ДО списка: без него
+      // «нет регистраций» может значить «мы их не увидели».
+      + (r.has_registration_attribution ? '' :
+         `<p class="muted" style="color:var(--serious)">Внимание: регистрации по запросам
+          аналитик достоверно не видит${r.attribution_note ? ' — ' + esc(r.attribution_note) : ''}.
+          Проверьте фразы глазами, прежде чем минусовать.</p>`)
+      + `<pre class="code" id="neg-text">${esc(negativeText)}</pre>`
+      + '<table class="stack"><tbody>' + r.phrases.map(p => `<tr>
+          <td><b>${esc(p.query)}</b></td>
+          <td class="muted">${esc(p.reason)}</td>
+          <td class="muted" style="white-space:nowrap">${nf(p.clicks)} ${
+            plural(p.clicks, 'клик', 'клика', 'кликов')} · ${nf(p.cost)} ₽</td>
+        </tr>`).join('') + '</tbody></table>';
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+$('neg-copy').onclick = async () => {
+  if (!negativeText) { toast('Список пуст — копировать нечего.'); return; }
+  try {
+    await navigator.clipboard.writeText(negativeText);
+    toast('Список скопирован. Вставьте его в минус-фразы кампании в Яндекс.Директе.');
+  } catch (e) {
+    // Буфер доступен не везде (http без TLS, старые браузеры). Молча
+    // «скопировать» и не скопировать хуже, чем выделить текст.
+    const el = $('neg-text');
+    if (!el) { toast('Скопировать не вышло: список ещё не загружен.'); return; }
+    const r = document.createRange(); r.selectNodeContents(el);
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    toast('Браузер не дал доступ к буферу — список выделен, скопируйте вручную.');
+  }
+};
+
 /* ---------------- Реклама ---------------- */
 // Директ и Метрика — необязательные источники. Без них аналитик работает,
 // просто не знает про деньги и внешний трафик. Показать таблицу прочерков
@@ -1449,6 +1526,7 @@ function renderOptionalSources(sources, hasDirectData) {
 }
 
 async function loadAds() {
+  loadNegatives();
   showSkeleton('ads-kpis', skelKpis(5));
   $('ads-table').tBodies[0].innerHTML = `<tr><td>${skelLines(4)}</td></tr>`;
   try {

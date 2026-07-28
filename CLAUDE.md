@@ -45,7 +45,7 @@ OOM в `connectors/direct.py`, диагностика памяти в `scheduler
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080   # прод-команда (Timeweb)
-python3 -m pytest tests/ -q                        # 800 тестов, все зелёные
+python3 -m pytest tests/ -q                        # 810 тестов, все зелёные
 ```
 
 Прогон должен быть чистым. Любое падение — регрессия, а не «известная

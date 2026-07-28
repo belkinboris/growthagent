@@ -1241,6 +1241,69 @@ async def ads_deep_check(identity=Depends(require_admin)):
     }
 
 
+@router.get("/api/ads/negative-keywords", dependencies=[Depends(require_admin)])
+async def negative_keywords(identity=Depends(require_admin)):
+    """
+    Готовый список минус-фраз по данным последней глубокой проверки Директа.
+
+    Аналитик их НЕ применяет: правки рекламы делает человек своими руками —
+    это сознательное ограничение продукта. Задача платформы — собрать
+    список, объяснить, почему каждая фраза туда попала, и дать скопировать
+    одним движением.
+
+    Новую тяжёлую проверку здесь не запускаем: читаем то, что уже посчитано
+    (кнопка «Проверить глубже» стоит рядом). Иначе открытие вкладки
+    заказывало бы десятки секунд работы Директа.
+    """
+    from app.service import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        cached = get_cached_diagnostics(
+            session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        )
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False,
+            "phrases": [],
+            "hint": "Глубокой проверки Директа ещё не было. Нажмите «Проверить глубже» — "
+                    "аналитик посмотрит поисковые запросы и соберёт список.",
+        }
+
+    data = dict(cached.result_json or {})
+    rows = data.get("safe_negatives") or []
+    phrases = [
+        {
+            "query": r.get("query"),
+            "clicks": r.get("clicks"),
+            "cost": r.get("cost"),
+            # Почему фраза в списке -- показываем словами. Без причины это
+            # просьба доверять аналитику вслепую, а решение принимает человек.
+            "reason": r.get("reason") or "",
+            "campaign": r.get("campaign_name"),
+        }
+        for r in rows if r.get("query")
+    ]
+    total_cost = round(sum(float(p["cost"] or 0) for p in phrases), 2)
+    return {
+        "ok": True,
+        "phrases": phrases,
+        "text": "\n".join(p["query"] for p in phrases),
+        "total_cost": total_cost,
+        "period_label": data.get("period_label"),
+        "checked_at": cached.created_at.isoformat() if cached.created_at else None,
+        # Атрибуция регистраций ненадёжна -- об этом надо сказать до того,
+        # как человек вырежет фразы: без неё «нет регистраций» может
+        # означать «мы их не увидели».
+        "attribution_note": data.get("registration_attribution_note") or "",
+        "has_registration_attribution": bool(data.get("has_registration_attribution")),
+        "hint": None if phrases else
+                "Фраз, которые можно безопасно отминусовать, аналитик не нашёл: "
+                "либо все запросы приносят результат, либо данных пока мало.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # История решений: что предлагали, что приняли, чем кончилось
 # ---------------------------------------------------------------------------
