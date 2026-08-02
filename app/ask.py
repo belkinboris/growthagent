@@ -94,12 +94,15 @@ SCREENS_REFERENCE = """ЭКРАНЫ ПЛАТФОРМЫ (что где смотр
 — Отчёты: полные текстовые версии доски, воронки, пути к оплате."""
 
 
-def _live_screens_summary(session, project) -> str:
+def _live_screens_summary(session, project, agent: str | None = None) -> str:
     """Те же числа и вердикты, что видит владелец на «Обзоре» сейчас.
 
     Считает теми же чистыми функциями, что и сами endpoint'ы (`_compare_row`,
     `_source_row`, `assess`) -- если поменяется порог малой выборки, чат
     и экран не разойдутся в оценке одних и тех же данных.
+
+    `agent` сужает выдачу до карточек этого агента (чат конкретной вкладки
+    не должен тонуть в чужих цифрах); без него -- общий чат, все карточки.
     """
     from datetime import timedelta
 
@@ -132,7 +135,8 @@ def _live_screens_summary(session, project) -> str:
                  .order_by(MetricSnapshot.created_at.desc())
         ).first()
 
-        if latest is not None:
+        # Неделя к неделе и готовность выводов -- вкладка Диагноста.
+        if agent in (None, "diagnostician") and latest is not None:
             now_values = extract_normalized_metrics_from_snapshot(latest)
 
             if previous is not None:
@@ -151,26 +155,35 @@ def _live_screens_summary(session, project) -> str:
                 lines.append("КАРТОЧКА «КОГДА ВЫВОДАМ МОЖНО БУДЕТ ВЕРИТЬ» (Обзор): " + "; ".join(
                     f"{r['question']} — {'готово' if r['ready'] else 'нет'}" for r in readiness_rows))
 
-        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
-        if cached is not None and cached.ok:
-            breakdown = parse_source_breakdown(cached.result_json or {})
-            if breakdown:
-                source_rows = [_source_row(label, data)
-                               for label, data in aggregate_by_label(breakdown).items()]
-                if source_rows:
-                    lines.append('КАРТОЧКА «ОТКУДА ПРИХОДЯТ ТЕ, КТО ПЛАТИТ» (Обзор): '
-                                + _sources_summary(source_rows))
+        # Источники трафика -- вкладка Маркетолога.
+        if agent in (None, "marketer"):
+            cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+            if cached is not None and cached.ok:
+                breakdown = parse_source_breakdown(cached.result_json or {})
+                if breakdown:
+                    source_rows = [_source_row(label, data)
+                                   for label, data in aggregate_by_label(breakdown).items()]
+                    if source_rows:
+                        lines.append('КАРТОЧКА «ОТКУДА ПРИХОДЯТ ТЕ, КТО ПЛАТИТ» (Обзор): '
+                                    + _sources_summary(source_rows))
     except Exception:
         logger.exception("ask: live screens summary failed")
 
     return "\n".join(lines)
 
 
-def build_context(session, project) -> str:
+def build_context(session, project, agent: str | None = None) -> str:
     """
     Снимок данных для системного контекста: доска (+growth loop состояние),
     воронка, оплата, динамика. Всё из существующих builder'ов и кэшей --
     никаких новых запросов к TruePost. Устойчив к отсутствию любого куска.
+
+    `agent` -- чат конкретной вкладки (diagnostician/marketer/product/tester).
+    Общий контекст (доска, Growth Loop, как читать цифры) виден всем -- по
+    нему принимаются решения, и урезать его ради экономии токенов означало
+    бы, что чат вкладки не знает, что уже решено. Урезаются только большие
+    предметные блоки (реклама, живые карточки источников/недели), которые
+    другому агенту не нужны и только отвлекают модель.
     """
     from app import growth_loop
     from app.commercial_report import (
@@ -242,35 +255,36 @@ def build_context(session, project) -> str:
         if isinstance(sb, dict) and sb:
             parts.append("ПО ИСТОЧНИКАМ: " + str(sb))
 
-    # Расход рекламы: последний combined-снимок 7д (spend/clicks)
-    try:
-        from sqlmodel import select as _select
-        from app.models import MetricSnapshot
-        from app.service import extract_normalized_metrics_from_snapshot
-        snapshot = session.exec(
-            _select(MetricSnapshot)
-            .where(
-                MetricSnapshot.project_id == project.id,
-                MetricSnapshot.period_key == "7d",
-                MetricSnapshot.source == "combined",
-            )
-            .order_by(MetricSnapshot.created_at.desc())
-            .limit(1)
-        ).first()
-        if snapshot is not None:
-            raw = extract_normalized_metrics_from_snapshot(snapshot)
-            spend, clicks = raw.get("spend"), raw.get("clicks")
-            if spend is not None or clicks is not None:
-                cpa = None
-                regs = (pp_dict or {}).get("registrations")
-                if spend and regs:
-                    cpa = round(float(spend) / int(regs))
-                parts.append(
-                    f"РЕКЛАМА (7 дней, Яндекс Директ): расход {spend} ₽, кликов {clicks}"
-                    + (f", цена регистрации ≈ {cpa} ₽" if cpa else "")
+    # Расход рекламы: последний combined-снимок 7д (spend/clicks) -- вкладка Маркетолога.
+    if agent in (None, "marketer"):
+        try:
+            from sqlmodel import select as _select
+            from app.models import MetricSnapshot
+            from app.service import extract_normalized_metrics_from_snapshot
+            snapshot = session.exec(
+                _select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.project_id == project.id,
+                    MetricSnapshot.period_key == "7d",
+                    MetricSnapshot.source == "combined",
                 )
-    except Exception:
-        logger.exception("ask: ads spend context failed")
+                .order_by(MetricSnapshot.created_at.desc())
+                .limit(1)
+            ).first()
+            if snapshot is not None:
+                raw = extract_normalized_metrics_from_snapshot(snapshot)
+                spend, clicks = raw.get("spend"), raw.get("clicks")
+                if spend is not None or clicks is not None:
+                    cpa = None
+                    regs = (pp_dict or {}).get("registrations")
+                    if spend and regs:
+                        cpa = round(float(spend) / int(regs))
+                    parts.append(
+                        f"РЕКЛАМА (7 дней, Яндекс Директ): расход {spend} ₽, кликов {clicks}"
+                        + (f", цена регистрации ≈ {cpa} ₽" if cpa else "")
+                    )
+        except Exception:
+            logger.exception("ask: ads spend context failed")
 
     # Как читать сырые числа (типовые вопросы владельца)
     parts.append(
@@ -296,7 +310,7 @@ def build_context(session, project) -> str:
     # Живые числа тех же карточек, что видит владелец на «Обзоре» -- чтобы
     # отвечать не общими словами, а теми же цифрами, что на экране, и
     # называть карточку, где их можно перепроверить (принцип 8 выше).
-    live = _live_screens_summary(session, project)
+    live = _live_screens_summary(session, project, agent)
     if live:
         parts.append(live)
 

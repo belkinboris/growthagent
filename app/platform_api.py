@@ -134,6 +134,9 @@ class ProjectUpdateRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+    # Чат конкретной вкладки-агента сужает контекст до её данных; общий чат
+    # на доске фаундера не передаёт agent вовсе -- видит всё, как раньше.
+    agent: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +762,113 @@ async def growth_state(identity=Depends(require_admin)):
                 "text": build_verdict_block(last),
             }
         return out
+
+
+# ---------------------------------------------------------------------------
+# Доска фаундера: сигналы и рекомендация — одним списком, с ярлыком «кто нашёл»
+# ---------------------------------------------------------------------------
+#
+# Раньше, чтобы понять, с чего начать день, нужно было обойти по кругу
+# «Обзор» (сигналы), «Реклама» (трафик), «Историю» (эксперименты) — каждый
+# честно отвечал на свой вопрос, но собрать из них одну картину «что делать
+# сначала» мог только сам владелец. Здесь то же самое, что уже показывают
+# /api/alerts и /api/growth, просто сведено в один список и подписано, какой
+# агент (вкладка) отвечает за эту проблему -- чтобы понять, куда идти
+# разбираться дальше.
+#
+# Категории/области -- то, что УЖЕ решает rules.py/growth_loop.py; здесь
+# только подпись, кто за какую область отвечает на экране. Если область
+# окажется на стыке (так и есть с onboarding/pricing_screen) -- это строка
+# в словаре, а не переделка.
+
+CATEGORY_TO_AGENT: dict[str, str] = {
+    "traffic_no_signups": "marketer",
+    "signups_no_activation": "diagnostician",
+    "activation_drop": "diagnostician",
+    "payments_started_no_success": "diagnostician",
+    "pending_payments": "diagnostician",
+    "metrics_discrepancy": "diagnostician",
+    "integration_down": "diagnostician",
+}
+
+AREA_TO_AGENT: dict[str, str] = {
+    "tracking": "diagnostician",
+    "collect_data": "diagnostician",
+    "onboarding": "diagnostician",
+    "payment_path": "diagnostician",
+    "scale": "diagnostician",
+    "pricing_screen": "marketer",
+    "first_post": "product",
+    "collect_feedback": "product",
+    "commercial_bridge": "product",
+}
+
+AGENT_TITLES: dict[str, str] = {
+    "diagnostician": "Диагност", "marketer": "Маркетолог",
+    "product": "Продакт", "tester": "Тестировщик",
+}
+
+
+@router.get("/api/dashboard", dependencies=[Depends(require_admin)])
+async def dashboard(identity=Depends(require_admin)):
+    """Открытые проблемы всех агентов одним списком -- доска фаундера."""
+    from app import growth_loop
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+
+        alert_rows = session.exec(
+            select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
+            .order_by(Alert.last_seen_at.desc())
+        ).all()
+
+        rec = growth_loop.get_active_recommendation(session, project.id)
+        running = growth_loop.get_running_experiment(session, project.id)
+
+    cards = []
+    for a in alert_rows:
+        agent = CATEGORY_TO_AGENT.get(a.category.value, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "alert", "id": a.id, "severity": a.severity.value,
+            "title": a.title, "message": a.message,
+            "found_by": f"{AGENT_TITLES[agent]} обнаружил",
+            "tested_by": None,
+            "actions": [{"action": "ack", "label": "Понял"},
+                        {"action": "snooze", "label": "Отложить на сутки"}],
+        })
+
+    if rec is not None:
+        # Ждёт решения владельца: принять можно только одну рекомендацию за
+        # раз (см. growth_loop.propose_if_needed), поэтому пока она не
+        # принята, эксперимента по ней ещё нет.
+        agent = AREA_TO_AGENT.get(rec.area, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "recommendation", "id": rec.id, "severity": None,
+            "title": rec.title, "message": rec.action,
+            "found_by": f"{AGENT_TITLES[agent]} предложил",
+            "tested_by": None,
+            "actions": [{"action": "accept", "label": "Сделаю"},
+                        {"action": "reject", "label": "Не буду"}],
+        })
+    elif running is not None:
+        # Рекомендацию уже приняли -- она больше не "proposed", но проверка
+        # идёт, и владельцу важно видеть её на доске, а не только во вкладке
+        # Тестировщика.
+        agent = AREA_TO_AGENT.get(running.area, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "experiment", "id": running.id, "severity": None,
+            "title": running.title, "message": running.hypothesis,
+            "found_by": f"{AGENT_TITLES[agent]} предложил",
+            "tested_by": f"{AGENT_TITLES['tester']} проверяет: "
+                        f"{running.current_sample}/{running.target_sample}",
+            "actions": [{"action": "cancel", "label": "Отменить проверку"}],
+        })
+
+    return {"cards": cards, "hint": None if cards else
+            "Открытых проблем нет: по всем проверяемым правилам всё в норме."}
 
 
 @router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
@@ -1789,6 +1899,71 @@ _SOURCE_FIELDS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Отзывы о результате: что людям не нравится (Продакт)
+# ---------------------------------------------------------------------------
+#
+# Причины отказов уже собирались, но были видны только внутри длинных
+# текстовых отчётов (/pay, /checks) -- владелец не мог посмотреть их
+# отдельно, не читая всё остальное. Эндпоинт просто открывает то, что уже
+# считает планировщик, отдельной JSON-выдачей -- новой логики здесь нет.
+
+FEEDBACK_MIN_SAMPLE = MIN_FOR_A_TREND
+
+
+@router.get("/api/feedback", dependencies=[Depends(require_admin)])
+async def feedback(identity=Depends(require_admin)):
+    """Отзывы о первом результате: сколько понравилось, сколько нет и почему."""
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+    from app.vocabulary import feedback_reason_label
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False, "good": None, "bad": None, "reasons": [], "checked_at": None,
+            "hint": "Разбор пути до оплаты ещё не собирался. Отзывы появятся "
+                    "после первого полного цикла сбора.",
+        }
+
+    pp = cached.result_json or {}
+    good = int(pp.get("first_post_feedback_good") or 0)
+    bad = int(pp.get("first_post_feedback_bad") or 0)
+    total = good + bad
+    checked_at = cached.created_at.isoformat() if cached.created_at else None
+
+    if total == 0:
+        return {
+            "ok": True, "good": 0, "bad": 0, "total": 0, "reliable": False,
+            "reasons": [], "checked_at": checked_at,
+            "hint": "За этот период никто не оставил отзыв о первом результате.",
+        }
+
+    reasons_raw = pp.get("first_post_feedback_reasons") or {}
+    reasons = sorted(
+        (
+            {"key": key, "label": feedback_reason_label(key), "count": int(count)}
+            for key, count in reasons_raw.items()
+            if isinstance(count, (int, float)) and count > 0
+        ),
+        key=lambda r: -r["count"],
+    )
+
+    # Доля плохих отзывов на 1-2 ответах ничего не значит -- тот же порог,
+    # что и у сравнения недель, чтобы платформа не говорила об уверенности
+    # по-разному в разных местах.
+    reliable = total >= FEEDBACK_MIN_SAMPLE
+    return {
+        "ok": True, "good": good, "bad": bad, "total": total, "reliable": reliable,
+        "bad_share_percent": round(bad / total * 100) if reliable else None,
+        "reasons": reasons, "checked_at": checked_at,
+        "hint": None if reliable else
+                f"Отзывов пока {total} — этого мало, чтобы говорить о доле хороших и плохих.",
+    }
+
+
 @router.get("/api/sources", dependencies=[Depends(require_admin)])
 async def sources_cohorts(identity=Depends(require_admin)):
     """Кто приходит из каждого канала и доходит ли до оплаты."""
@@ -2214,9 +2389,10 @@ async def ask(body: AskRequest, identity=Depends(require_admin)):
             status_code=503,
             detail="LLM не настроен: задайте LLM_PROVIDER=yandex и YANDEX_API_KEY/YANDEX_FOLDER_ID",
         )
+    agent = body.agent if body.agent in ("diagnostician", "marketer", "product", "tester") else None
     with get_session() as session:
         project = _active_project(session, identity)
-        context_text = ask_module.build_context(session, project)
+        context_text = ask_module.build_context(session, project, agent)
 
     answer = await ask_module.answer_question(body.question, context_text, settings)
     if answer is None:

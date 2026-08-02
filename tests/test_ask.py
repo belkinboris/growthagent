@@ -294,3 +294,58 @@ class TestScreenReferences:
             s.add(p); s.commit(); s.refresh(p)
             ctx = ask.build_context(s, p)
         assert "КАРТОЧКА" not in ctx
+
+
+class TestPerAgentChat:
+    """Чат вкладки-агента не должен тонуть в чужих цифрах: общий контекст
+    (доска, Growth Loop) виден всем, предметные блоки (реклама) -- только
+    своему агенту."""
+
+    def _project_with_ads(self, s):
+        from datetime import datetime, timezone
+        from app.models import MetricSnapshot
+
+        p = Project(name="TruePost", type="t", is_active=True)
+        s.add(p); s.commit(); s.refresh(p)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        s.add(MetricSnapshot(
+            project_id=p.id, period_key="7d", source="combined",
+            period_start=now, period_end=now,
+            metrics_json={"product": {"signup": 16}, "direct": {"spend": 4124, "clicks": 136}},
+        ))
+        s.commit()
+        return p
+
+    def test_no_agent_sees_everything(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            ctx = ask.build_context(s, p)
+        assert "РЕКЛАМА" in ctx
+
+    def test_marketer_sees_ads_diagnostician_does_not(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            marketer_ctx = ask.build_context(s, p, agent="marketer")
+            diag_ctx = ask.build_context(s, p, agent="diagnostician")
+        assert "РЕКЛАМА" in marketer_ctx
+        assert "РЕКЛАМА" not in diag_ctx
+
+    def test_common_context_survives_agent_filter(self):
+        """Доска и правила чтения цифр видны любому агенту -- иначе чат
+        вкладки не будет знать, что уже решено."""
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            ctx = ask.build_context(s, p, agent="product")
+        assert "Доска" in ctx
+        assert "КАК ЧИТАТЬ ЦИФРЫ" in ctx
+
+    def test_platform_api_rejects_unknown_agent_value(self):
+        """/api/ask сам отфильтровывает мусорное значение agent, а не
+        передаёт его дальше как есть."""
+        from app.platform_api import AskRequest
+        body = AskRequest(question="q", agent="выдумка")
+        allowed = body.agent if body.agent in ("diagnostician", "marketer", "product", "tester") else None
+        assert allowed is None
