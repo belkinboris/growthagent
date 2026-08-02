@@ -50,6 +50,7 @@ class AlertCategory(str, Enum):
     payments_started_no_success = "payments_started_no_success"
     pending_payments = "pending_payments"
     metrics_discrepancy = "metrics_discrepancy"
+    payments_invisible_in_metrika = "payments_invisible_in_metrika"  # задача F6
     integration_down = "integration_down"  # инфраструктурная, не бизнес-проблема
 
 
@@ -678,3 +679,46 @@ class PlatformSubscription(SQLModel, table=True):
     payment_id: str = Field(default="", index=True)
     paid_until: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow, index=True)
+
+
+class AgentActionStatus(str, Enum):
+    proposed = "proposed"                    # предложил, ждёт решения владельца
+    applied = "applied"                       # применено (агентом или владельцем)
+    rejected = "rejected"                     # владелец отклонил
+    blocked_not_configured = "blocked_not_configured"  # хотел применить сам, но запись не настроена
+
+
+class AgentAction(SQLModel, table=True):
+    """
+    Что предложил или сделал сам агент (задача F6).
+
+    Аналог `OwnerAction`, но для машинных действий: `OwnerAction` пишет
+    только то, что сделал человек руками, здесь -- что сделал (или
+    предложил сделать) один из агентов (Диагност/Маркетолог/Продакт/
+    Тестировщик). Один и тот же журнал кормит и карточки «предложил»
+    на доске фаундера, и ленту «сделал сам» при включённом уровне
+    автономии 3 -- фронту не нужно домысливать, что откуда взялось.
+
+    `payload_json` хранит `{"before": ..., "after": ...}` -- то, что
+    реально меняется (например старая и новая цель в Метрике), чтобы
+    показать владельцу разницу, а не просто текст «поправил цель».
+
+    Новая таблица, а не колонки в существующих: `ALTER TABLE` на живой
+    базе здесь запрещён (правило из прод-инцидентов).
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    agent: str = Field(index=True)            # diagnostician|marketer|product|tester
+    domain: str = Field(index=True)           # metrika_goal|direct_bid|direct_minus_phrase|product|pricing|landing
+    action: str = ""                          # create_goal|update_goal|add_minus_phrase…
+    reasoning: str = ""                       # человеческая формулировка «почему» (рус.)
+    payload_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    status: str = Field(default=AgentActionStatus.proposed.value, index=True)
+    autonomy_level_at_time: int = 1
+    related_alert_id: Optional[int] = Field(default=None, foreign_key="alert.id")
+    related_recommendation_id: Optional[int] = Field(
+        default=None, foreign_key="growthrecommendation.id"
+    )
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    applied_at: Optional[datetime] = None

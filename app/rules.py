@@ -53,8 +53,9 @@ class NormalizedMetrics:
     ctr: Optional[float] = None
 
     # из Яндекс.Метрики (отдельно от Project Metrics API -- для сравнения,
-    # см. правило metrics_discrepancy)
+    # см. правила metrics_discrepancy и payments_invisible_in_metrika)
     metrika_signup: Optional[int] = None
+    metrika_payment_success: Optional[int] = None
 
     # какие источники реально ответили в этом окне -- используется, чтобы
     # не путать "0 событий" с "источник не отвечал"
@@ -292,6 +293,45 @@ RULES: list[Rule] = [
         do_not_action_template="Не делать выводов про рекламу на основе данных Метрики, пока расхождение не объяснено.",
         sample_size_fn=lambda m: m.signup or 0,
         payload_fn=lambda m: {"signup": m.signup or 0},
+    ),
+
+    Rule(
+        # Задача F6, реальный случай владельца: оплата прошла и видна в
+        # воронке продукта, а в Метрике (и, значит, в Директе) цель
+        # payment_success не сработала ни разу -- пользователя, его путь и
+        # поисковый запрос установить невозможно. metrics_discrepancy выше
+        # проверяет только signup -- у оплаты своя цена ошибки (деньги уже
+        # есть, а реклама всё ещё считается неэффективной), поэтому порог
+        # по количеству оплат обязателен: на одной оплате шуметь нельзя,
+        # это может быть просто задержка синхронизации Метрики.
+        rule_id="payments_invisible_in_metrika",
+        title="Оплаты не видны в Метрике",
+        category=AlertCategory.payments_invisible_in_metrika,
+        severity=AlertSeverity.p1,
+        affected_step="payment_success",
+        metric_type="conversion",
+        required_sources=("product", "metrika"),
+        condition=lambda m: (
+            _has("product", "metrika")(m)
+            and (m.payment_success or 0) >= MIN_PAYMENT_ATTEMPTS_FOR_PAYMENT_ALERT
+            and (m.metrika_payment_success or 0) == 0
+        ),
+        hypothesis_template=(
+            "Продукт показывает {payment_success} успешных оплат, а цель "
+            "payment_success в Метрике -- 0. Скорее всего, цель отвязана от "
+            "кнопки/события оплаты (или её вообще не создали) -- по какому "
+            "пользователю, пути и поисковому запросу пришла оплата, узнать "
+            "нельзя, пока это не починено."
+        ),
+        check_action_template=(
+            "Проверить, что цель payment_success в Метрике привязана к "
+            "реальному событию оплаты (счётчик стоит на странице/событии "
+            "успеха), и попросить Маркетолога предложить или создать цель "
+            "заново."
+        ),
+        do_not_action_template="Не делать выводов про эффективность рекламы, пока оплаты не видны в Метрике.",
+        sample_size_fn=lambda m: m.payment_success or 0,
+        payload_fn=lambda m: {"payment_success": m.payment_success or 0},
     ),
 ]
 

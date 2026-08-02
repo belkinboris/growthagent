@@ -788,6 +788,9 @@ CATEGORY_TO_AGENT: dict[str, str] = {
     "payments_started_no_success": "diagnostician",
     "pending_payments": "diagnostician",
     "metrics_discrepancy": "diagnostician",
+    # Диагност находит расхождение по данным воронки, но чинить -- цели/
+    # пиксели -- хозяйство Маркетолога (задача F6).
+    "payments_invisible_in_metrika": "marketer",
     "integration_down": "diagnostician",
 }
 
@@ -808,11 +811,64 @@ AGENT_TITLES: dict[str, str] = {
     "product": "Продакт", "tester": "Тестировщик",
 }
 
+# Уровни автономии (задача F6) -- один переключатель на проект, а не по
+# одному на каждого агента: владелец договаривается с "аналитиком как с
+# гендиром" целиком, а не настраивает четыре независимых роли.
+AUTONOMY_LEVELS = {
+    1: {
+        "title": "Гендир только докладывает",
+        "description": "Все агенты находят и предлагают. Ничего не применяется "
+                        "без вашей кнопки.",
+    },
+    2: {
+        "title": "Гендир решает мелкое сам",
+        "description": "Обратимые мелкие правки (минус-слова, цели в Метрике для "
+                        "уже надёжно фиксируемых событий) применяются сами. "
+                        "Всё крупное -- на ваше решение.",
+    },
+    3: {
+        "title": "Гендир действует, отчитывается постфактум",
+        "description": "Всё, что технически можно записать (цели Метрики, "
+                        "ставки и минус-слова Директа), применяется автоматически. "
+                        "Выключено по умолчанию -- включайте осознанно.",
+    },
+}
+
+
+def autonomy_level(project: Project) -> int:
+    """Текущий уровень делегирования для проекта. По умолчанию 1 -- ничего
+    не меняется автоматически, ровно как было до F6."""
+    try:
+        level = int((project.settings_json or {}).get("autonomy_level", 1))
+    except (TypeError, ValueError):
+        level = 1
+    return level if level in AUTONOMY_LEVELS else 1
+
+
+AGENT_ACTION_STATUS_LABELS = {
+    "proposed": "предложено",
+    "applied": "применено само",
+    "rejected": "отклонено",
+    "blocked_not_configured": "не настроено",
+}
+
+
+def _agent_action_to_dict(a) -> dict:
+    return {
+        "id": a.id, "agent": a.agent, "agent_title": AGENT_TITLES.get(a.agent, a.agent),
+        "domain": a.domain, "action": a.action, "reasoning": a.reasoning,
+        "payload": a.payload_json or {}, "status": a.status,
+        "status_label": AGENT_ACTION_STATUS_LABELS.get(a.status, a.status),
+        "created_at": a.created_at.isoformat(),
+        "applied_at": a.applied_at.isoformat() if a.applied_at else None,
+    }
+
 
 @router.get("/api/dashboard", dependencies=[Depends(require_admin)])
 async def dashboard(identity=Depends(require_admin)):
     """Открытые проблемы всех агентов одним списком -- доска фаундера."""
     from app import growth_loop
+    from app.models import AgentAction
 
     with get_session() as session:
         project = _active_project(session, identity)
@@ -824,6 +880,16 @@ async def dashboard(identity=Depends(require_admin)):
 
         rec = growth_loop.get_active_recommendation(session, project.id)
         running = growth_loop.get_running_experiment(session, project.id)
+
+        # "Что сделали агенты" -- задача F6: последние предложения/действия
+        # агентов отдельной секцией, независимо от их статуса, чтобы было
+        # видно и то, что применилось само, и то, что предложено, и то, что
+        # агент хотел сделать сам, но не смог (не настроена запись).
+        agent_action_rows = session.exec(
+            select(AgentAction).where(AgentAction.project_id == project.id)
+            .order_by(AgentAction.created_at.desc()).limit(20)
+        ).all()
+        level = autonomy_level(project)
 
     cards = []
     for a in alert_rows:
@@ -867,8 +933,48 @@ async def dashboard(identity=Depends(require_admin)):
             "actions": [{"action": "cancel", "label": "Отменить проверку"}],
         })
 
-    return {"cards": cards, "hint": None if cards else
-            "Открытых проблем нет: по всем проверяемым правилам всё в норме."}
+    return {
+        "cards": cards, "hint": None if cards else
+            "Открытых проблем нет: по всем проверяемым правилам всё в норме.",
+        "autonomy_level": level,
+        "autonomy_levels": {str(k): v for k, v in AUTONOMY_LEVELS.items()},
+        "agent_actions": [_agent_action_to_dict(a) for a in agent_action_rows],
+    }
+
+
+@router.post("/api/agent-actions/{action_id}/{decision}", dependencies=[Depends(require_admin)])
+async def agent_action_decide(action_id: int, decision: str, identity=Depends(require_admin)):
+    """Решение владельца по предложению агента (не по тому, что агент уже
+    применил сам -- те статусы менять поздно, действие уже сделано)."""
+    from app.models import AgentAction, AgentActionStatus, utcnow
+
+    if decision not in ("apply", "reject"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+    with get_session() as session:
+        action = session.get(AgentAction, action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="Действие не найдено")
+        _require_own_project_id(session, action.project_id, identity)
+        if action.status != AgentActionStatus.proposed.value:
+            raise HTTPException(status_code=409, detail="По этому предложению уже есть решение")
+
+        if decision == "apply":
+            # Владелец применил предложение сам (руками, вне платформы) --
+            # фиксируем как решённое, без вызова write-клиента: применить
+            # автоматически может только сам агент на уровне автономии 3.
+            action.status = AgentActionStatus.applied.value
+            action.applied_at = utcnow()
+        else:
+            action.status = AgentActionStatus.rejected.value
+        session.add(action)
+        session.commit()
+        _record_action(
+            session, identity,
+            "agent_action_applied" if decision == "apply" else "agent_action_rejected",
+            f"«{action.reasoning[:120]}»" + (" -- сделал сам" if decision == "apply" else " -- отклонил"),
+            action.project_id,
+        )
+        return {"ok": True, "status": action.status}
 
 
 @router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
@@ -2467,6 +2573,7 @@ def _project_to_dict(p: Project) -> dict:
         "metrika_counter_id": sj.get("metrika_counter_id"),
         "direct_client_login": sj.get("direct_client_login"),
         "notify_chat_ids": sj.get("notify_chat_ids") or [],
+        "autonomy_level": autonomy_level(p),
         "created_at": p.created_at.isoformat(),
     }
 
@@ -2616,6 +2723,31 @@ async def pause_project(project_id: int, identity=Depends(require_admin)):
         _record_action(session, identity, "collection_off",
                        f"Выключил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": False}
+
+
+class AutonomyLevelRequest(BaseModel):
+    level: int
+
+
+@router.post("/api/projects/{project_id}/autonomy", dependencies=[Depends(require_admin)])
+async def set_autonomy_level(project_id: int, body: AutonomyLevelRequest, identity=Depends(require_admin)):
+    """Меняет уровень делегирования агентам для проекта (задача F6)."""
+    if body.level not in AUTONOMY_LEVELS:
+        raise HTTPException(status_code=422, detail="Уровень должен быть 1, 2 или 3")
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        sj = dict(project.settings_json or {})
+        sj["autonomy_level"] = body.level
+        project.settings_json = sj
+        session.add(project)
+        session.commit()
+        _record_action(
+            session, identity, "autonomy_level_changed",
+            f"Установил уровень автономии {body.level} («{AUTONOMY_LEVELS[body.level]['title']}») "
+            f"у проекта «{project.name}»",
+            project.id,
+        )
+        return {"ok": True, "level": body.level}
 
 
 @router.post("/api/projects/{project_id}/retest", dependencies=[Depends(require_admin)])

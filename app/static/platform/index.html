@@ -106,6 +106,7 @@
   .item:first-of-type{border-top:none;padding-top:0}
   .item h3{font-size:15px;margin-bottom:4px}
   .item .body{color:var(--text-2);font-size:14px;white-space:pre-wrap}
+  .item.active{background:var(--accent-bg,rgba(90,140,255,.08));border-radius:8px;padding-left:10px;padding-right:10px;margin:0 -10px}
   .tag{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:99px;
     font-size:12px;border:1px solid var(--border);color:var(--text-2)}
   .tag.critical{color:var(--critical);border-color:var(--critical)}
@@ -434,6 +435,25 @@
         «Сделаю» уводит на вкладку нужного агента, где инструмент для правки; «Не буду» — в архив,
         чтобы не предлагалось снова бездумно.</p>
       <div id="problems-body">Загрузка…</div>
+    </div>
+
+    <!-- Уровень автономии (задача F6): одна ручка на проект, а не по одной
+         на каждого агента -- владелец договаривается с "аналитиком как с
+         гендиром" целиком. -->
+    <div class="card">
+      <h2>Уровень автономии</h2>
+      <p class="purpose" style="margin-top:0">Как вы хотите договориться с гендиром: он сам всё
+        решает и отчитывается постфактум, только ключевое выносит на ваше решение, или всё
+        предлагает и ничего не делает без вашей кнопки.</p>
+      <div id="autonomy-body">Загрузка…</div>
+    </div>
+
+    <!-- Что сделали (или предложили) агенты сами -- отдельная лента от
+         карточек проблем: там "что не так", здесь "что агент сам сделал
+         или хочет сделать по этому поводу". -->
+    <div class="card">
+      <h2>Что сделали агенты</h2>
+      <div id="agent-actions-body" class="muted">Загрузка…</div>
     </div>
 
     <div class="card">
@@ -1162,6 +1182,9 @@ async function loadDashboardProblems() {
     $('problems-count').textContent = r.cards.length ? `${r.cards.length} открытых` : '';
     if (!r.cards.length) {
       box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
+      window._problemCards = [];
+      renderAutonomy(r.autonomy_level, r.autonomy_levels);
+      renderAgentActions(r.agent_actions || []);
       return;
     }
     box.innerHTML = r.cards.map((c, i) => `<div class="item">
@@ -1179,9 +1202,59 @@ async function loadDashboardProblems() {
       </div>
     </div>`).join('');
     window._problemCards = r.cards;
+    renderAutonomy(r.autonomy_level, r.autonomy_levels);
+    renderAgentActions(r.agent_actions || []);
   } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
     `<p class="error-text">${esc(e.message)}</p>`; }
 }
+
+function renderAutonomy(level, levels) {
+  const box = $('autonomy-body');
+  if (!levels) { box.innerHTML = ''; return; }
+  box.innerHTML = Object.keys(levels).sort().map(k => {
+    const l = levels[k];
+    const active = Number(k) === level;
+    return `<div class="item${active ? ' active' : ''}" style="cursor:pointer" onclick="setAutonomyLevel(${k})">
+      <div class="row" style="margin-bottom:4px">
+        <b>${esc(l.title)}</b>${active ? '<span class="tag">текущий</span>' : ''}
+      </div>
+      <div class="muted" style="font-size:13px">${esc(l.description)}</div>
+    </div>`;
+  }).join('');
+}
+window.setAutonomyLevel = async (level) => {
+  const id = await currentProjectId();
+  if (!id) return;
+  try {
+    await api(`/api/projects/${id}/autonomy`, {method: 'POST', body: JSON.stringify({level})});
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+};
+
+function renderAgentActions(actions) {
+  const box = $('agent-actions-body');
+  if (!actions.length) {
+    box.innerHTML = '<p class="muted">Агенты пока ничего сами не предлагали и не делали.</p>';
+    return;
+  }
+  box.innerHTML = actions.map(a => `<div class="item">
+      <div class="row" style="margin-bottom:5px">
+        <span class="tag">${esc(a.agent_title)}</span>
+        <b style="margin:0">${esc(a.status_label)}</b>
+      </div>
+      <div class="body">${esc(a.reasoning)}</div>
+      ${a.status === 'proposed' ? `<div class="row" style="margin-top:9px">
+        <button class="btn sm" onclick="decideAgentAction(${a.id},'apply')">Сделаю сам</button>
+        <button class="btn sm" onclick="decideAgentAction(${a.id},'reject')">Не буду</button>
+      </div>` : ''}
+    </div>`).join('');
+}
+window.decideAgentAction = async (id, decision) => {
+  try {
+    await api(`/api/agent-actions/${id}/${decision}`, {method: 'POST'});
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+};
 window.actOnProblem = async (i, action) => {
   const card = (window._problemCards || [])[i];
   if (!card) return;

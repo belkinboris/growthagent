@@ -47,6 +47,7 @@ from app.models import AttributionStatus, Integration, IntegrationStatus, Integr
 from app.rules import NormalizedMetrics, checkable_categories
 from app.analyzer import analyze
 from app.service import (
+    AlertChangeType,
     CycleResult,
     DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
     LANDING_FUNNEL_CACHE_PERIOD_KEY,
@@ -424,6 +425,7 @@ async def _collect_window(project: Project, period_key: str, period_hours: int) 
 
     if metrika_data:
         metrics.metrika_signup = metrika_data.get("signup")
+        metrics.metrika_payment_success = metrika_data.get("payment_success")
         if metrics.clicks is None:
             metrics.clicks = metrika_data.get("traffic")  # fallback, если Директ не настроен
 
@@ -592,6 +594,20 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         )
         result.integration_down_changes = integration_changes
         result.source_statuses_by_window = source_statuses_by_window
+
+        # F6: Маркетолог реагирует на новые/повторные алерты "оплаты не
+        # видны в Метрике" -- предлагает (и на уровне автономии 3 пытается
+        # применить сам) починку цели. Только new/escalated -- на "repeated"
+        # уже есть открытое предложение, handle_payment_visibility_alert
+        # сам это проверяет, но нет смысла дёргать его на каждый повтор.
+        from app.marketer_actions import handle_payment_visibility_alert
+        from app.platform_api import autonomy_level
+
+        level = autonomy_level(project)
+        for change in result.changes:
+            if change.change_type in (AlertChangeType.new, AlertChangeType.escalated):
+                await handle_payment_visibility_alert(session, project, change.alert, level)
+
         _log_memory("after main windows, before deep diagnostics")
 
         # Deep diagnostics: гибридный режим. Автоматически запускается
