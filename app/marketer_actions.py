@@ -71,14 +71,21 @@ async def handle_payment_visibility_alert(session, project, alert: Alert, level:
     )
 
     if level >= 3:
-        condition = (project.settings_json or {}).get("metrika_payment_success_goal_condition")
+        from app.config import get_settings
+
+        condition = (project.settings_json or {}).get(
+            "metrika_payment_success_goal_condition"
+        ) or get_settings().metrika_payment_success_goal_condition
         if not metrika_write.is_configured(project) or not condition:
             action.status = AgentActionStatus.blocked_not_configured.value
             missing = []
             if not metrika_write.is_configured(project):
-                missing.append("токен записи Метрики (metrika_management_token)")
+                missing.append("токен записи Метрики (METRIKA_MANAGEMENT_TOKEN в окружении "
+                                "или metrika_management_token у проекта)")
             if not condition:
-                missing.append("условие цели «оплата успешна» (metrika_payment_success_goal_condition)")
+                missing.append("условие цели «оплата успешна» "
+                                "(METRIKA_PAYMENT_SUCCESS_GOAL_CONDITION_JSON в окружении "
+                                "или metrika_payment_success_goal_condition у проекта)")
             action.reasoning += (
                 " Уровень автономии 3 включён, но записать цель сам не могу: "
                 "не настроено " + ", ".join(missing) + "."

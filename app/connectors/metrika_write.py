@@ -9,11 +9,12 @@ API), только чтение, и токен для него нужен с п�
 (токен слабый), либо выдать боту куда больше прав, чем нужно для простого
 чтения статистики.
 
-Токен для записи хранится в `Project.settings_json["metrika_management_token"]`
--- по тому же месту, где уже лежат `metrika_counter_id` и остальные
-per-project настройки Метрики, а не в глобальном `Settings` (у каждого
-подключённого продукта свой рекламный кабинет, в отличие от собственного
-биллинга платформы -- см. `app/billing_platform.py`).
+Токен для записи можно задать двумя способами: `METRIKA_MANAGEMENT_TOKEN`
+в окружении (как `YANDEX_OAUTH_TOKEN` сейчас) -- предпочтительно, секрет
+не проходит через интерфейс/чат -- либо `Project.settings_json
+["metrika_management_token"]`, если понадобится другой токен на конкретный
+проект. Настройка проекта, если задана, побеждает env (тот же порядок
+приоритета, что у per-project override в scheduler.py).
 
 Пока владелец не выдал такой токен, `is_configured()` возвращает False, и
 всё, что пытается писать, получает честную ошибку вместо тихого no-op --
@@ -23,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -36,13 +37,24 @@ class MetrikaWriteError(RuntimeError):
     pass
 
 
+def _management_token(project) -> Optional[str]:
+    """Токен для записи -- сначала настройка проекта, иначе
+    METRIKA_MANAGEMENT_TOKEN из окружения (тот же паттерн, что у
+    effective_direct_oauth_token в app/config.py). Токен нарочно можно
+    задать через env, а не только через интерфейс -- секрет не должен
+    ходить через чат/UI, если владелец не хочет."""
+    from app.config import get_settings
+
+    project_token = (project.settings_json or {}).get("metrika_management_token")
+    return project_token or get_settings().metrika_management_token
+
+
 def is_configured(project) -> bool:
-    sj = project.settings_json or {}
-    return bool(sj.get("metrika_management_token") and sj.get("metrika_counter_id"))
+    return bool(_management_token(project) and _counter_id(project))
 
 
 def _headers(project) -> dict[str, str]:
-    token = (project.settings_json or {}).get("metrika_management_token")
+    token = _management_token(project)
     return {
         "Authorization": f"OAuth {token}",
         "Content-Type": "application/json",
@@ -55,7 +67,10 @@ def _headers(project) -> dict[str, str]:
 
 
 def _counter_id(project) -> str:
-    return str((project.settings_json or {}).get("metrika_counter_id") or "")
+    from app.config import get_settings
+
+    project_counter = (project.settings_json or {}).get("metrika_counter_id")
+    return str(project_counter or get_settings().metrika_counter_id or "")
 
 
 async def list_goals(project, timeout_seconds: float = 15.0) -> list[dict[str, Any]]:

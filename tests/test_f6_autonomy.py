@@ -94,6 +94,36 @@ class TestMetrikaWriteConfigured:
         with pytest.raises(metrika_write.MetrikaWriteError):
             asyncio.run(metrika_write.create_goal(P(), name="x", goal_type="url", conditions=[]))
 
+    def test_falls_back_to_env_token_when_project_has_none(self, monkeypatch):
+        """Токен можно задать в окружении, а не только через настройку
+        проекта -- секрет не должен ходить через интерфейс/чат."""
+        import app.config as config
+        from app.connectors import metrika_write
+
+        monkeypatch.setenv("METRIKA_MANAGEMENT_TOKEN", "env-tok")
+        config.get_settings.cache_clear()
+        try:
+            class P:
+                settings_json = {"metrika_counter_id": "123"}
+
+            assert metrika_write.is_configured(P()) is True
+        finally:
+            config.get_settings.cache_clear()
+
+    def test_project_setting_wins_over_env(self, monkeypatch):
+        import app.config as config
+        from app.connectors import metrika_write
+
+        monkeypatch.setenv("METRIKA_MANAGEMENT_TOKEN", "env-tok")
+        config.get_settings.cache_clear()
+        try:
+            class P:
+                settings_json = {"metrika_management_token": "project-tok", "metrika_counter_id": "123"}
+
+            assert metrika_write._management_token(P()) == "project-tok"
+        finally:
+            config.get_settings.cache_clear()
+
 
 class TestAutonomyLevelApi:
     def test_default_level_is_one(self, monkeypatch, tmp_path):

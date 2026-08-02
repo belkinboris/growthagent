@@ -208,6 +208,20 @@ class Settings(BaseSettings):
     metrika_counter_id: Optional[str] = None
     metrika_goal_ids_json: str = "{}"  # JSON-строка: {"signup": 123456, "activation_1": 123457, ...}
 
+    # --- Яндекс.Метрика: запись (задача F6) ---
+    # ОТДЕЛЬНЫЙ токен от yandex_oauth_token выше -- тот только на чтение
+    # статистики (metrika:read), этот должен быть выпущен с правом
+    # metrika:write ("Создание счётчиков, изменение параметров своих и
+    # доверенных счётчиков"), иначе Management API отвечает 403. Держим
+    # в env, а не только в Project.settings_json, чтобы не пересылать
+    # живой токен через интерфейс/чат -- см. app/connectors/metrika_write.py.
+    metrika_management_token: Optional[str] = None
+    # Условие цели "оплата успешна" для автовосстановления Маркетологом на
+    # уровне автономии 3 -- JSON вида {"type": "url", "conditions": [...]}.
+    # Без него агент не может сам создать цель: URL/событие успешной оплаты
+    # никому не известно заранее, придумывать его агенту запрещено.
+    metrika_payment_success_goal_condition_json: str = ""
+
     # --- Яндекс.Директ ---
     direct_client_login: Optional[str] = None
     direct_campaign_ids: str = ""  # список через запятую
@@ -274,6 +288,24 @@ class Settings(BaseSettings):
             return {k: int(v) for k, v in parsed.items()}
         except (json.JSONDecodeError, ValueError, TypeError):
             return {}
+
+    @property
+    def metrika_payment_success_goal_condition(self) -> Optional[dict]:
+        """
+        Парсит METRIKA_PAYMENT_SUCCESS_GOAL_CONDITION_JSON в dict вида
+        {"type": "url", "conditions": [...]}. None при отсутствии/невалидном
+        JSON -- не ошибка конфигурации, просто автовосстановление цели на
+        уровне автономии 3 честно останется "не настроено" (см.
+        app/marketer_actions.py).
+        """
+        import json
+        if not self.metrika_payment_success_goal_condition_json:
+            return None
+        try:
+            parsed = json.loads(self.metrika_payment_success_goal_condition_json)
+            return parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
 
     @property
     def effective_direct_oauth_token(self) -> Optional[str]:
