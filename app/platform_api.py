@@ -28,7 +28,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlmodel import select
+from sqlmodel import or_, select
 
 from app.config import (
     ANALYSIS_WINDOWS_HOURS,
@@ -338,6 +338,20 @@ def _require_own_project_id(session, project_id: Optional[int], identity) -> Non
         raise HTTPException(status_code=404, detail="Не найдено")
 
 
+# Сигнал считается "требующим внимания" (виден в списке и в счётчике),
+# пока владелец не сказал обратное: acknowledged/resolved -- это "понял" и
+# "решилось", их прятать; snoozed виден заново, как только истёк снуз.
+# Общая функция для /api/overview (счётчик) и /api/alerts (сам список) --
+# раньше они считали по-разному, и счётчик наверху не совпадал со списком.
+def _visible_alerts_filter():
+    from app.models import utcnow
+    return or_(
+        Alert.status.in_(["open", "sent", "escalated"]),
+        (Alert.status == "snoozed")
+        & or_(Alert.snooze_until.is_(None), Alert.snooze_until <= utcnow()),
+    )
+
+
 @router.get("/api/overview", dependencies=[Depends(require_admin)])
 async def overview(identity=Depends(require_admin)):
     with get_session() as session:
@@ -354,10 +368,7 @@ async def overview(identity=Depends(require_admin)):
         # состояние по конфигурации, чтобы список не врал владельцу.
         live_status = _config_based_statuses(settings=get_settings())
         open_alerts = session.exec(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.status.in_(["open", "sent", "acknowledged", "escalated"]),
-            )
+            select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
         ).all()
         return {
             "build_marker": BUILD_MARKER,
@@ -458,7 +469,7 @@ async def alerts(limit: int = 30, identity=Depends(require_admin)):
         project = _active_project(session, identity)
         rows = session.exec(
             select(Alert)
-            .where(Alert.project_id == project.id)
+            .where(Alert.project_id == project.id, _visible_alerts_filter())
             .order_by(Alert.last_seen_at.desc())
             .limit(limit * 3)  # запас: дубли по окнам схлопнутся ниже
         ).all()
