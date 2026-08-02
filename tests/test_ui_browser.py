@@ -168,7 +168,7 @@ class TestOverviewWithoutData:
         # иначе тест ловит момент, когда их ещё нет, и «проходит» вхолостую.
         page.wait_for_function(
             "document.getElementById('kpis').innerText.trim().length > 0", timeout=15000)
-        text = page.inner_text("#view-overview").lower()
+        text = page.inner_text("#view-dashboard").lower()
         assert "данных ещё нет" in text
         assert errors == [], f"ошибки в консоли: {errors}"
         page.close()
@@ -179,6 +179,7 @@ class TestOverviewWithoutData:
         base, _ = server
         page, _ = _page(browser)
         _login_owner(page, base)
+        page.click("#tabs button[data-tab='diagnostician']")
         page.wait_for_function(
             "document.getElementById('alerts-body').innerText.trim().length > 0", timeout=15000)
         text = page.inner_text("#alerts-body").lower()
@@ -209,7 +210,7 @@ class TestTabsAndProjects:
         base, _ = server
         page, errors = _page(browser)
         _login_owner(page, base)
-        for tab in ["ads", "live", "history", "reports", "chat", "projects", "overview"]:
+        for tab in ["diagnostician", "marketer", "product", "tester", "projects", "dashboard"]:
             page.click(f"#tabs button[data-tab='{tab}']")
             page.wait_for_selector(f"#view-{tab}:not(.hidden)", timeout=10000)
             page.wait_for_timeout(400)
@@ -227,7 +228,7 @@ class TestTabsAndProjects:
 
         page.click("#projects-table >> text=выключить")
         page.wait_for_timeout(800)
-        page.click("#tabs button[data-tab='overview']")
+        page.click("#tabs button[data-tab='dashboard']")
         page.wait_for_selector("#project-inactive:not(.hidden)", timeout=10000)
         assert "сбор данных по этому проекту выключен" in page.inner_text("#project-inactive").lower()
 

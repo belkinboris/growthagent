@@ -106,6 +106,7 @@
   .item:first-of-type{border-top:none;padding-top:0}
   .item h3{font-size:15px;margin-bottom:4px}
   .item .body{color:var(--text-2);font-size:14px;white-space:pre-wrap}
+  .item.active{background:var(--accent-bg,rgba(90,140,255,.08));border-radius:8px;padding-left:10px;padding-right:10px;margin:0 -10px}
   .tag{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:99px;
     font-size:12px;border:1px solid var(--border);color:var(--text-2)}
   .tag.critical{color:var(--critical);border-color:var(--critical)}
@@ -205,7 +206,7 @@
   #toast.hidden{display:none}
   .error-text{color:var(--critical);font-size:13px;margin:6px 0}
   .ok-text{color:var(--good);font-size:13px;margin:6px 0}
-  #chat-log{display:flex;flex-direction:column;gap:10px;max-height:56vh;overflow-y:auto;margin-bottom:12px}
+  .chat-log{display:flex;flex-direction:column;gap:10px;max-height:56vh;overflow-y:auto;margin-bottom:12px}
   .msg{padding:11px 15px;border-radius:14px;max-width:86%;white-space:pre-wrap;font-size:14px}
   .msg.user{align-self:flex-end;background:#22375c}
   .msg.bot{align-self:flex-start;background:var(--surface-2)}
@@ -257,12 +258,11 @@
   <span class="who" id="hdr-user"></span>
   <div class="nav-wrap" id="nav-wrap">
   <nav id="tabs" class="hidden">
-    <button data-tab="overview" class="active">Обзор</button>
-    <button data-tab="ads">Реклама</button>
-    <button data-tab="live">Лента</button>
-    <button data-tab="history">История</button>
-    <button data-tab="reports">Отчёты</button>
-    <button data-tab="chat">Чат</button>
+    <button data-tab="dashboard" class="active">Доска</button>
+    <button data-tab="diagnostician">Диагност</button>
+    <button data-tab="marketer">Маркетолог</button>
+    <button data-tab="product">Продакт</button>
+    <button data-tab="tester">Тестировщик</button>
     <button data-tab="projects">Проекты</button>
     <button id="logout-btn">Выйти</button>
   </nav>
@@ -360,8 +360,8 @@
     </div>
   </div>
 
-  <!-- ОБЗОР -->
-  <div id="view-overview" class="hidden">
+  <!-- ДОСКА ФАУНДЕРА -->
+  <div id="view-dashboard" class="hidden">
     <!-- Первый экран, пока проект не подключён. Показывать вместо доски из
          прочерков: пустые карточки не объясняют новому человеку ничего. -->
     <div id="overview-empty" class="hidden">
@@ -372,10 +372,9 @@
           его внутреннего API.</p>
         <p class="muted">Когда проект подключится, здесь появится:</p>
         <ul class="plain">
-          <li><b>Воронка</b> — сколько людей дошло до каждого шага и где теряется больше всего.</li>
+          <li><b>Результат за неделю</b> — сколько людей дошло до каждого шага.</li>
           <li><b>Решение</b> — одно предложение, что изменить, с кнопками «принять» и «отклонить».</li>
-          <li><b>Сигналы</b> — что выбилось из нормы: оплаты не проходят, регистрации встали.</li>
-          <li><b>Динамика и лента</b> — как меняется неделя и что делают конкретные люди.</li>
+          <li><b>Проблемы</b> — что нашли агенты и что с этим делать.</li>
         </ul>
         <div class="row" style="margin-top:16px">
           <button class="btn primary" onclick="switchTab('projects')">Подключить проект</button>
@@ -411,8 +410,9 @@
     </div>
 
     <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
-      и что делать дальше. Сверху — числа за неделю, ниже — единственное решение, которое
-      аналитик предлагает принять сейчас, затем где отваливаются люди и что сломалось.</p>
+      и что делать дальше — без обхода вкладок агентов по кругу. Сверху — числа за неделю,
+      ниже — единственное решение, которое аналитик предлагает принять сейчас, дальше —
+      открытые проблемы от всех агентов одним списком.</p>
 
     <div class="kpis" id="kpis" style="margin-bottom:16px"></div>
 
@@ -423,6 +423,63 @@
         поэтому во время проверки остальное трогать нельзя, иначе результат ничего не докажет.</p>
       <div id="decision-body" class="muted">Загрузка…</div>
     </div>
+
+    <!-- Карточки проблем от всех агентов одним списком (задача про четырёх
+         агентов): раньше, чтобы понять, с чего начать день, нужно было
+         обойти вкладки по кругу. Каждая карточка подписана, кто её нашёл --
+         это витрина поверх уже работающих alerts/growth_loop, не новая
+         диагностика. -->
+    <div class="card">
+      <h2>Проблемы<span class="spacer"></span><span class="muted" id="problems-count"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: одна доска вместо обхода вкладок агентов.
+        «Сделаю» уводит на вкладку нужного агента, где инструмент для правки; «Не буду» — в архив,
+        чтобы не предлагалось снова бездумно.</p>
+      <div id="problems-body">Загрузка…</div>
+    </div>
+
+    <!-- Уровень автономии (задача F6): одна ручка на проект, а не по одной
+         на каждого агента -- владелец договаривается с "аналитиком как с
+         гендиром" целиком. -->
+    <div class="card">
+      <h2>Уровень автономии</h2>
+      <p class="purpose" style="margin-top:0">Как вы хотите договориться с гендиром: он сам всё
+        решает и отчитывается постфактум, только ключевое выносит на ваше решение, или всё
+        предлагает и ничего не делает без вашей кнопки.</p>
+      <div id="autonomy-body">Загрузка…</div>
+    </div>
+
+    <!-- Что сделали (или предложили) агенты сами -- отдельная лента от
+         карточек проблем: там "что не так", здесь "что агент сам сделал
+         или хочет сделать по этому поводу". -->
+    <div class="card">
+      <h2>Что сделали агенты</h2>
+      <div id="agent-actions-body" class="muted">Загрузка…</div>
+    </div>
+
+    <div class="card">
+      <h2>Источники данных</h2>
+      <div class="row" id="integrations-body"></div>
+    </div>
+    </div><!-- /overview-content -->
+
+    <!-- Общий чат: видит всё, по любому агенту. У каждой вкладки-агента
+         свой чат ниже, со своим контекстом -- этот для вопросов «в целом». -->
+    <div class="card">
+      <h2>Чат с аналитиком</h2>
+      <div id="chat-log-dashboard" class="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input-dashboard" placeholder="Что происходит и что делать дальше?"></textarea>
+        <button class="btn primary" data-chat-send="dashboard">→</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Отвечает по всем данным сразу. Спросить
+        конкретного агента можно на его вкладке — там он не путает чужие цифры со своими.</p>
+    </div>
+  </div>
+
+  <!-- ДИАГНОСТ -->
+  <div id="view-diagnostician" class="hidden">
+    <p class="purpose">Зачем этот агент: находит, где именно теряются люди -- по воронке,
+      сигналам и живому пути конкретных людей.</p>
 
     <div class="card">
       <h2>Воронка
@@ -472,19 +529,6 @@
       <div id="compare-body"></div>
     </div>
 
-    <!-- Когорты по источнику. Канал с нулём оплат в общей сумме выглядит
-         пользой: он поднимает верх воронки и топит конверсию, а виноватым
-         кажется продукт. -->
-    <div class="card">
-      <h2>Откуда приходят те, кто платит<span class="spacer"></span>
-        <span class="muted" id="sources-when"></span></h2>
-      <p class="purpose" style="margin-top:0">Зачем: суммарная воронка не показывает,
-        кого именно приводит каждый канал. Здесь видно, доходят ли до оплаты пришедшие
-        из разных источников по-разному. Долю оплат аналитик считает только там,
-        где людей достаточно; правки в рекламе делает человек сам.</p>
-      <div id="sources-body"></div>
-    </div>
-
     <!-- «Событий слишком мало» написано на трёх экранах, а срока не было
          нигде: ожидание без срока выглядит бесконечным. -->
     <div class="card">
@@ -506,17 +550,37 @@
     </div>
 
     <div class="card">
-      <h2>Источники данных</h2>
-      <div class="row" id="integrations-body"></div>
+      <h2>Живая лента
+        <span class="spacer"></span>
+        <select id="live-period" style="width:auto;margin:0;padding:4px 8px;font-size:13px">
+          <option value="120">2 часа</option>
+          <option value="720" selected>12 часов</option>
+          <option value="1440">сутки</option>
+          <option value="4320">3 дня</option>
+        </select>
+        <button class="btn sm" id="live-refresh">Обновить</button>
+      </h2>
+      <p class="purpose" style="margin-top:0">Зачем: увидеть путь конкретного человека, а не
+        средние числа. Где обрывается цепочка — там и стоит искать проблему.</p>
+      <div id="live-body">Загрузка…</div>
     </div>
-    </div><!-- /overview-content -->
+
+    <div class="card">
+      <h2>Чат с Диагностом</h2>
+      <div id="chat-log-diagnostician" class="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input-diagnostician" placeholder="Где именно теряются люди?"></textarea>
+        <button class="btn primary" data-chat-send="diagnostician">→</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Отвечает по воронке, сигналам и живой ленте.</p>
+    </div>
   </div>
 
-  <!-- РЕКЛАМА -->
-  <div id="view-ads" class="hidden">
-    <p class="purpose">Зачем: понять, окупается ли реклама. Слева — сколько денег ушло,
-      справа — что из этих людей выросло. Если источник даёт регистрации, но не даёт
-      оплат, проблема не в рекламе, а в продукте после регистрации.</p>
+  <!-- МАРКЕТОЛОГ -->
+  <div id="view-marketer" class="hidden">
+    <p class="purpose">Зачем этот агент: понять, кого и за сколько приводит реклама.
+      Если источник даёт регистрации, но не даёт оплат, проблема не в рекламе,
+      а в продукте после регистрации.</p>
     <div id="ads-optional" class="hidden"></div>
     <div class="kpis" id="ads-kpis" style="margin-bottom:16px"></div>
     <div class="card">
@@ -525,6 +589,20 @@
       <div class="chart-wrap"><table id="ads-table"><tbody></tbody></table></div>
       <p class="muted" id="ads-note" style="margin:12px 0 0"></p>
     </div>
+
+    <!-- Когорты по источнику. Канал с нулём оплат в общей сумме выглядит
+         пользой: он поднимает верх воронки и топит конверсию, а виноватым
+         кажется продукт. -->
+    <div class="card">
+      <h2>Откуда приходят те, кто платит<span class="spacer"></span>
+        <span class="muted" id="sources-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: суммарная воронка не показывает,
+        кого именно приводит каждый канал. Здесь видно, доходят ли до оплаты пришедшие
+        из разных источников по-разному. Долю оплат аналитик считает только там,
+        где людей достаточно; правки в рекламе делает человек сам.</p>
+      <div id="sources-body"></div>
+    </div>
+
     <div class="card">
       <h2>Глубокая проверка Директа</h2>
       <p class="purpose" style="margin-top:0">Зачем: найти, какие поисковые запросы и площадки
@@ -548,12 +626,50 @@
         в Яндекс.Директе. Аналитик сам рекламу не меняет — решение и кнопка ваши.</p>
       <div id="neg-body">Загрузка…</div>
     </div>
+
+    <div class="card">
+      <h2>Чат с Маркетологом</h2>
+      <div id="chat-log-marketer" class="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input-marketer" placeholder="Какой источник лучше окупается?"></textarea>
+        <button class="btn primary" data-chat-send="marketer">→</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Отвечает по расходу рекламы и источникам трафика.</p>
+    </div>
   </div>
 
-  <!-- ИСТОРИЯ -->
-  <div id="view-history" class="hidden">
-    <p class="purpose">Зачем: помнить, что уже проверяли. Это защита от хождения по кругу —
-      видно, какие гипотезы подтвердились, какие нет, и что вы решили не делать.</p>
+  <!-- ПРОДАКТ -->
+  <div id="view-product" class="hidden">
+    <p class="purpose">Зачем этот агент: понять, что людям не нравится в результате --
+      по отзывам о первом посте и причинам отказов.</p>
+
+    <!-- Отзывы о результате. Данные уже считал планировщик, но были видны
+         только внутри длинных текстовых отчётов -- новой логики здесь нет,
+         только отдельная витрина. -->
+    <div class="card">
+      <h2>Отзывы о результате<span class="spacer"></span>
+        <span class="muted" id="feedback-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: суммарная воронка не говорит, ПОЧЕМУ
+        люди не идут дальше после первого результата. Здесь видно, сколько понравилось,
+        сколько нет, и по какой причине чаще всего — честно, без процентов на малых числах.</p>
+      <div id="feedback-body">Загрузка…</div>
+    </div>
+
+    <div class="card">
+      <h2>Чат с Продактом</h2>
+      <div id="chat-log-product" class="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input-product" placeholder="Почему людям не нравится результат?"></textarea>
+        <button class="btn primary" data-chat-send="product">→</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Отвечает по отзывам о результате и причинам отказов.</p>
+    </div>
+  </div>
+
+  <!-- ТЕСТИРОВЩИК -->
+  <div id="view-tester" class="hidden">
+    <p class="purpose">Зачем этот агент: проверяет, помогло ли предложенное изменение --
+      эксперименты и сравнение «до/после» выкатки.</p>
     <div class="card">
       <h2>История решений</h2>
       <div id="history-body">Загрузка…</div>
@@ -566,51 +682,50 @@
         он показывает выше.</p>
       <div id="actions-body">Загрузка…</div>
     </div>
-  </div>
 
-  <!-- ЛЕНТА -->
-  <div id="view-live" class="hidden">
+    <!-- Отметки выкаток. Аналитик не угадывает по излому графика, что и когда
+         выкатили: догадка тут хуже пустоты, на ней строится вывод «помогло». -->
     <div class="card">
-      <h2>Живая лента
-        <span class="spacer"></span>
-        <select id="live-period" style="width:auto;margin:0;padding:4px 8px;font-size:13px">
-          <option value="120">2 часа</option>
-          <option value="720" selected>12 часов</option>
-          <option value="1440">сутки</option>
-          <option value="4320">3 дня</option>
-        </select>
-        <button class="btn sm" id="live-refresh">Обновить</button>
-      </h2>
-      <p class="purpose" style="margin-top:0">Зачем: увидеть путь конкретного человека, а не
-        средние числа. Где обрывается цепочка — там и стоит искать проблему.</p>
-      <div id="live-body">Загрузка…</div>
-    </div>
-  </div>
-
-  <!-- ОТЧЁТЫ -->
-  <div id="view-reports" class="hidden">
-    <div class="subnav" id="report-nav">
-      <button class="btn sm active" data-kind="board">Доска</button>
-      <button class="btn sm" data-kind="funnel">Воронка</button>
-      <button class="btn sm" data-kind="ads">Реклама</button>
-      <button class="btn sm" data-kind="pay">Путь к оплате</button>
-      <button class="btn sm" data-kind="checks">Проверки</button>
-      <button class="btn sm" data-kind="journeys">Пути пользователей</button>
-      <button class="btn sm" data-kind="experiments">Эксперименты</button>
-    </div>
-    <div class="card"><div class="report" id="report-body">Загрузка…</div></div>
-  </div>
-
-  <!-- ЧАТ -->
-  <div id="view-chat" class="hidden">
-    <div class="card">
-      <h2>Чат с аналитиком</h2>
-      <div id="chat-log"></div>
-      <div class="chat-row">
-        <textarea id="chat-input" placeholder="Почему упали регистрации? Что делать с рекламой?"></textarea>
-        <button class="btn primary" id="chat-send">→</button>
+      <h2>Что вы меняли в продукте</h2>
+      <p class="purpose" style="margin-top:0">Зачем: сравнение недель отвечает «стало лучше
+        или хуже», но не отвечает, помогло ли то, что вы сделали. Отметьте выкатку — и
+        аналитик сравнит чистую неделю после неё с неделей до. Знать о выкатке он может
+        только от вас.</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:220px">
+          <label>Что изменили</label>
+          <input id="change-title" placeholder="Переписал первый экран" style="margin-bottom:0">
+        </div>
+        <div>
+          <label>Когда <span class="muted">(пусто — значит сейчас)</span></label>
+          <input type="datetime-local" id="change-at" style="margin-bottom:0">
+        </div>
+        <button class="btn primary" id="change-add">Отметить</button>
       </div>
-      <p class="muted" style="margin-bottom:0">Отвечает по своим данным: воронка, оплата, реклама, эксперименты.</p>
+      <div class="muted" id="change-status" style="margin-top:8px"></div>
+      <div id="changes-body" style="margin-top:12px"></div>
+    </div>
+
+    <!-- Вход для машины (D7): чтобы отметку не забывали ставить руками при
+         частых релизах, продукт может сообщать о выкатке сам. -->
+    <div class="card">
+      <h2>Автоматические отметки об изменениях</h2>
+      <p class="purpose" style="margin-top:0">Зачем: если выкатки частые, отметку
+        руками легко забыть — а без неё сравнение «до/после» неполное. Скрипт деплоя
+        вашего продукта может присылать отметку сам, одним запросом. Токен даёт право
+        только на это — доступа к данным он не открывает.</p>
+      <button class="btn sm" id="inbound-token-btn">Выпустить токен</button>
+      <div id="inbound-token-body" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Чат с Тестировщиком</h2>
+      <div id="chat-log-tester" class="chat-log"></div>
+      <div class="chat-row">
+        <textarea id="chat-input-tester" placeholder="Помогло ли последнее изменение?"></textarea>
+        <button class="btn primary" data-chat-send="tester">→</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Отвечает по экспериментам и сравнению «до/после».</p>
     </div>
   </div>
 
@@ -621,6 +736,15 @@
       <p class="muted" id="projects-who" style="margin-top:-6px"></p>
       <table id="projects-table" class="stack"><tbody></tbody></table>
     </div>
+
+    <!-- Тариф. Показывается только когда владелец платформы включил продажу
+         (COMMERCIAL_MODE) -- пока аналитик обслуживает только его самого,
+         разговор про тарифы был бы неуместен. -->
+    <div class="card hidden" id="billing-card">
+      <h2>Тариф</h2>
+      <div id="billing-body">Загрузка…</div>
+    </div>
+
     <div class="card">
       <h2>Названия этапов воронки<span class="spacer"></span>
         <button class="btn sm" id="stages-ai">Предложить названия по сайту</button></h2>
@@ -737,21 +861,20 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g,
 const nf = n => n == null ? '—' : new Intl.NumberFormat('ru-RU').format(n);
 
 // Отчёты приходят с телеграмной разметкой — экранируем всё, возвращаем узкий whitelist.
-// Ссылки на команды бота (/funnel, /pay …) превращаем в переходы по вкладкам:
-// на сайте это те же отчёты, слэш-команды тут набирать негде.
-const CMD_TO_REPORT = {funnel:'funnel', pay:'pay', ads:'ads', checks:'checks',
-  journeys:'journeys', experiments:'experiments', board:'board', today:'board'};
+// Ссылки на команды бота (/funnel, /pay …) превращаем в переходы по вкладкам
+// агентов — веб-вкладки "Отчёты" больше нет, слэш-команды тут набирать негде.
+const CMD_TO_TAB = {funnel:'diagnostician', pay:'diagnostician', journeys:'diagnostician',
+  ads:'marketer', checks:'diagnostician', experiments:'tester', board:'dashboard', today:'dashboard'};
 function renderReport(text) {
   let s = esc(text);
   ['b','i','u','s','code'].forEach(t => {
     s = s.replace(new RegExp(`&lt;${t}&gt;`, 'g'), `<${t}>`)
          .replace(new RegExp(`&lt;/${t}&gt;`, 'g'), `</${t}>`);
   });
-  s = s.replace(/\/([a-z_]+)\b/g, (m, cmd) => CMD_TO_REPORT[cmd]
-    ? `<a href="#" onclick="gotoReport('${CMD_TO_REPORT[cmd]}');return false">${m}</a>` : m);
+  s = s.replace(/\/([a-z_]+)\b/g, (m, cmd) => CMD_TO_TAB[cmd]
+    ? `<a href="#" onclick="switchTab('${CMD_TO_TAB[cmd]}');return false">${m}</a>` : m);
   return s;
 }
-window.gotoReport = kind => { switchTab('reports'); loadReport(kind); };
 
 async function api(path, opts = {}) {
   const resp = await fetch(BASE + path, {
@@ -776,7 +899,7 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.add('hidden'), 7000);
 }
 
-const VIEWS = ['overview','ads','live','history','reports','chat','projects'];
+const VIEWS = ['dashboard','diagnostician','marketer','product','tester','projects'];
 function showLogin() {
   $('login-view').classList.remove('hidden');
   $('tabs').classList.add('hidden');
@@ -794,7 +917,7 @@ function showApp() {
   // Переключатель грузим ДО первой отрисовки: обзор смотрит, виден ли он,
   // чтобы не дублировать название проекта. Иначе получалась гонка --
   // название то появлялось, то нет.
-  loadProjectSwitch().then(() => switchTab('overview'));
+  loadProjectSwitch().then(() => switchTab('dashboard'));
   loadWho();
 }
 
@@ -830,7 +953,7 @@ $('hdr-switch').onchange = () => {
   // Перерисовываем текущую вкладку, а не всю страницу: человек остаётся
   // там, где был, и сразу видит данные выбранного проекта.
   const activeTab = document.querySelector('#tabs button.active');
-  switchTab(activeTab ? activeTab.dataset.tab : 'overview');
+  switchTab(activeTab ? activeTab.dataset.tab : 'dashboard');
 };
 
 // Кто вошёл. Спрашиваем у сервера, а не запоминаем ответ формы: после
@@ -850,11 +973,11 @@ function switchTab(tab) {
   VIEWS.forEach(v => $('view-'+v).classList.toggle('hidden', v !== tab));
   document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === tab));
-  if (tab === 'overview') loadOverview();
-  if (tab === 'ads') loadAds();
-  if (tab === 'live') loadLive();
-  if (tab === 'history') loadHistory();
-  if (tab === 'reports') loadReport(currentReport);
+  if (tab === 'dashboard') loadDashboard();
+  if (tab === 'diagnostician') loadDiagnostician();
+  if (tab === 'marketer') loadMarketer();
+  if (tab === 'product') loadProduct();
+  if (tab === 'tester') loadTester();
   if (tab === 'projects') loadProjects();
 }
 
@@ -1010,13 +1133,11 @@ let STAGE_TITLES = {};
 let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_started','payment_success'];
 const stageTitle = k => STAGE_TITLES[k] || k;
 
-async function loadOverview() {
+async function loadDashboard() {
   showSkeleton('kpis', skelKpis());
   showSkeleton('decision-body', skelLines(3));
-  showSkeleton('funnel-body', skelLines(5, 'tall'));
-  showSkeleton('dynamics-body', skelLines(4));
-  showSkeleton('alerts-body', skelLines(2));
   showSkeleton('integrations-body', skelLines(1, 'w60'));
+  showSkeleton('problems-body', skelLines(2));
   try {
     // Обзор грузим первым: пока проект не подключён, остальные panels
     // отвечают 404, и одним Promise.all весь экран умирал на «Загрузка…».
@@ -1038,28 +1159,138 @@ async function loadOverview() {
 
     // allSettled, а не all: если один источник отвалился, остальные панели
     // должны отрисоваться — каждая сама честно скажет, что данных нет.
-    const [f, g, d, alerts] = (await Promise.allSettled([
+    const [f, g] = (await Promise.allSettled([
       api('/api/funnel'), api('/api/growth'),
-      api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
+    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+
+    const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
+    renderKpis(f && f.windows ? f.windows['7d'] : null);
+    renderDecision(g);
+    renderFirstRun(o, hasSnapshots);
+    renderIntegrations(o.integrations || []);
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+
+/* ---------------- Проблемы (доска фаундера) ---------------- */
+// Витрина поверх /api/alerts и /api/growth: раньше, чтобы понять, с чего
+// начать день, нужно было обойти вкладки агентов по кругу.
+async function loadDashboardProblems() {
+  const box = $('problems-body');
+  try {
+    const r = await api('/api/dashboard');
+    $('problems-count').textContent = r.cards.length ? `${r.cards.length} открытых` : '';
+    if (!r.cards.length) {
+      box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
+      window._problemCards = [];
+      renderAutonomy(r.autonomy_level, r.autonomy_levels);
+      renderAgentActions(r.agent_actions || []);
+      return;
+    }
+    box.innerHTML = r.cards.map((c, i) => `<div class="item">
+      <div class="row" style="margin-bottom:5px">
+        <span class="tag">${esc(c.agent_title)}</span>
+        <h3 style="margin:0">${esc(c.title)}</h3>
+      </div>
+      <div class="body">${esc(c.message || '')}</div>
+      <div class="muted" style="font-size:13px;margin-top:4px">${esc(c.found_by)}${
+        c.tested_by ? ' · ' + esc(c.tested_by) : ''}</div>
+      <div class="row" style="margin-top:9px">
+        ${c.actions.map(a => `<button class="btn sm" onclick="actOnProblem(${i},'${a.action}')">${
+          esc(a.label)}</button>`).join('')}
+        <button class="btn sm" onclick="switchTab('${c.agent}')">Открыть у ${esc(c.agent_title).toLowerCase()}а</button>
+      </div>
+    </div>`).join('');
+    window._problemCards = r.cards;
+    renderAutonomy(r.autonomy_level, r.autonomy_levels);
+    renderAgentActions(r.agent_actions || []);
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+function renderAutonomy(level, levels) {
+  const box = $('autonomy-body');
+  if (!levels) { box.innerHTML = ''; return; }
+  box.innerHTML = Object.keys(levels).sort().map(k => {
+    const l = levels[k];
+    const active = Number(k) === level;
+    return `<div class="item${active ? ' active' : ''}" style="cursor:pointer" onclick="setAutonomyLevel(${k})">
+      <div class="row" style="margin-bottom:4px">
+        <b>${esc(l.title)}</b>${active ? '<span class="tag">текущий</span>' : ''}
+      </div>
+      <div class="muted" style="font-size:13px">${esc(l.description)}</div>
+    </div>`;
+  }).join('');
+}
+window.setAutonomyLevel = async (level) => {
+  const id = await currentProjectId();
+  if (!id) return;
+  try {
+    await api(`/api/projects/${id}/autonomy`, {method: 'POST', body: JSON.stringify({level})});
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+};
+
+function renderAgentActions(actions) {
+  const box = $('agent-actions-body');
+  if (!actions.length) {
+    box.innerHTML = '<p class="muted">Агенты пока ничего сами не предлагали и не делали.</p>';
+    return;
+  }
+  box.innerHTML = actions.map(a => `<div class="item">
+      <div class="row" style="margin-bottom:5px">
+        <span class="tag">${esc(a.agent_title)}</span>
+        <b style="margin:0">${esc(a.status_label)}</b>
+      </div>
+      <div class="body">${esc(a.reasoning)}</div>
+      ${a.status === 'proposed' ? `<div class="row" style="margin-top:9px">
+        <button class="btn sm" onclick="decideAgentAction(${a.id},'apply')">Сделаю сам</button>
+        <button class="btn sm" onclick="decideAgentAction(${a.id},'reject')">Не буду</button>
+      </div>` : ''}
+    </div>`).join('');
+}
+window.decideAgentAction = async (id, decision) => {
+  try {
+    await api(`/api/agent-actions/${id}/${decision}`, {method: 'POST'});
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+};
+window.actOnProblem = async (i, action) => {
+  const card = (window._problemCards || [])[i];
+  if (!card) return;
+  // Разные источники карточки живут на разных существующих эндпоинтах --
+  // доска сама ничего не решает, только вызывает уже проверенные действия.
+  const url = card.source === 'alert' ? `/api/alerts/${card.id}/${action}`
+    : card.source === 'experiment' ? `/api/growth/experiment/${card.id}/${action}`
+    : `/api/growth/recommendation/${card.id}/${action}`;
+  try {
+    await api(url, {method: 'POST'});
+    loadDashboardProblems();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+};
+
+async function loadDiagnostician() {
+  showSkeleton('funnel-body', skelLines(5, 'tall'));
+  showSkeleton('dynamics-body', skelLines(4));
+  showSkeleton('alerts-body', skelLines(2));
+  try {
+    const [f, d, alerts] = (await Promise.allSettled([
+      api('/api/funnel'), api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
     ])).map(r => r.status === 'fulfilled' ? r.value : null);
 
     window._funnel = (f && f.windows) || {};
     STAGE_TITLES = (f && f.stage_titles) || {};
     STAGE_ORDER = ((f && f.stage_order) || STAGE_ORDER).filter(k => k !== 'revenue');
 
-    renderKpis(f && f.windows ? f.windows['7d'] : null);
-    renderDecision(g);
     renderFunnel($('funnel-window').value);
     renderDynamics(d);
     loadCompare();
-    loadSources();
     loadReadiness();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
     renderAlerts(alerts, hasSnapshots);
-    renderFirstRun(o, hasSnapshots);
-    renderIntegrations(o.integrations || []);
+    loadLive();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -1274,12 +1505,12 @@ function renderDecision(g) {
 window.decide = async (id, action) => {
   if (action === 'reject' && !confirm('Отклонить предложение?')) return;
   await api(`/api/growth/recommendation/${id}/${action}`, {method:'POST', body: JSON.stringify({})});
-  loadOverview();
+  loadDashboard();
 };
 window.cancelExp = async id => {
   if (!confirm('Отменить идущую проверку?')) return;
   await api(`/api/growth/experiment/${id}/cancel`, {method:'POST', body: JSON.stringify({})});
-  loadOverview();
+  loadDashboard();
 };
 window.why = async id => {
   const r = await api(`/api/growth/recommendation/${id}/why`);
@@ -1317,7 +1548,7 @@ function renderAlerts(alerts, hasSnapshots) {
 }
 window.alertAction = async (id, action) => {
   await api(`/api/alerts/${id}/${action}`, {method:'POST'});
-  loadOverview();
+  loadDiagnostician();
 };
 
 $('run-btn').onclick = async () => {
@@ -1326,7 +1557,7 @@ $('run-btn').onclick = async () => {
   try {
     const r = await api('/api/run', {method:'POST'});
     $('run-result').textContent = r.primary ? `Главное: ${r.primary.title}` : 'Готово, новых проблем нет.';
-    loadOverview();
+    loadDashboard();
   } catch (e) { $('run-result').textContent = e.message; }
   finally { $('run-btn').disabled = false; }
 };
@@ -1550,6 +1781,32 @@ async function loadReadiness() {
     `<p class="error-text">${esc(e.message)}</p>`; }
 }
 
+/* ---------------- Автоматические отметки об изменениях (D7) ---------------- */
+$('inbound-token-btn').onclick = async () => {
+  const btn = $('inbound-token-btn');
+  const box = $('inbound-token-body');
+  // Выпуск токена отзывает предыдущий -- предупреждаем до запроса, а не
+  // после: отменить уже нельзя.
+  if (btn.textContent === 'Выпустить токен' && box.dataset.issued === '1'
+      && !confirm('Прошлый токен перестанет работать. Выпустить новый?')) return;
+  btn.disabled = true;
+  try {
+    const id = await currentProjectId();
+    const r = await api(`/api/projects/${id}/inbound-token`, {method: 'POST'});
+    box.dataset.issued = '1';
+    box.innerHTML = `
+      <p class="muted">${esc(r.hint)}</p>
+      <pre class="code">${esc(r.token)}</pre>
+      <p class="purpose" style="margin:8px 0 0">Отправляйте POST на
+        <code>${esc(location.origin)}/growth/api/public/projects/${id}/changes</code>
+        с заголовком <code>Authorization: Bearer ${esc(r.token)}</code> и телом
+        <code>{"title": "что изменили"}</code> при каждом релизе.</p>`;
+    btn.textContent = 'Выпустить новый (старый перестанет работать)';
+  } catch (e) {
+    if (e.message !== 'unauthorized') box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+  } finally { btn.disabled = false; }
+};
+
 /* ---------------- Минус-фразы ---------------- */
 // Список берём из последней глубокой проверки, новую не запускаем: она
 // тяжёлая (до минуты), и открытие вкладки не должно её заказывать.
@@ -1615,6 +1872,41 @@ $('neg-copy').onclick = async () => {
   }
 };
 
+/* ---------------- Продакт: отзывы о результате ---------------- */
+async function loadProduct() {
+  const box = $('feedback-body');
+  box.innerHTML = skelLines(3);
+  $('feedback-when').textContent = '';
+  try {
+    const r = await api('/api/feedback');
+    if (!r.ok) {
+      box.innerHTML = `<p class="muted">${esc(r.hint || 'Отзывов пока нет.')}</p>`;
+      return;
+    }
+    if (r.checked_at) $('feedback-when').textContent =
+      'по данным на ' + r.checked_at.slice(0, 10).split('-').reverse().slice(0, 2).join('.');
+    if (r.total === 0) {
+      box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
+      return;
+    }
+    const share = r.bad_share_percent == null
+      ? '<span class="muted">— (данных мало для доли)</span>'
+      : `${r.bad_share_percent}% плохих`;
+    const reasons = r.reasons.length
+      ? '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px">' + r.reasons.map(x =>
+          `<span class="tag">${esc(x.label)}: ${x.count}</span>`).join('') + '</div>'
+      : '<p class="muted" style="margin-top:8px">Причины не собирались отдельно.</p>';
+    box.innerHTML = `<div class="kpis" style="margin-bottom:0">
+        <div class="kpi"><div class="label">Понравилось</div><div class="value">${nf(r.good)}</div></div>
+        <div class="kpi"><div class="label">Не понравилось</div><div class="value">${nf(r.bad)}</div></div>
+        <div class="kpi"><div class="label">Доля плохих</div><div class="value" style="font-size:20px">${share}</div></div>
+      </div>
+      ${r.hint ? `<p class="muted" style="margin-top:8px">${esc(r.hint)}</p>` : ''}
+      ${reasons}`;
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
 /* ---------------- Реклама ---------------- */
 // Директ и Метрика — необязательные источники. Без них аналитик работает,
 // просто не знает про деньги и внешний трафик. Показать таблицу прочерков
@@ -1665,8 +1957,9 @@ function renderOptionalSources(sources, hasDirectData) {
   }).join('');
 }
 
-async function loadAds() {
+async function loadMarketer() {
   loadNegatives();
+  loadSources();
   showSkeleton('ads-kpis', skelKpis(5));
   $('ads-table').tBodies[0].innerHTML = `<tr><td>${skelLines(4)}</td></tr>`;
   try {
@@ -1756,8 +2049,90 @@ function fmtWhen(iso) {
   return d.toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
 }
 
-async function loadHistory() {
+/* ---------------- Что вы меняли в продукте ---------------- */
+// Отметку ставит человек: аналитик не угадывает по излому графика, что и
+// когда выкатили. Догадка тут хуже пустоты -- на ней строится вывод «помогло».
+async function currentProjectId() {
+  if (window._activeProjectId) return window._activeProjectId;
+  const list = await api('/api/projects');
+  const chosen = (document.cookie.match(/(?:^|; )ga_platform_project=([^;]*)/) || [])[1];
+  const current = (chosen && list.find(p => String(p.id) === decodeURIComponent(chosen)))
+    || list.find(p => p.is_active) || list[0];
+  window._activeProjectId = current ? current.id : null;
+  return window._activeProjectId;
+}
+
+async function loadChanges() {
+  const box = $('changes-body');
+  box.innerHTML = skelLines(2);
+  try {
+    const id = await currentProjectId();
+    if (!id) { box.innerHTML = '<p class="muted">Сначала подключите проект.</p>'; return; }
+    const r = await api(`/api/projects/${id}/changes`);
+    if (!r.changes.length) {
+      box.innerHTML = '<p class="muted">Отметок пока нет. Отметьте ближайшую выкатку — '
+        + 'через неделю аналитик покажет, что изменилось в воронке после неё.</p>';
+      return;
+    }
+    box.innerHTML = r.changes.map(c => `<div class="item">
+      <div class="row" style="gap:8px">
+        <b>${esc(c.title)}</b>
+        <div style="flex:1"></div>
+        <span class="muted" style="white-space:nowrap">${esc(fmtWhen(c.at))} · ${esc(c.by)}</span>
+      </div>
+      <div id="effect-${c.id}" class="muted" style="font-size:13px;margin-top:6px">Считаю…</div>
+    </div>`).join('');
+    r.changes.forEach(c => loadEffect(c.id));
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
+async function loadEffect(changeId) {
+  const box = $('effect-' + changeId);
+  if (!box) return;
+  try {
+    const r = await api(`/api/changes/${changeId}/effect`);
+    if (!r.ok) { box.textContent = r.hint; return; }
+    const rows = r.rows.map(row => {
+      const sign = row.delta > 0 ? '+' : '';
+      const change = !row.reliable ? '—' : `${sign}${nf(row.delta)}`;
+      const color = !row.reliable ? 'var(--muted)'
+        : (row.delta > 0 ? 'var(--good)' : (row.delta < 0 ? 'var(--serious)' : 'var(--text-2)'));
+      return `<tr><td>${esc(row.title)}</td><td>${nf(row.was)} → ${nf(row.now)}</td>
+        <td style="color:${color};white-space:nowrap">${change}</td>
+        <td class="muted">${esc(row.verdict)}</td></tr>`;
+    }).join('');
+    // Предупреждение стоит под таблицей, а не в подсказке карточки: его
+    // должно быть видно рядом с цифрами, по которым делают вывод.
+    box.innerHTML = `<table class="stack"><tbody>${rows}</tbody></table>
+      <p class="muted" style="margin:8px 0 0">${esc(r.caution)}</p>`;
+  } catch (e) { if (e.message !== 'unauthorized') box.textContent = e.message; }
+}
+
+$('change-add').onclick = async () => {
+  const title = $('change-title').value.trim();
+  if (!title) { $('change-status').textContent = 'Напишите, что именно вы изменили.'; return; }
+  $('change-add').disabled = true;
+  try {
+    const id = await currentProjectId();
+    const raw = $('change-at').value;
+    // Поле datetime-local отдаёт местное время без пояса -- переводим в UTC
+    // сами, иначе выкатка уедет на разницу часовых поясов.
+    const at = raw ? new Date(raw).toISOString() : null;
+    await api(`/api/projects/${id}/changes`,
+              {method: 'POST', body: JSON.stringify({title, at})});
+    $('change-title').value = ''; $('change-at').value = '';
+    await loadChanges();
+    $('change-status').textContent = 'Отметил. Сравнение появится, когда после '
+      + 'изменения пройдёт чистая неделя.';
+  } catch (e) {
+    $('change-status').textContent = e.message;
+  } finally { $('change-add').disabled = false; }
+};
+
+async function loadTester() {
   loadActions();
+  loadChanges();
   const box = $('history-body');
   box.innerHTML = skelLines(4);
   try {
@@ -1927,49 +2302,83 @@ async function loadLive() {
 $('live-refresh').onclick = loadLive;
 $('live-period').onchange = loadLive;
 
-/* ---------------- Отчёты ---------------- */
-let currentReport = 'board';
-async function loadReport(kind) {
-  currentReport = kind;
-  document.querySelectorAll('#report-nav button').forEach(b =>
-    b.classList.toggle('active', b.dataset.kind === kind));
-  $('report-body').innerHTML = skelLines(6);
-  try {
-    const r = await api('/api/reports/' + kind);
-    $('report-body').innerHTML = renderReport(r.text) || '<span class="muted">Отчёт пуст.</span>';
-  } catch (e) {
-    if (e.message !== 'unauthorized') $('report-body').innerHTML = `<span class="error-text">${esc(e.message)}</span>`;
-  }
-}
-document.querySelectorAll('#report-nav button').forEach(b => b.onclick = () => loadReport(b.dataset.kind));
-
 /* ---------------- Чат ---------------- */
-function addMsg(text, who) {
+// Общий чат (доска) и чат каждого агента используют одну и ту же логику,
+// только с разным набором элементов и своим agent-фильтром контекста
+// (null для общего -- видит всё, как раньше).
+function addMsg(logId, text, who) {
   const div = document.createElement('div');
   div.className = 'msg ' + who;
   div.textContent = text;
-  $('chat-log').appendChild(div);
-  $('chat-log').scrollTop = $('chat-log').scrollHeight;
+  $(logId).appendChild(div);
+  $(logId).scrollTop = $(logId).scrollHeight;
   return div;
 }
-$('chat-send').onclick = async () => {
-  const q = $('chat-input').value.trim();
-  if (!q) return;
-  $('chat-input').value = '';
-  addMsg(q, 'user');
-  const pending = addMsg('…', 'bot');
-  try {
-    const r = await api('/api/ask', {method:'POST', body: JSON.stringify({question: q})});
-    pending.textContent = r.answer;
-  } catch (e) { pending.textContent = '⚠️ ' + e.message; }
-};
-$('chat-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('chat-send').click(); }
-});
+function wireChat(agent) {
+  const suffix = agent || 'dashboard';
+  const input = $('chat-input-' + suffix), logId = 'chat-log-' + suffix;
+  const send = async () => {
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    addMsg(logId, q, 'user');
+    const pending = addMsg(logId, '…', 'bot');
+    try {
+      const body = {question: q};
+      if (agent) body.agent = agent;
+      const r = await api('/api/ask', {method: 'POST', body: JSON.stringify(body)});
+      pending.textContent = r.answer;
+    } catch (e) { pending.textContent = '⚠️ ' + e.message; }
+  };
+  document.querySelector(`[data-chat-send="${suffix}"]`).onclick = send;
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+}
+[null, 'diagnostician', 'marketer', 'product', 'tester'].forEach(wireChat);
 
 /* ---------------- Проекты ---------------- */
+/* ---------------- Тариф ---------------- */
+async function loadBilling() {
+  try {
+    const b = await api('/api/billing/plans');
+    // Пока владелец платформы не включил продажу -- карточки тарифа
+    // не должно быть на экране вообще, не только пустой.
+    if (!b.commercial_mode) { $('billing-card').classList.add('hidden'); return; }
+    $('billing-card').classList.remove('hidden');
+
+    const plan = b.plans.find(p => p.key === b.current_plan) || {};
+    const usage = b.usage.projects == null ? '' :
+      `Проектов подключено: ${b.usage.projects}` +
+      (plan.max_projects ? ` из ${plan.max_projects}` : ' (без ограничения)') + '.';
+
+    const upgrade = b.current_plan === 'free' ? `
+      <button class="btn primary sm" id="billing-upgrade" style="margin-top:8px">
+        Перейти на Pro — ${b.plans.find(p => p.key === 'pro').price_rub} ₽/мес</button>
+      <div class="muted" id="billing-status" style="margin-top:6px"></div>` : '';
+
+    $('billing-body').innerHTML = `
+      <p>Сейчас: <b>${esc(plan.title || b.current_plan)}</b></p>
+      <p class="muted">${usage}</p>
+      ${upgrade}`;
+
+    const btn = $('billing-upgrade');
+    if (btn) btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const r = await api('/api/billing/checkout', {method: 'POST', body: JSON.stringify({plan: 'pro'})});
+        location.href = r.confirmation_url;
+      } catch (e) {
+        $('billing-status').textContent = e.message;
+        btn.disabled = false;
+      }
+    };
+  } catch (e) { if (e.message !== 'unauthorized') $('billing-card').classList.add('hidden'); }
+}
+
 async function loadProjects() {
   $('projects-table').tBodies[0].innerHTML = `<tr><td>${skelLines(2)}</td></tr>`;
+  loadBilling();
   try {
     const list = await api('/api/projects');
     // Названия этапов и событий настраиваются у того проекта, который

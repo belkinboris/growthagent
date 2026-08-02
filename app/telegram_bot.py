@@ -215,6 +215,20 @@ def _explain_metrics_discrepancy(payload: dict) -> str:
     )
 
 
+def _explain_payments_invisible_in_metrika(payload: dict) -> str:
+    return (
+        f"Почему я так решил: продукт показывает {payload.get('payment_success', 0)} "
+        "успешных оплат, а цель payment_success в Яндекс.Метрике — 0.\n\n"
+        "Вероятная причина: цель отвязана от кнопки/события оплаты (или её "
+        "вообще не создали). Пока это не починено, узнать, какой пользователь, "
+        "по какому пути и с каким поисковым запросом пришёл к оплате, нельзя.\n\n"
+        "Что проверить:\n"
+        "1. Привязана ли цель payment_success к реальному событию оплаты.\n"
+        "2. Стоит ли счётчик Метрики на странице/событии успешной оплаты.\n"
+        "3. Вкладку «Маркетолог» — он может предложить или создать цель заново."
+    )
+
+
 def _explain_low_signup_conversion(payload: dict) -> str:
     return (
         f"Почему я так решил: за период было {payload.get('clicks', 0)} кликов из Директа, "
@@ -250,6 +264,7 @@ _EXPLAIN_BY_RULE_ID = {
     "payments_started_no_success": _explain_payments_started_no_success,
     "pending_payments": _explain_pending_payments,
     "metrics_discrepancy": _explain_metrics_discrepancy,
+    "payments_invisible_in_metrika": _explain_payments_invisible_in_metrika,
     "low_signup_conversion": _explain_low_signup_conversion,
     "integration_down": _explain_integration_down,
 }

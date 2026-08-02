@@ -583,6 +583,45 @@ class TestAlerts:
         assert client.post(f"/growth/api/alerts/{alert_id}/snooze").json()["status"] == "snoozed"
         assert client.post(f"/growth/api/alerts/{alert_id}/выдумка").status_code == 404
 
+    def test_acknowledged_alert_disappears_from_the_list(self, monkeypatch, tmp_path):
+        """Нажали «Понял» -- сигнал должен пропасть из списка, не только
+        поменять статус в базе (иначе кнопка выглядит рабочей, но врёт)."""
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = _project_id(session_factory)
+        with session_factory() as session:
+            _alert(session, pid, "7d")
+        _login(client)
+        alert_id = client.get("/growth/api/alerts").json()[0]["id"]
+
+        client.post(f"/growth/api/alerts/{alert_id}/ack")
+
+        assert client.get("/growth/api/alerts").json() == []
+        assert client.get("/growth/api/overview").json()["open_alerts_count"] == 0
+
+    def test_snoozed_alert_reappears_after_snooze_expires(self, monkeypatch, tmp_path):
+        from datetime import timedelta
+
+        from app.models import AlertStatus, utcnow
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = _project_id(session_factory)
+        with session_factory() as session:
+            _alert(session, pid, "7d")
+        _login(client)
+        alert_id = client.get("/growth/api/alerts").json()[0]["id"]
+        client.post(f"/growth/api/alerts/{alert_id}/snooze")
+
+        assert client.get("/growth/api/alerts").json() == []
+
+        with session_factory() as session:
+            from app.models import Alert as AlertModel
+            alert = session.get(AlertModel, alert_id)
+            alert.snooze_until = utcnow() - timedelta(minutes=1)
+            session.add(alert)
+            session.commit()
+
+        assert len(client.get("/growth/api/alerts").json()) == 1
+
 
 # ---------------------------------------------------------------------------
 # Реклама

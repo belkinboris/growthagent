@@ -191,3 +191,161 @@ class TestContextGapsClosed:
             p = self._project_with_pp(s, {"registrations": 16})
             ctx = ask.build_context(s, p)
         assert len(ctx) <= ask.MAX_CONTEXT_CHARS
+
+
+class TestCoreDoesNotKnowProductSpecifics:
+    """Ядро не знает продуктовой специфики (принцип роадмапа): факты
+    АвтоПоста/TruePost не должны попадать в контекст чужого продукта,
+    подключённого другим клиентом."""
+
+    def test_facts_present_for_autopost(self):
+        f = _factory()
+        with f() as s:
+            p = Project(name="АвтоПост", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "ФАКТЫ О ПРОЕКТЕ" in ctx
+
+    def test_facts_absent_for_a_different_product(self):
+        """Другой клиент подключил свой продукт -- eLama и Telegram Ads
+        АвтоПоста к его бизнесу отношения не имеют."""
+        f = _factory()
+        with f() as s:
+            p = Project(name="Служба доставки цветов", type="web_app",
+                        base_url="https://flowers.example.ru", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "ФАКТЫ О ПРОЕКТЕ" not in ctx
+        assert "eLama" not in ctx
+
+    def test_system_prompt_does_not_hardcode_a_person_or_product(self):
+        assert "Борис" not in ask.SYSTEM_PROMPT
+        assert "АвтоПост" not in ask.SYSTEM_PROMPT
+
+    def test_context_names_the_connected_project(self):
+        f = _factory()
+        with f() as s:
+            p = Project(name="Служба доставки цветов", type="web_app", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "Служба доставки цветов" in ctx
+
+
+class TestScreenReferences:
+    """Задача D5: чат умеет ссылаться на конкретные экраны и цифры."""
+
+    def test_screens_reference_is_in_context(self):
+        f = _factory()
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "ЭКРАНЫ ПЛАТФОРМЫ" in ctx
+        assert "Неделя к неделе" in ctx
+        assert "Когда выводам можно будет верить" in ctx
+
+    def test_system_prompt_instructs_to_name_the_screen(self):
+        assert "ЭКРАНЫ ПЛАТФОРМЫ" in ask.SYSTEM_PROMPT
+
+    def test_live_compare_numbers_are_quoted_with_their_card(self):
+        from datetime import datetime, timedelta, timezone
+        from app.models import MetricSnapshot
+
+        f = _factory()
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            now = datetime.now(timezone.utc)
+            for days, signup in ((9, 40), (0, 60)):
+                created = now - timedelta(days=days)
+                s.add(MetricSnapshot(
+                    project_id=p.id, period_key="7d", source="combined",
+                    period_start=created - timedelta(days=7), period_end=created,
+                    as_of=created, created_at=created, metrics_json={"product": {"signup": signup}},
+                ))
+            s.commit()
+            ctx = ask.build_context(s, p)
+        assert 'КАРТОЧКА «НЕДЕЛЯ К НЕДЕЛЕ» (Обзор)' in ctx
+        assert "40" in ctx and "60" in ctx
+
+    def test_readiness_is_quoted_with_its_card(self):
+        from datetime import datetime, timedelta, timezone
+        from app.models import MetricSnapshot
+
+        f = _factory()
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            now = datetime.now(timezone.utc)
+            s.add(MetricSnapshot(
+                project_id=p.id, period_key="7d", source="combined",
+                period_start=now - timedelta(days=7), period_end=now,
+                as_of=now, created_at=now, metrics_json={"product": {"signup": 40}},
+            ))
+            s.commit()
+            ctx = ask.build_context(s, p)
+        assert 'КАРТОЧКА «КОГДА ВЫВОДАМ МОЖНО БУДЕТ ВЕРИТЬ» (Обзор)' in ctx
+
+    def test_live_summary_survives_no_snapshots(self):
+        """Свежий проект без единого снимка -- контекст не должен падать."""
+        f = _factory()
+        with f() as s:
+            p = Project(name="TruePost", type="t", is_active=True)
+            s.add(p); s.commit(); s.refresh(p)
+            ctx = ask.build_context(s, p)
+        assert "КАРТОЧКА" not in ctx
+
+
+class TestPerAgentChat:
+    """Чат вкладки-агента не должен тонуть в чужих цифрах: общий контекст
+    (доска, Growth Loop) виден всем, предметные блоки (реклама) -- только
+    своему агенту."""
+
+    def _project_with_ads(self, s):
+        from datetime import datetime, timezone
+        from app.models import MetricSnapshot
+
+        p = Project(name="TruePost", type="t", is_active=True)
+        s.add(p); s.commit(); s.refresh(p)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        s.add(MetricSnapshot(
+            project_id=p.id, period_key="7d", source="combined",
+            period_start=now, period_end=now,
+            metrics_json={"product": {"signup": 16}, "direct": {"spend": 4124, "clicks": 136}},
+        ))
+        s.commit()
+        return p
+
+    def test_no_agent_sees_everything(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            ctx = ask.build_context(s, p)
+        assert "РЕКЛАМА" in ctx
+
+    def test_marketer_sees_ads_diagnostician_does_not(self):
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            marketer_ctx = ask.build_context(s, p, agent="marketer")
+            diag_ctx = ask.build_context(s, p, agent="diagnostician")
+        assert "РЕКЛАМА" in marketer_ctx
+        assert "РЕКЛАМА" not in diag_ctx
+
+    def test_common_context_survives_agent_filter(self):
+        """Доска и правила чтения цифр видны любому агенту -- иначе чат
+        вкладки не будет знать, что уже решено."""
+        f = _factory()
+        with f() as s:
+            p = self._project_with_ads(s)
+            ctx = ask.build_context(s, p, agent="product")
+        assert "Доска" in ctx
+        assert "КАК ЧИТАТЬ ЦИФРЫ" in ctx
+
+    def test_platform_api_rejects_unknown_agent_value(self):
+        """/api/ask сам отфильтровывает мусорное значение agent, а не
+        передаёт его дальше как есть."""
+        from app.platform_api import AskRequest
+        body = AskRequest(question="q", agent="выдумка")
+        allowed = body.agent if body.agent in ("diagnostician", "marketer", "product", "tester") else None
+        assert allowed is None

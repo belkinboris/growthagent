@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlmodel import select
+from sqlmodel import or_, select
 
 from app.config import (
     ANALYSIS_WINDOWS_HOURS,
@@ -132,6 +134,9 @@ class ProjectUpdateRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+    # Чат конкретной вкладки-агента сужает контекст до её данных; общий чат
+    # на доске фаундера не передаёт agent вовсе -- видит всё, как раньше.
+    agent: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +341,20 @@ def _require_own_project_id(session, project_id: Optional[int], identity) -> Non
         raise HTTPException(status_code=404, detail="Не найдено")
 
 
+# Сигнал считается "требующим внимания" (виден в списке и в счётчике),
+# пока владелец не сказал обратное: acknowledged/resolved -- это "понял" и
+# "решилось", их прятать; snoozed виден заново, как только истёк снуз.
+# Общая функция для /api/overview (счётчик) и /api/alerts (сам список) --
+# раньше они считали по-разному, и счётчик наверху не совпадал со списком.
+def _visible_alerts_filter():
+    from app.models import utcnow
+    return or_(
+        Alert.status.in_(["open", "sent", "escalated"]),
+        (Alert.status == "snoozed")
+        & or_(Alert.snooze_until.is_(None), Alert.snooze_until <= utcnow()),
+    )
+
+
 @router.get("/api/overview", dependencies=[Depends(require_admin)])
 async def overview(identity=Depends(require_admin)):
     with get_session() as session:
@@ -352,10 +371,7 @@ async def overview(identity=Depends(require_admin)):
         # состояние по конфигурации, чтобы список не врал владельцу.
         live_status = _config_based_statuses(settings=get_settings())
         open_alerts = session.exec(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.status.in_(["open", "sent", "acknowledged", "escalated"]),
-            )
+            select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
         ).all()
         return {
             "build_marker": BUILD_MARKER,
@@ -456,7 +472,7 @@ async def alerts(limit: int = 30, identity=Depends(require_admin)):
         project = _active_project(session, identity)
         rows = session.exec(
             select(Alert)
-            .where(Alert.project_id == project.id)
+            .where(Alert.project_id == project.id, _visible_alerts_filter())
             .order_by(Alert.last_seen_at.desc())
             .limit(limit * 3)  # запас: дубли по окнам схлопнутся ниже
         ).all()
@@ -746,6 +762,219 @@ async def growth_state(identity=Depends(require_admin)):
                 "text": build_verdict_block(last),
             }
         return out
+
+
+# ---------------------------------------------------------------------------
+# Доска фаундера: сигналы и рекомендация — одним списком, с ярлыком «кто нашёл»
+# ---------------------------------------------------------------------------
+#
+# Раньше, чтобы понять, с чего начать день, нужно было обойти по кругу
+# «Обзор» (сигналы), «Реклама» (трафик), «Историю» (эксперименты) — каждый
+# честно отвечал на свой вопрос, но собрать из них одну картину «что делать
+# сначала» мог только сам владелец. Здесь то же самое, что уже показывают
+# /api/alerts и /api/growth, просто сведено в один список и подписано, какой
+# агент (вкладка) отвечает за эту проблему -- чтобы понять, куда идти
+# разбираться дальше.
+#
+# Категории/области -- то, что УЖЕ решает rules.py/growth_loop.py; здесь
+# только подпись, кто за какую область отвечает на экране. Если область
+# окажется на стыке (так и есть с onboarding/pricing_screen) -- это строка
+# в словаре, а не переделка.
+
+CATEGORY_TO_AGENT: dict[str, str] = {
+    "traffic_no_signups": "marketer",
+    "signups_no_activation": "diagnostician",
+    "activation_drop": "diagnostician",
+    "payments_started_no_success": "diagnostician",
+    "pending_payments": "diagnostician",
+    "metrics_discrepancy": "diagnostician",
+    # Диагност находит расхождение по данным воронки, но чинить -- цели/
+    # пиксели -- хозяйство Маркетолога (задача F6).
+    "payments_invisible_in_metrika": "marketer",
+    "integration_down": "diagnostician",
+}
+
+AREA_TO_AGENT: dict[str, str] = {
+    "tracking": "diagnostician",
+    "collect_data": "diagnostician",
+    "onboarding": "diagnostician",
+    "payment_path": "diagnostician",
+    "scale": "diagnostician",
+    "pricing_screen": "marketer",
+    "first_post": "product",
+    "collect_feedback": "product",
+    "commercial_bridge": "product",
+}
+
+AGENT_TITLES: dict[str, str] = {
+    "diagnostician": "Диагност", "marketer": "Маркетолог",
+    "product": "Продакт", "tester": "Тестировщик",
+}
+
+# Уровни автономии (задача F6) -- один переключатель на проект, а не по
+# одному на каждого агента: владелец договаривается с "аналитиком как с
+# гендиром" целиком, а не настраивает четыре независимых роли.
+AUTONOMY_LEVELS = {
+    1: {
+        "title": "Гендир только докладывает",
+        "description": "Все агенты находят и предлагают. Ничего не применяется "
+                        "без вашей кнопки.",
+    },
+    2: {
+        "title": "Гендир решает мелкое сам",
+        "description": "Обратимые мелкие правки (минус-слова, цели в Метрике для "
+                        "уже надёжно фиксируемых событий) применяются сами. "
+                        "Всё крупное -- на ваше решение.",
+    },
+    3: {
+        "title": "Гендир действует, отчитывается постфактум",
+        "description": "Всё, что технически можно записать (цели Метрики, "
+                        "ставки и минус-слова Директа), применяется автоматически. "
+                        "Выключено по умолчанию -- включайте осознанно.",
+    },
+}
+
+
+def autonomy_level(project: Project) -> int:
+    """Текущий уровень делегирования для проекта. По умолчанию 1 -- ничего
+    не меняется автоматически, ровно как было до F6."""
+    try:
+        level = int((project.settings_json or {}).get("autonomy_level", 1))
+    except (TypeError, ValueError):
+        level = 1
+    return level if level in AUTONOMY_LEVELS else 1
+
+
+AGENT_ACTION_STATUS_LABELS = {
+    "proposed": "предложено",
+    "applied": "применено само",
+    "rejected": "отклонено",
+    "blocked_not_configured": "не настроено",
+}
+
+
+def _agent_action_to_dict(a) -> dict:
+    return {
+        "id": a.id, "agent": a.agent, "agent_title": AGENT_TITLES.get(a.agent, a.agent),
+        "domain": a.domain, "action": a.action, "reasoning": a.reasoning,
+        "payload": a.payload_json or {}, "status": a.status,
+        "status_label": AGENT_ACTION_STATUS_LABELS.get(a.status, a.status),
+        "created_at": a.created_at.isoformat(),
+        "applied_at": a.applied_at.isoformat() if a.applied_at else None,
+    }
+
+
+@router.get("/api/dashboard", dependencies=[Depends(require_admin)])
+async def dashboard(identity=Depends(require_admin)):
+    """Открытые проблемы всех агентов одним списком -- доска фаундера."""
+    from app import growth_loop
+    from app.models import AgentAction
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+
+        alert_rows = session.exec(
+            select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
+            .order_by(Alert.last_seen_at.desc())
+        ).all()
+
+        rec = growth_loop.get_active_recommendation(session, project.id)
+        running = growth_loop.get_running_experiment(session, project.id)
+
+        # "Что сделали агенты" -- задача F6: последние предложения/действия
+        # агентов отдельной секцией, независимо от их статуса, чтобы было
+        # видно и то, что применилось само, и то, что предложено, и то, что
+        # агент хотел сделать сам, но не смог (не настроена запись).
+        agent_action_rows = session.exec(
+            select(AgentAction).where(AgentAction.project_id == project.id)
+            .order_by(AgentAction.created_at.desc()).limit(20)
+        ).all()
+        level = autonomy_level(project)
+
+    cards = []
+    for a in alert_rows:
+        agent = CATEGORY_TO_AGENT.get(a.category.value, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "alert", "id": a.id, "severity": a.severity.value,
+            "title": a.title, "message": a.message,
+            "found_by": f"{AGENT_TITLES[agent]} обнаружил",
+            "tested_by": None,
+            "actions": [{"action": "ack", "label": "Понял"},
+                        {"action": "snooze", "label": "Отложить на сутки"}],
+        })
+
+    if rec is not None:
+        # Ждёт решения владельца: принять можно только одну рекомендацию за
+        # раз (см. growth_loop.propose_if_needed), поэтому пока она не
+        # принята, эксперимента по ней ещё нет.
+        agent = AREA_TO_AGENT.get(rec.area, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "recommendation", "id": rec.id, "severity": None,
+            "title": rec.title, "message": rec.action,
+            "found_by": f"{AGENT_TITLES[agent]} предложил",
+            "tested_by": None,
+            "actions": [{"action": "accept", "label": "Сделаю"},
+                        {"action": "reject", "label": "Не буду"}],
+        })
+    elif running is not None:
+        # Рекомендацию уже приняли -- она больше не "proposed", но проверка
+        # идёт, и владельцу важно видеть её на доске, а не только во вкладке
+        # Тестировщика.
+        agent = AREA_TO_AGENT.get(running.area, "diagnostician")
+        cards.append({
+            "agent": agent, "agent_title": AGENT_TITLES[agent],
+            "source": "experiment", "id": running.id, "severity": None,
+            "title": running.title, "message": running.hypothesis,
+            "found_by": f"{AGENT_TITLES[agent]} предложил",
+            "tested_by": f"{AGENT_TITLES['tester']} проверяет: "
+                        f"{running.current_sample}/{running.target_sample}",
+            "actions": [{"action": "cancel", "label": "Отменить проверку"}],
+        })
+
+    return {
+        "cards": cards, "hint": None if cards else
+            "Открытых проблем нет: по всем проверяемым правилам всё в норме.",
+        "autonomy_level": level,
+        "autonomy_levels": {str(k): v for k, v in AUTONOMY_LEVELS.items()},
+        "agent_actions": [_agent_action_to_dict(a) for a in agent_action_rows],
+    }
+
+
+@router.post("/api/agent-actions/{action_id}/{decision}", dependencies=[Depends(require_admin)])
+async def agent_action_decide(action_id: int, decision: str, identity=Depends(require_admin)):
+    """Решение владельца по предложению агента (не по тому, что агент уже
+    применил сам -- те статусы менять поздно, действие уже сделано)."""
+    from app.models import AgentAction, AgentActionStatus, utcnow
+
+    if decision not in ("apply", "reject"):
+        raise HTTPException(status_code=404, detail="Неизвестное действие")
+    with get_session() as session:
+        action = session.get(AgentAction, action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="Действие не найдено")
+        _require_own_project_id(session, action.project_id, identity)
+        if action.status != AgentActionStatus.proposed.value:
+            raise HTTPException(status_code=409, detail="По этому предложению уже есть решение")
+
+        if decision == "apply":
+            # Владелец применил предложение сам (руками, вне платформы) --
+            # фиксируем как решённое, без вызова write-клиента: применить
+            # автоматически может только сам агент на уровне автономии 3.
+            action.status = AgentActionStatus.applied.value
+            action.applied_at = utcnow()
+        else:
+            action.status = AgentActionStatus.rejected.value
+        session.add(action)
+        session.commit()
+        _record_action(
+            session, identity,
+            "agent_action_applied" if decision == "apply" else "agent_action_rejected",
+            f"«{action.reasoning[:120]}»" + (" -- сделал сам" if decision == "apply" else " -- отклонил"),
+            action.project_id,
+        )
+        return {"ok": True, "status": action.status}
 
 
 @router.get("/api/growth/recommendation/{rec_id}/why", dependencies=[Depends(require_admin)])
@@ -1269,8 +1498,6 @@ COMPARE_MIN_SAMPLE = MIN_FOR_A_TREND
 @router.get("/api/compare", dependencies=[Depends(require_admin)])
 async def compare_periods(identity=Depends(require_admin)):
     """Неделя к предыдущей неделе по каждому шагу воронки."""
-    from datetime import timedelta
-
     from app.models import utcnow
     from app.service import extract_normalized_metrics_from_snapshot
 
@@ -1355,6 +1582,348 @@ def _compare_row(key: str, title: str, now_v, was_v) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Тариф платформы (E1/E2)
+# ---------------------------------------------------------------------------
+#
+# COMMERCIAL_MODE выключен по умолчанию -- пока платформа обслуживает
+# только своего владельца, лимитов и оплаты нет вообще. Когда владелец
+# решит отдавать аналитик другим фаундерам за деньги, включение одной
+# переменной делает лимиты и кнопку оплаты видимыми, без правок кода.
+
+
+@router.get("/api/billing/plans", dependencies=[Depends(require_admin)])
+async def billing_plans(identity=Depends(require_admin)):
+    from app import accounts
+    from app.plans import PLANS, current_plan
+
+    settings = get_settings()
+    with get_session() as session:
+        plan = current_plan(session, identity.user_id)
+        owned = len(accounts.user_project_ids(session, identity.user_id)) if identity.user_id else None
+
+    return {
+        "commercial_mode": settings.commercial_mode,
+        "current_plan": plan,
+        "plans": [{"key": key, **info} for key, info in PLANS.items()],
+        "usage": {"projects": owned},
+    }
+
+
+class CheckoutRequest(BaseModel):
+    plan: str
+
+
+@router.post("/api/billing/checkout", dependencies=[Depends(require_admin)])
+async def billing_checkout(body: CheckoutRequest, identity=Depends(require_admin)):
+    from app import billing_platform
+    from app.models import PlatformSubscription
+    from app.plans import PLANS
+
+    settings = get_settings()
+    if not settings.commercial_mode:
+        raise HTTPException(status_code=404, detail="Оплата тарифов сейчас не предлагается")
+    if identity.user_id is None:
+        raise HTTPException(status_code=400, detail="Оплата привязывается к аккаунту — войдите по почте")
+    plan_info = PLANS.get(body.plan)
+    if plan_info is None or body.plan == "free":
+        raise HTTPException(status_code=400, detail="Неизвестный или бесплатный тариф")
+
+    try:
+        payment = await billing_platform.create_checkout(
+            settings, user_id=identity.user_id, plan=body.plan,
+            price_rub=plan_info["price_rub"],
+            description=f"Аналитик Воронки — тариф {plan_info['title']}",
+        )
+    except billing_platform.YooKassaError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    with get_session() as session:
+        session.add(PlatformSubscription(
+            user_id=identity.user_id, plan=body.plan, status="pending",
+            price_rub=plan_info["price_rub"], payment_id=payment["id"],
+        ))
+        session.commit()
+
+    return {"ok": True, "confirmation_url": payment["confirmation"]["confirmation_url"]}
+
+
+@router.post("/api/billing/yookassa/notify")
+async def billing_yookassa_notify(request: Request):
+    """Вебхук ЮKassa. Без require_admin -- вызывает ЮKassa, не владелец.
+
+    Вебхуку самому не доверяем (его можно подделать): по payment_id из
+    тела запрашиваем актуальный статус напрямую у ЮKassa и начисляем
+    тариф только по её ответу.
+    """
+    from datetime import timedelta
+
+    from app import billing_platform
+    from app.models import PlatformSubscription, utcnow
+
+    body = await request.json()
+    payment_id = ((body.get("object") or {}).get("id")) or ""
+    if not payment_id:
+        return {"ok": True}  # нечего обрабатывать, но и падать незачем
+
+    settings = get_settings()
+    try:
+        payment = await billing_platform.get_payment(settings, payment_id)
+    except billing_platform.YooKassaError:
+        logger.exception("billing: не удалось проверить платёж %s в ЮKassa", payment_id)
+        return {"ok": True}
+
+    with get_session() as session:
+        sub = session.exec(
+            select(PlatformSubscription).where(PlatformSubscription.payment_id == payment_id)
+        ).first()
+        if sub is None:
+            return {"ok": True}  # платёж не наш (или уже не найти) -- не ошибка вебхука
+        if sub.status == "active":
+            return {"ok": True}  # уже начислено -- вебхук может прийти повторно
+
+        if payment.get("status") == "succeeded" and payment.get("paid"):
+            sub.status = "active"
+            sub.paid_until = utcnow() + timedelta(days=30)
+        elif payment.get("status") in ("canceled",):
+            sub.status = "failed"
+        session.add(sub)
+        session.commit()
+
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Что изменилось после выкатки (D6)
+# ---------------------------------------------------------------------------
+#
+# Сравнение недель отвечает «стало лучше или хуже», но не отвечает на вопрос,
+# который человек задаёт на самом деле: помогло ли то, что я сделал. Календарь
+# не знает, когда была выкатка, и изменение, случившееся в среду, размазывается
+# по двум неделям сразу.
+#
+# Отметку ставит человек: аналитик не угадывает по излому графика, что именно
+# и когда выкатили. Догадка тут хуже пустоты -- на ней строится вывод «помогло».
+
+
+class ChangeIn(BaseModel):
+    title: str
+    description: str | None = None
+    at: str | None = None  # ISO-время; пусто -- значит «только что»
+
+
+def _parse_change_payload(payload: ChangeIn) -> tuple[str, datetime]:
+    """Общая проверка для отметки об изменении -- одна и та же что для
+    владельца в интерфейсе, что для машины через входящий API (D7):
+    правило честности («дата не в будущем») не должно зависеть от того,
+    кто именно поставил отметку."""
+    from app.models import utcnow
+
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Напишите, что именно вы изменили")
+
+    cutoff = utcnow()
+    if payload.at:
+        try:
+            cutoff = datetime.fromisoformat(payload.at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Не разобрал дату изменения")
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+    # Изменение «в будущем» -- это опечатка в дате, а не план: сравнение по
+    # такой отметке потом молча покажет пустоту вместо ошибки.
+    if cutoff > utcnow() + timedelta(minutes=5):
+        raise HTTPException(status_code=400, detail="Дата изменения — в будущем")
+    return title, cutoff
+
+
+@router.post("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
+async def add_project_change(project_id: int, payload: ChangeIn, identity=Depends(require_admin)):
+    """Владелец отмечает: «я выкатил X тогда-то»."""
+    from app.service import add_change_event
+
+    title, cutoff = _parse_change_payload(payload)
+
+    with get_session() as session:
+        _require_own_project_id(session, project_id, identity)
+        event = add_change_event(
+            session, project_id, title, cutoff,
+            description=(payload.description or "").strip() or None,
+            created_by="владелец",
+        )
+        _record_action(session, identity, "change_marked",
+                       f"Отметил изменение: {title}", project_id=project_id)
+        return {"ok": True, "id": event.id}
+
+
+# ---------------------------------------------------------------------------
+# Вход для машины (D7): продукт или соседний агент сообщает о выкатке сам
+# ---------------------------------------------------------------------------
+#
+# До сих пор отметку мог поставить только человек руками -- удобно один
+# раз, но при частых релизах владелец либо забывает отмечать, либо
+# перестаёт это делать вовсе, и сравнение «до/после» остаётся неполным.
+#
+# Токен отдельный от `internal_api_token` (тем платформа ХОДИТ В продукт),
+# здесь наоборот -- продукт стучится В платформу, и это другое направление
+# доверия: чужой скрипт деплоя не должен получить доступ ни к чему, кроме
+# права поставить одну отметку. Хранится не сам токен, а его хэш (тем же
+# pbkdf2, что и пароли) -- утечка базы не должна означать утечку токенов.
+
+INBOUND_TOKEN_KEY = "inbound_token_hash"
+
+
+@router.post("/api/projects/{project_id}/inbound-token", dependencies=[Depends(require_admin)])
+async def rotate_inbound_token(project_id: int, identity=Depends(require_admin)):
+    """Выпускает новый токен для входящих отметок об изменениях, старый
+    (если был) перестаёт работать. Показывается один раз -- как обычно
+    для секретов, платформа хранит только хэш и не может показать снова."""
+    import secrets
+
+    from app import accounts
+
+    token = secrets.token_urlsafe(32)
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        project.settings_json = {**(project.settings_json or {}), INBOUND_TOKEN_KEY: accounts.hash_password(token)}
+        session.add(project)
+        session.commit()
+        _record_action(session, identity, "inbound_token_rotated",
+                       "Выпустил новый токен для автоматических отметок об изменениях",
+                       project_id=project_id)
+
+    return {"ok": True, "token": token,
+            "hint": "Сохраните сейчас — второй раз показать не сможем."}
+
+
+@router.post("/api/public/projects/{project_id}/changes")
+async def add_project_change_public(project_id: int, payload: ChangeIn, authorization: str | None = Header(default=None)):
+    """Публичный (не требует входа владельца) вход для машины: продукт
+    сам сообщает о выкатке. Проверяется токеном проекта, не сессией."""
+    from app import accounts
+    from app.service import add_change_event
+
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужен заголовок Authorization: Bearer <токен>")
+
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        stored_hash = (project.settings_json or {}).get(INBOUND_TOKEN_KEY)
+        if not stored_hash or not accounts.verify_password(token, stored_hash):
+            raise HTTPException(status_code=401, detail="Неверный токен")
+
+        title, cutoff = _parse_change_payload(payload)
+        event = add_change_event(
+            session, project_id, title, cutoff,
+            description=(payload.description or "").strip() or None,
+            created_by="продукт (автоматически)",
+        )
+        return {"ok": True, "id": event.id}
+
+
+@router.get("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
+async def list_project_changes(project_id: int, identity=Depends(require_admin)):
+    from app.models import ProjectChangeEvent
+
+    with get_session() as session:
+        _require_own_project_id(session, project_id, identity)
+        rows = session.exec(
+            select(ProjectChangeEvent)
+            .where(ProjectChangeEvent.project_id == project_id)
+            .order_by(ProjectChangeEvent.cutoff_at.desc())
+        ).all()
+        # База хранит время без часового пояса, но это UTC. Отдавать его
+        # «голым» нельзя: браузер прочитает такую строку как местное время
+        # и покажет выкатку на три часа раньше, чем она была.
+        return {"changes": [
+            {"id": r.id, "title": r.title, "description": r.description,
+             "at": _as_utc(r.cutoff_at).isoformat(), "by": r.created_by}
+            for r in rows
+        ]}
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+@router.get("/api/changes/{change_id}/effect", dependencies=[Depends(require_admin)])
+async def change_effect(change_id: int, identity=Depends(require_admin)):
+    """Что стало с воронкой после этой выкатки."""
+    from app.models import ProjectChangeEvent, utcnow
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        event = session.get(ProjectChangeEvent, change_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Изменение не найдено")
+        _require_own_project_id(session, event.project_id, identity)
+        stage_titles = load_stage_titles(session, event.project_id)
+
+        cutoff = _as_utc(event.cutoff_at)
+
+        def _snapshot(before=None, after=None):
+            query = (
+                select(MetricSnapshot)
+                .where(MetricSnapshot.project_id == event.project_id)
+                .where(MetricSnapshot.period_key == "7d")
+                .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+            )
+            if before is not None:
+                query = query.where(MetricSnapshot.created_at <= before)
+            if after is not None:
+                query = query.where(MetricSnapshot.created_at >= after)
+            order = MetricSnapshot.created_at.desc() if before is not None \
+                else MetricSnapshot.created_at.asc()
+            return session.exec(query.order_by(order)).first()
+
+        # «До» -- последний снимок, целиком лежащий до выкатки. «После» --
+        # первый снимок, чьё недельное окно началось уже после неё: иначе
+        # в одном окне смешаны старая и новая версии продукта, и разница
+        # показывает не изменение, а долю дней.
+        was = _snapshot(before=cutoff)
+        now = _snapshot(after=cutoff + timedelta(days=WINDOW_DAYS))
+
+        head = {"id": event.id, "title": event.title, "description": event.description,
+                "at": cutoff.isoformat()}
+
+        if was is None:
+            return {**head, "ok": False, "rows": [],
+                    "hint": "Снимка до этого изменения нет: аналитик начал наблюдать позже. "
+                            "Сравнивать не с чем."}
+        if now is None:
+            days_left = max(1, math.ceil(
+                (cutoff + timedelta(days=WINDOW_DAYS) - utcnow()).total_seconds() / 86400))
+            return {**head, "ok": False, "rows": [],
+                    "hint": f"Чистой недели после изменения ещё не набралось — осталось около "
+                            f"{days_left} дн. До этого срока в окне смешаны старая и новая версия."}
+
+        was_values = extract_normalized_metrics_from_snapshot(was)
+        now_values = extract_normalized_metrics_from_snapshot(now)
+
+    rows = []
+    for key in ("signup", "activation_1", "activation_2", "payment_started", "payment_success"):
+        now_v, was_v = now_values.get(key), was_values.get(key)
+        if now_v is None and was_v is None:
+            continue
+        rows.append(_compare_row(key, stage_titles.get(key, key), now_v, was_v))
+
+    return {
+        **head, "ok": True, "rows": rows,
+        "was_at": was.created_at.isoformat(), "now_at": now.created_at.isoformat(),
+        # Одна точка «до» и одна «после» -- это совпадение во времени, а не
+        # доказательство. Сказать это обязан сам экран: иначе владелец
+        # припишет изменению чужой результат и будет катить дальше вслепую.
+        "caution": "Это совпадение во времени, а не доказательство: в те же дни могли "
+                   "измениться реклама, сезон или что-то ещё. Чтобы проверить одну "
+                   "причину, запустите эксперимент — он держит остальное неизменным.",
+        "hint": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Когда выводам можно будет верить (D4)
 # ---------------------------------------------------------------------------
 #
@@ -1434,6 +2003,71 @@ _SOURCE_FIELDS = (
     ("payment_started", "payment_started"),
     ("payment_success", "payment_success"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Отзывы о результате: что людям не нравится (Продакт)
+# ---------------------------------------------------------------------------
+#
+# Причины отказов уже собирались, но были видны только внутри длинных
+# текстовых отчётов (/pay, /checks) -- владелец не мог посмотреть их
+# отдельно, не читая всё остальное. Эндпоинт просто открывает то, что уже
+# считает планировщик, отдельной JSON-выдачей -- новой логики здесь нет.
+
+FEEDBACK_MIN_SAMPLE = MIN_FOR_A_TREND
+
+
+@router.get("/api/feedback", dependencies=[Depends(require_admin)])
+async def feedback(identity=Depends(require_admin)):
+    """Отзывы о первом результате: сколько понравилось, сколько нет и почему."""
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+    from app.vocabulary import feedback_reason_label
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False, "good": None, "bad": None, "reasons": [], "checked_at": None,
+            "hint": "Разбор пути до оплаты ещё не собирался. Отзывы появятся "
+                    "после первого полного цикла сбора.",
+        }
+
+    pp = cached.result_json or {}
+    good = int(pp.get("first_post_feedback_good") or 0)
+    bad = int(pp.get("first_post_feedback_bad") or 0)
+    total = good + bad
+    checked_at = cached.created_at.isoformat() if cached.created_at else None
+
+    if total == 0:
+        return {
+            "ok": True, "good": 0, "bad": 0, "total": 0, "reliable": False,
+            "reasons": [], "checked_at": checked_at,
+            "hint": "За этот период никто не оставил отзыв о первом результате.",
+        }
+
+    reasons_raw = pp.get("first_post_feedback_reasons") or {}
+    reasons = sorted(
+        (
+            {"key": key, "label": feedback_reason_label(key), "count": int(count)}
+            for key, count in reasons_raw.items()
+            if isinstance(count, (int, float)) and count > 0
+        ),
+        key=lambda r: -r["count"],
+    )
+
+    # Доля плохих отзывов на 1-2 ответах ничего не значит -- тот же порог,
+    # что и у сравнения недель, чтобы платформа не говорила об уверенности
+    # по-разному в разных местах.
+    reliable = total >= FEEDBACK_MIN_SAMPLE
+    return {
+        "ok": True, "good": good, "bad": bad, "total": total, "reliable": reliable,
+        "bad_share_percent": round(bad / total * 100) if reliable else None,
+        "reasons": reasons, "checked_at": checked_at,
+        "hint": None if reliable else
+                f"Отзывов пока {total} — этого мало, чтобы говорить о доле хороших и плохих.",
+    }
 
 
 @router.get("/api/sources", dependencies=[Depends(require_admin)])
@@ -1861,9 +2495,10 @@ async def ask(body: AskRequest, identity=Depends(require_admin)):
             status_code=503,
             detail="LLM не настроен: задайте LLM_PROVIDER=yandex и YANDEX_API_KEY/YANDEX_FOLDER_ID",
         )
+    agent = body.agent if body.agent in ("diagnostician", "marketer", "product", "tester") else None
     with get_session() as session:
         project = _active_project(session, identity)
-        context_text = ask_module.build_context(session, project)
+        context_text = ask_module.build_context(session, project, agent)
 
     answer = await ask_module.answer_question(body.question, context_text, settings)
     if answer is None:
@@ -1938,6 +2573,7 @@ def _project_to_dict(p: Project) -> dict:
         "metrika_counter_id": sj.get("metrika_counter_id"),
         "direct_client_login": sj.get("direct_client_login"),
         "notify_chat_ids": sj.get("notify_chat_ids") or [],
+        "autonomy_level": autonomy_level(p),
         "created_at": p.created_at.isoformat(),
     }
 
@@ -1957,6 +2593,14 @@ async def list_projects(identity=Depends(require_admin)):
 @router.post("/api/projects", dependencies=[Depends(require_admin)])
 async def create_project(body: ProjectCreateRequest, identity=Depends(require_admin)):
     from app.connectors.truepost import DEFAULT_FUNNEL_MAPPING
+    from app.plans import can_create_project
+
+    with get_session() as session:
+        # Лимит тарифа проверяем ДО тяжёлой проверки подключения: если всё
+        # равно откажем, незачем дёргать чужой /api/internal/metrics.
+        allowed, reason = can_create_project(session, identity.user_id, get_settings())
+        if not allowed:
+            raise HTTPException(status_code=402, detail=reason)
 
     probe = await _probe_internal_api(body.base_url, body.internal_api_token)
     if not probe["ok"]:
@@ -2079,6 +2723,31 @@ async def pause_project(project_id: int, identity=Depends(require_admin)):
         _record_action(session, identity, "collection_off",
                        f"Выключил сбор данных по проекту «{project.name}»", project.id)
         return {"ok": True, "is_active": False}
+
+
+class AutonomyLevelRequest(BaseModel):
+    level: int
+
+
+@router.post("/api/projects/{project_id}/autonomy", dependencies=[Depends(require_admin)])
+async def set_autonomy_level(project_id: int, body: AutonomyLevelRequest, identity=Depends(require_admin)):
+    """Меняет уровень делегирования агентам для проекта (задача F6)."""
+    if body.level not in AUTONOMY_LEVELS:
+        raise HTTPException(status_code=422, detail="Уровень должен быть 1, 2 или 3")
+    with get_session() as session:
+        project = _owned_project(session, project_id, identity)
+        sj = dict(project.settings_json or {})
+        sj["autonomy_level"] = body.level
+        project.settings_json = sj
+        session.add(project)
+        session.commit()
+        _record_action(
+            session, identity, "autonomy_level_changed",
+            f"Установил уровень автономии {body.level} («{AUTONOMY_LEVELS[body.level]['title']}») "
+            f"у проекта «{project.name}»",
+            project.id,
+        )
+        return {"ok": True, "level": body.level}
 
 
 @router.post("/api/projects/{project_id}/retest", dependencies=[Depends(require_admin)])
