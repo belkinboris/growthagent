@@ -109,6 +109,22 @@ def progress_bar(current: int, target: int, width: int = 10) -> str:
     return f"[{bar}] {percent}%"
 
 
+def _week_line(label: str, value: int | None, target: int | None) -> str:
+    """
+    Строка блока НЕДЕЛЯ на доске.
+
+    `value is None` -- источник не отдал это число. Печатаем прочерк и
+    говорим словами, а не рисуем «0 / 20 [░░░░░░░░░░] 0%»: шкала на нуле
+    читается как факт «за неделю никто не пришёл», хотя на деле мы просто
+    не смогли собрать данные. Настоящий ноль печатаем как ноль -- он факт.
+    """
+    if value is None:
+        return f"{label} —   данных нет"
+    if target is None:
+        return f"{label} {value}"
+    return f"{label} {value} / {target}   {progress_bar(value, target)}"
+
+
 # ---------------------------------------------------------------------------
 # /run — главный владельческий отчёт
 # ---------------------------------------------------------------------------
@@ -1307,6 +1323,17 @@ def build_board_report(
 
     reg_count = new_registrations_since_deploy if new_registrations_since_deploy is not None else signup
 
+    # «Ноль» и «мы не знаем» -- разные вещи, и на доске их путать нельзя.
+    # Раньше пустой платёжный путь (продукт не ответил, кэш протух) давал
+    # «Регистрации 0 / 20 [░░░░░░░░░░] 0%» -- владелец читал это как «за
+    # неделю не пришёл никто», хотя на деле данные просто не собрались. Ниже
+    # None означает «неизвестно» и печатается прочерком, ноль -- остаётся
+    # нулём: это факт, а прочерк -- признание незнания.
+    week_reg = reg_count if (new_registrations_since_deploy is not None or metrics is not None) else None
+    week_feedback = total_feedback if has_feedback_data else None
+    week_pricing = pricing_viewed if pricing_tracked else None
+    week_payments = pp_success if payment_path else None
+
     # Решение считаем по тем же регистрациям, что показываем в блоке НЕДЕЛЯ
     # (reg_count), а не по сырому metrics.signup -- иначе при metrics=None
     # (утренняя сводка берёт регистрации из payment_path) доска показывала бы
@@ -1329,10 +1356,13 @@ def build_board_report(
         lines.append(f"\nДо решения:\n{missing}")
 
     lines.append("\n<b>НЕДЕЛЯ</b>")
-    lines.append(f"Регистрации   {reg_count} / {new_registrations_target}   {progress_bar(reg_count, new_registrations_target)}")
-    lines.append(f"Отзывы        {total_feedback} / {feedback_target}   {progress_bar(total_feedback, feedback_target)}")
-    lines.append(f"Тарифы        {pricing_viewed} / {pricing_target}   {progress_bar(pricing_viewed, pricing_target)}")
-    lines.append(f"Оплаты        {pp_success}")
+    lines.append(_week_line("Регистрации  ", week_reg, new_registrations_target))
+    lines.append(_week_line("Отзывы       ", week_feedback, feedback_target))
+    lines.append(_week_line("Тарифы       ", week_pricing, pricing_target))
+    lines.append(_week_line("Оплаты       ", week_payments, None))
+    if week_reg is None and week_feedback is None and week_pricing is None and week_payments is None:
+        lines.append("\nЦифр за неделю нет: продукт не отдал данные в последнем сборе.\n"
+                      "Нажмите «Проверить сейчас» или загляните в «Источники данных».")
 
     if skip_decision:
         lines.append("\n<b>НЕ МЕНЯТЬ</b> 🔒")
@@ -1735,15 +1765,26 @@ def build_recommendation_why(rec) -> str:
 
 def _delta_phrase(history: list[dict], key: str, word: str) -> str | None:
     """«+2 регистрации» из разницы двух последних дневных точек."""
+    d = _delta_value(history, key)
+    if d is None or d <= 0:
+        return None
+    return f"+{d} {word}"
+
+
+def _delta_value(history: list[dict], key: str) -> int | None:
+    """
+    Разница двух последних дневных точек. None -- измерить НЕ СМОГЛИ
+    (нет двух точек подряд или продукт не отдал число), это не то же
+    самое, что 0 («измерили, прироста нет»). Раньше оба случая давали
+    None и сливались в бодрое «за сутки новых событий не было» -- сводка
+    уверенно сообщала о тишине, когда на самом деле не измеряла ничего.
+    """
     if len(history) < 2:
         return None
     prev, cur = history[-2].get(key), history[-1].get(key)
     if prev is None or cur is None:
         return None
-    d = int(cur) - int(prev)
-    if d <= 0:
-        return None
-    return f"+{d} {word}"
+    return int(cur) - int(prev)
 
 
 def build_morning_story(
@@ -1758,14 +1799,28 @@ def build_morning_story(
     """
     lines = ["☀️ <b>Доброе утро.</b>"]
 
-    deltas = [p for p in (
-        _delta_phrase(history, "registrations", "регистрации"),
-        _delta_phrase(history, "feedback_total", "отзыва"),
-        _delta_phrase(history, "pricing_viewed", "открытия тарифов"),
-        _delta_phrase(history, "payment_success", "ОПЛАТЫ"),
-    ) if p]
-    if deltas:
-        lines.append("За сутки: " + ", ".join(deltas) + ".")
+    tracked = (
+        ("registrations", "регистрации"),
+        ("feedback_total", "отзыва"),
+        ("pricing_viewed", "открытия тарифов"),
+        ("payment_success", "ОПЛАТЫ"),
+    )
+    measured = [(word, _delta_value(history, key)) for key, word in tracked]
+    measured = [(word, d) for word, d in measured if d is not None]
+
+    grew = [f"+{d} {word}" for word, d in measured if d > 0]
+    fell = [f"{word} −{abs(d)}" for word, d in measured if d < 0]
+
+    if not measured:
+        # Ни одного измеримого шага -- честно про это, а не «всё тихо».
+        lines.append("За сутки сравнивать не с чем: нет двух дней подряд с данными "
+                      "(или продукт не ответил в последнем сборе).")
+    elif grew:
+        lines.append("За сутки: " + ", ".join(grew) + ".")
+    elif fell:
+        # Спад -- это событие, а не тишина. Раньше он молча превращался
+        # в «новых событий не было».
+        lines.append("За сутки прироста не было, снизилось: " + ", ".join(fell) + ".")
     else:
         lines.append("За сутки новых событий не было — при 1–3 регистрациях в день это нормально.")
 
