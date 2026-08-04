@@ -604,3 +604,63 @@ class TestAutonomyDescriptionsAreTrue:
         _login(client)
         levels = client.get("/growth/api/dashboard").json()["autonomy_levels"]
         assert "минус-фраз" in levels["2"]["description"].lower()
+
+
+class TestUnconfiguredSourceIsNotOk:
+    """
+    Ненастроенный источник приходит в проверку свежести без ошибки
+    (коннектор бросает NotConfiguredError, планировщик честно превращает
+    это в error=None) -- и получал статус «ok» со свежей датой синхронизации.
+    Экран «Источники данных» показывал YooKassa как работающую, хотя её
+    коннектор — заглушка без единого запроса наружу.
+    """
+
+    def _project(self, session_factory):
+        from app.models import Integration, IntegrationStatus, IntegrationType, Project
+        from sqlmodel import select
+
+        with session_factory() as session:
+            project = session.exec(select(Project)).first()
+            session.add(Integration(project_id=project.id, type=IntegrationType.yookassa,
+                                     status=IntegrationStatus.ok))
+            session.commit()
+            return project.id
+
+    def test_not_configured_source_is_marked_so(self, monkeypatch, tmp_path):
+        from sqlmodel import select
+
+        from app.models import Integration, IntegrationStatus, IntegrationType, Project
+        from app.service import check_integration_freshness
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = self._project(session_factory)
+        with session_factory() as session:
+            project = session.get(Project, pid)
+            change = check_integration_freshness(
+                session, project, IntegrationType.yookassa,
+                as_of=None, error=None, configured=False,
+            )
+            assert change is None, "ненастроенный источник не повод для алерта"
+        with session_factory() as session:
+            row = session.exec(select(Integration).where(
+                Integration.type == IntegrationType.yookassa)).first()
+        assert row.status == IntegrationStatus.not_configured
+        assert row.last_sync_at is None, "дата синхронизации у источника, куда не ходили"
+
+    def test_configured_and_working_is_still_ok(self, monkeypatch, tmp_path):
+        from sqlmodel import select
+
+        from app.models import Integration, IntegrationStatus, IntegrationType, Project
+        from app.service import check_integration_freshness
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = self._project(session_factory)
+        with session_factory() as session:
+            project = session.get(Project, pid)
+            check_integration_freshness(session, project, IntegrationType.yookassa,
+                                         as_of=None, error=None, configured=True)
+        with session_factory() as session:
+            row = session.exec(select(Integration).where(
+                Integration.type == IntegrationType.yookassa)).first()
+        assert row.status == IntegrationStatus.ok
+        assert row.last_sync_at is not None
