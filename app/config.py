@@ -226,6 +226,13 @@ class Settings(BaseSettings):
     direct_client_login: Optional[str] = None
     direct_campaign_ids: str = ""  # список через запятую
     direct_oauth_token: Optional[str] = None
+    # Токен для ЗАПИСИ в Директ (минус-слова на уровне автономии 2/3).
+    # У Директа, в отличие от Метрики, нет отдельного scope на запись --
+    # право даётся одним флагом «Использовать API Яндекс.Директа» при
+    # регистрации приложения. Отдельная переменная нужна тем, кто хочет
+    # развести чтение и запись по разным токенам; если не задана, пишем
+    # тем же токеном, которым читаем отчёты.
+    direct_write_oauth_token: Optional[str] = None
     direct_sandbox: bool = False
     # GoalId Яндекс.Директа для атрибуции конверсий по целям.
     # НЕЛЬЗЯ считать total conversions регистрациями без явного GoalId.

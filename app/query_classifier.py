@@ -160,6 +160,12 @@ class QueryClassification:
     reason: str
     campaign_name: str = ""
     ad_group_name: str = ""
+    # Числовые ID нужны, чтобы минус-фразу можно было записать в Директ
+    # через API: adgroups.update принимает AdGroupId, а не название группы.
+    # Раньше до кэша доезжали только названия, и автоматическое применение
+    # упиралось в «знаем что минусовать, не знаем куда».
+    campaign_id: Optional[str] = None
+    ad_group_id: Optional[str] = None
     clicks: int = 0
     cost: float = 0.0
     impressions: int = 0
@@ -200,6 +206,8 @@ class DirectIntelligenceResult:
                 "reason": q.reason,
                 "campaign_name": q.campaign_name,
                 "ad_group_name": q.ad_group_name,
+                "campaign_id": q.campaign_id,
+                "ad_group_id": q.ad_group_id,
                 "clicks": q.clicks,
                 "cost": q.cost,
                 "impressions": q.impressions,
@@ -494,6 +502,8 @@ def classify_query(
     registration_attribution: str = "none",
     campaign_name: str = "",
     ad_group_name: str = "",
+    campaign_id: Optional[str] = None,
+    ad_group_id: Optional[str] = None,
 ) -> QueryClassification:
     """
     Классифицирует один поисковый запрос.
@@ -522,6 +532,8 @@ def classify_query(
             reason=f"{registrations} регистр., расход {cost:.0f} ₽",
             campaign_name=campaign_name,
             ad_group_name=ad_group_name,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
             clicks=clicks,
             cost=cost,
             impressions=impressions,
@@ -584,6 +596,8 @@ def classify_query(
             reason=f"семантика: {garbage_cat.replace('_', ' ')}",
             campaign_name=campaign_name,
             ad_group_name=ad_group_name,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
             clicks=clicks,
             cost=cost,
             impressions=impressions,
@@ -607,6 +621,8 @@ def classify_query(
             reason=f"возможно мусор ({garbage_cat.replace('_', ' ')}), но данных мало ({clicks} кл., {cost:.0f} ₽)",
             campaign_name=campaign_name,
             ad_group_name=ad_group_name,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
             clicks=clicks,
             cost=cost,
             impressions=impressions,
@@ -624,6 +640,8 @@ def classify_query(
             reason=f'содержит защищённый термин "{protected}"',
             campaign_name=campaign_name,
             ad_group_name=ad_group_name,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
             clicks=clicks,
             cost=cost,
             impressions=impressions,
@@ -700,6 +718,8 @@ def classify_search_queries(
         impressions = int(row.get("impressions") or 0)
         campaign_name = row.get("campaign_name", "")
         ad_group_name = row.get("ad_group_name", "")
+        campaign_id = row.get("campaign_id") or None
+        ad_group_id = row.get("ad_group_id") or None
 
         # Конверсии только если reliable attribution
         if has_reliable_attribution:
@@ -722,6 +742,8 @@ def classify_search_queries(
             registration_attribution=attribution,
             campaign_name=campaign_name,
             ad_group_name=ad_group_name,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
         )
         classifications.append(classification)
 

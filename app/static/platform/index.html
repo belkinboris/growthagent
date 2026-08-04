@@ -204,6 +204,8 @@
     max-width:min(520px,92vw);background:var(--surface-2);border:1px solid var(--border);
     border-radius:10px;padding:12px 16px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
   #toast.hidden{display:none}
+  #toast.toast-ok{border-color:var(--good);box-shadow:0 8px 24px rgba(0,0,0,.45),inset 3px 0 0 var(--good)}
+  #toast.toast-error{border-color:var(--critical);box-shadow:0 8px 24px rgba(0,0,0,.45),inset 3px 0 0 var(--critical)}
   .error-text{color:var(--critical);font-size:13px;margin:6px 0}
   .ok-text{color:var(--good);font-size:13px;margin:6px 0}
   .chat-log{display:flex;flex-direction:column;gap:10px;max-height:56vh;overflow-y:auto;margin-bottom:12px}
@@ -891,12 +893,15 @@ async function api(path, opts = {}) {
 }
 
 let toastTimer = null;
-function toast(text) {
+// kind: 'ok' | 'error' | '' -- раньше успех и ошибка выглядели одинаково
+// серыми, и «Сохранено» не отличалось от «Не удалось сохранить».
+function toast(text, kind) {
   const el = $('toast');
   el.textContent = text;
+  el.className = kind ? 'toast-' + kind : '';
   el.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add('hidden'), 7000);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), kind === 'error' ? 9000 : 6000);
 }
 
 const VIEWS = ['dashboard','diagnostician','marketer','product','tester','projects'];
@@ -1097,6 +1102,15 @@ function showSkeleton(id, html) {
   const el = $(id);
   if (el) el.innerHTML = html;
 }
+// Скелетон обязан во что-то смениться. Раньше упавший запрос оставлял
+// пульсирующие полоски навсегда, и человек ждал данных, которых не будет.
+function failCard(id, message) {
+  const el = $(id);
+  if (!el) return;
+  el.innerHTML = `<p class="error-text">Не удалось загрузить: ${esc(message || 'ошибка связи')}.</p>
+    <p class="muted" style="margin-top:6px">Это сбой запроса, а не «данных нет» —
+      обновите страницу или попробуйте позже.</p>`;
+}
 
 /* ---------------- Обзор ---------------- */
 // Обязателен один источник — внутренний API продукта. Остальные добавляют
@@ -1159,17 +1173,37 @@ async function loadDashboard() {
 
     // allSettled, а не all: если один источник отвалился, остальные панели
     // должны отрисоваться — каждая сама честно скажет, что данных нет.
-    const [f, g] = (await Promise.allSettled([
+    const [fr, gr] = await Promise.allSettled([
       api('/api/funnel'), api('/api/growth'),
-    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+    ]);
+    const f = fr.status === 'fulfilled' ? fr.value : null;
+    const g = gr.status === 'fulfilled' ? gr.value : null;
+    // «Запрос упал» и «данных ещё нет» -- разные вещи. Раньше оба случая
+    // давали null, и экран уверенно писал «данных ещё нет», хотя данные
+    // могли быть -- просто мы их не получили.
+    const funnelFailed = fr.status === 'rejected';
+
+    // Подписи шагов приходят с воронкой. Раньше их клал только Диагност,
+    // и на Доске при первом входе плитки подписывались сырыми ключами
+    // (signup, activation_1) по-английски, пока человек не сходит на
+    // соседнюю вкладку и обратно.
+    if (f && f.stage_titles) STAGE_TITLES = f.stage_titles;
 
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
-    renderKpis(f && f.windows ? f.windows['7d'] : null);
-    renderDecision(g);
+    renderKpis(f && f.windows ? f.windows['7d'] : null, funnelFailed);
+    renderDecision(g, gr.status === 'rejected');
     renderFirstRun(o, hasSnapshots);
     renderIntegrations(o.integrations || []);
     loadDashboardProblems();
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    // Скелетон без этой ветки пульсировал вечно: человек ждал данных,
+    // которых уже не будет.
+    console.error(e);
+    failCard('kpis', e.message);
+    failCard('decision-body', e.message);
+    failCard('problems-body', e.message);
+  }
 }
 
 /* ---------------- Проблемы (доска фаундера) ---------------- */
@@ -1274,32 +1308,50 @@ async function loadDiagnostician() {
   showSkeleton('dynamics-body', skelLines(4));
   showSkeleton('alerts-body', skelLines(2));
   try {
-    const [f, d, alerts] = (await Promise.allSettled([
+    const [fr, dr, ar] = await Promise.allSettled([
       api('/api/funnel'), api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
-    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+    ]);
+    const f = fr.status === 'fulfilled' ? fr.value : null;
+    const d = dr.status === 'fulfilled' ? dr.value : null;
+    const alerts = ar.status === 'fulfilled' ? ar.value : null;
 
     window._funnel = (f && f.windows) || {};
-    STAGE_TITLES = (f && f.stage_titles) || {};
+    if (f && f.stage_titles) STAGE_TITLES = f.stage_titles;
     STAGE_ORDER = ((f && f.stage_order) || STAGE_ORDER).filter(k => k !== 'revenue');
 
-    renderFunnel($('funnel-window').value);
-    renderDynamics(d);
+    if (fr.status === 'rejected') failCard('funnel-body', fr.reason && fr.reason.message);
+    else renderFunnel($('funnel-window').value);
+    if (dr.status === 'rejected') failCard('dynamics-body', dr.reason && dr.reason.message);
+    else renderDynamics(d);
     loadCompare();
     loadReadiness();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
-    renderAlerts(alerts, hasSnapshots);
+    // Упавший запрос сигналов -- НЕ «сигналов нет». Раньше экран в этом
+    // случае писал «всё в норме»: аналитик уверенно заявлял, что проблем
+    // нет, не получив ни одного ответа.
+    if (ar.status === 'rejected') failCard('alerts-body', ar.reason && ar.reason.message);
+    else renderAlerts(alerts, hasSnapshots);
     loadLive();
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    console.error(e);
+    failCard('funnel-body', e.message);
+    failCard('dynamics-body', e.message);
+    failCard('alerts-body', e.message);
+  }
 }
 
-function renderKpis(win) {
+function renderKpis(win, failed) {
   const fu = (win && win.funnel) || {};
   // Пока цикл ни разу не отработал, снимка нет вовсе. Показать шесть
   // прочерков и молчать — значит заставить человека гадать, сломалось
   // что-то или просто рано.
   const noData = !win;
+  // Три разных состояния прочерка, и их нельзя путать: «запрос упал»,
+  // «сбора ещё не было», «собрали, но продукт не отдал этот шаг».
+  const subNoData = failed ? 'не удалось получить' : 'данных ещё нет';
   // Откуда берётся число — часть самого числа. Без этого «40» на шаге,
   // где на предыдущем «8», выглядит ошибкой, а прочерк читается как ноль.
   const FROM_PRODUCT = 'Считает сам продукт и отдаёт по своему внутреннему API. '
@@ -1332,7 +1384,7 @@ function renderKpis(win) {
     `<div class="kpi"><div class="label">${esc(t.label)}${
        t.hint ? `<button class="hint" data-hint="kpi-${i}" title="Откуда это число">?</button>` : ''}</div>
      <div class="value">${nf(t.value)}</div>
-     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div>
+     <div class="sub">${esc(noData ? subNoData : (t.sub || (t.value == null ? 'продукт не отдал этот шаг' : '')))}</div>
      ${t.hint ? `<div class="hint-pop hidden" id="hint-kpi-${i}">${esc(t.hint)}</div>` : ''}
      </div>`).join('');
 }
@@ -1502,19 +1554,33 @@ function renderDecision(g) {
   box.innerHTML = '<p class="muted">Активных предложений нет. Аналитик копит данные '
     + 'и предложит следующий шаг, когда выборка станет осмысленной.</p>';
 }
+// Все три раньше не ловили ошибку: нажатие на «Принять» при упавшем
+// запросе не делало ничего и ничего не говорило -- кнопка выглядела
+// сломанной.
 window.decide = async (id, action) => {
   if (action === 'reject' && !confirm('Отклонить предложение?')) return;
-  await api(`/api/growth/recommendation/${id}/${action}`, {method:'POST', body: JSON.stringify({})});
-  loadDashboard();
+  try {
+    await api(`/api/growth/recommendation/${id}/${action}`, {method:'POST', body: JSON.stringify({})});
+    loadDashboard();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.cancelExp = async id => {
   if (!confirm('Отменить идущую проверку?')) return;
-  await api(`/api/growth/experiment/${id}/cancel`, {method:'POST', body: JSON.stringify({})});
-  loadDashboard();
+  try {
+    await api(`/api/growth/experiment/${id}/cancel`, {method:'POST', body: JSON.stringify({})});
+    loadDashboard();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.why = async id => {
-  const r = await api(`/api/growth/recommendation/${id}/why`);
-  $('why-box').innerHTML = renderReport(r.text);
+  const box = $('why-box');
+  try {
+    const r = await api(`/api/growth/recommendation/${id}/why`);
+    if (box) box.innerHTML = renderReport(r.text);
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    if (box) box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+    else toast(e.message, 'error');
+  }
 };
 
 function renderAlerts(alerts, hasSnapshots) {
@@ -1530,25 +1596,36 @@ function renderAlerts(alerts, hasSnapshots) {
     return;
   }
   const sevClass = s => ({P0:'critical', P1:'critical', P2:'warning', P3:'serious'})[s] || '';
-  $('alerts-body').innerHTML = alerts.map(a => `<div class="item">
+  // Текст сигнала передаём по индексу, а не подстановкой в атрибут:
+  // JSON.stringify внутри onclick="..." рвал разметку на первой же кавычке
+  // (кнопка «В разработку» не работала), и заодно пускал текст сигнала
+  // в HTML без экранирования.
+  window._alerts = alerts;
+  $('alerts-body').innerHTML = alerts.map((a, i) => `<div class="item">
     <div class="row" style="margin-bottom:5px">
       <span class="tag ${sevClass(a.severity)}">${esc(a.severity)}</span>
       <h3 style="margin:0">${esc(a.title)}</h3>
       <div class="spacer" style="flex:1"></div>
-      <span class="muted">${(a.periods || []).join(', ')} · ×${a.occurrence_count}</span>
+      <span class="muted">${esc((a.periods || []).join(', '))} · ×${esc(String(a.occurrence_count))}</span>
     </div>
     <div class="body">${esc(a.message)}</div>
     <div class="row" style="margin-top:9px">
       <button class="btn sm" onclick="alertAction(${a.id},'ack')">Понял</button>
       <button class="btn sm" onclick="alertAction(${a.id},'snooze')">Отложить на сутки</button>
-      <button class="btn sm" onclick="sendToDev(${JSON.stringify(a.title)}, ${JSON.stringify(
-        a.message + '\n\nИсточник: Аналитик Воронки, сигнал ' + a.severity + '.')})">В разработку</button>
-      <span class="muted">${esc(a.last_seen_at.slice(0,16).replace('T',' '))}</span>
+      <button class="btn sm" onclick="alertToDev(${i})">В разработку</button>
+      <span class="muted">${esc((a.last_seen_at || '').slice(0,16).replace('T',' '))}</span>
     </div></div>`).join('');
 }
+window.alertToDev = i => {
+  const a = (window._alerts || [])[i];
+  if (!a) return;
+  sendToDev(a.title, a.message + '\n\nИсточник: Аналитик Воронки, сигнал ' + a.severity + '.');
+};
 window.alertAction = async (id, action) => {
-  await api(`/api/alerts/${id}/${action}`, {method:'POST'});
-  loadDiagnostician();
+  try {
+    await api(`/api/alerts/${id}/${action}`, {method:'POST'});
+    loadDiagnostician();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 
 $('run-btn').onclick = async () => {
@@ -2420,18 +2497,29 @@ async function loadProjects() {
 // обходит все включённые, поэтому «включить свой» больше не значит
 // «выключить чужой».
 window.activate = async id => {
-  await api(`/api/projects/${id}/activate`, {method:'POST'});
-  loadProjects(); loadProjectSwitch();
+  try {
+    await api(`/api/projects/${id}/activate`, {method:'POST'});
+    toast('Сбор включён', 'ok');
+    loadProjects(); loadProjectSwitch();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.pause = async id => {
-  await api(`/api/projects/${id}/pause`, {method:'POST'});
-  loadProjects(); loadProjectSwitch();
+  try {
+    await api(`/api/projects/${id}/pause`, {method:'POST'});
+    toast('Сбор выключен', 'ok');
+    loadProjects(); loadProjectSwitch();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.retest = async id => {
-  const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
-  alert(r.ok ? 'Связь есть. Endpoints: ' + r.available_endpoints.join(', ')
-             : 'Проблема: ' + (r.hint || JSON.stringify(r.errors)));
-  loadProjects();
+  try {
+    const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
+    // Системное окно alert() показывало сырой JSON ошибок -- заменено на
+    // обычный тост, как в остальном интерфейсе.
+    toast(r.ok ? 'Связь есть: ' + (r.available_endpoints || []).join(', ')
+               : 'Проблема: ' + (r.hint || 'продукт не ответил как ожидалось'),
+          r.ok ? 'ok' : 'error');
+    loadProjects();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 /* ---- Готовый код endpoint'а для стороны продукта ---- */
 // Грузим по первому раскрытию, а не при загрузке вкладки: у большинства
