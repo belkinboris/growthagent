@@ -553,29 +553,49 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # integration_down: проверяем свежесть/доступность для каждого источника
         # ОТДЕЛЬНО от бизнес-анализа. Эта проверка использует данные собранные
         # выше за 24h окно как репрезентативные для статуса интеграции.
+        # Настроен ли источник -- знает только это место. Без этого флага
+        # ненастроенная интеграция помечалась «ok» со свежей датой
+        # синхронизации: экран «Источники данных» показывал YooKassa как
+        # работающую, хотя её коннектор -- заглушка без единого запроса.
+        sj = project.settings_json or {}
+        product_configured = bool(project.base_url and _project_token(project))
+        metrika_configured = bool(
+            settings.yandex_oauth_token
+            and (sj.get("metrika_counter_id") or settings.metrika_counter_id)
+        )
+        direct_configured = bool(
+            settings.effective_direct_oauth_token
+            and (sj.get("direct_client_login") or settings.direct_client_login)
+        )
+        yookassa_configured = bool(settings.yookassa_shop_id and settings.yookassa_secret_key)
+
         integration_changes = []
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.project_metrics_api,
                 as_of=product_as_of, error=all_errors.get("product"),
+                configured=product_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.metrika,
                 as_of=None, error=all_errors.get("metrika"),
+                configured=metrika_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.direct,
                 as_of=None, error=all_errors.get("direct"),
+                configured=direct_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.yookassa,
                 as_of=None, error=all_errors.get("yookassa"),
+                configured=yookassa_configured,
             )
         )
         integration_changes = [c for c in integration_changes if c is not None]

@@ -325,6 +325,7 @@ def check_integration_freshness(
     integration_type: IntegrationType,
     as_of: datetime | None,
     error: str | None,
+    configured: bool = True,
 ) -> AlertChange | None:
     """
     Вызывается scheduler.py после попытки получить данные от источника.
@@ -349,6 +350,20 @@ def check_integration_freshness(
         as_of is not None
         and (utcnow() - as_of) > timedelta(minutes=settings.integration_stale_minutes)
     )
+
+    # Ненастроенный источник приходит сюда без ошибки (коннектор бросает
+    # NotConfiguredError, и scheduler честно превращает это в error=None) --
+    # и раньше он получал статус «ok» со свежей датой синхронизации. На
+    # экране «Источники данных» это выглядело как «подключено и работает»
+    # там, где не задан ни один ключ, а у YooKassa вообще нет реализации.
+    # «Не настроено» -- это состояние, а не успех.
+    if not configured:
+        if integration and integration.status != IntegrationStatus.not_configured:
+            integration.status = IntegrationStatus.not_configured
+            integration.last_error = None
+            session.add(integration)
+            session.commit()
+        return None
 
     if error:
         if integration:
