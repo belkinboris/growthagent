@@ -111,11 +111,11 @@
   .card.hero > h2{font-size:18px}
   .muted{color:var(--muted);font-size:13px}
   /* «Зачем этот экран» — 27 таких абзацев отодвигали реальные данные ниже
-     первого экрана. Теперь это тихая сноска, а не блок с рамкой. */
-  .purpose{color:var(--muted);font-size:13px;line-height:1.5;margin:0 0 14px;
-    padding:0 0 0 12px;background:none;border:none;border-left:2px solid var(--border);
-    border-radius:0}
-  .card .purpose{background:none;border-left-color:var(--border)}
+     первого экрана и создавали ощущение, что владельца грузят методичкой.
+     Скрыты целиком: назначение экрана должно быть понятно из его
+     содержимого, а не из сопроводительного текста. Разметка оставлена —
+     это же готовые подсказки, если решим показывать их по запросу. */
+  .purpose{display:none}
   .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .spacer{flex:1}
 
@@ -495,57 +495,49 @@
       <p class="muted" id="first-run-note" style="margin:14px 0 0"></p>
     </div>
 
-    <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
-      и что делать дальше — без обхода вкладок агентов по кругу. Сверху — числа за неделю,
-      ниже — единственное решение, которое аналитик предлагает принять сейчас, дальше —
-      открытые проблемы от всех агентов одним списком.</p>
+    <!-- Главная карточка доски. Фаундер открывает экран с одним вопросом:
+         «что мне сделать?» — и получает нумерованный короткий список
+         готовых шагов, а не сырьё из сигналов, рекомендаций и лент.
+         Всё, из чего список собран, лежит ниже в свёрнутых подробностях. -->
+    <div class="card hero" id="today-card">
+      <h2>Что сделать сегодня<span class="spacer"></span><span class="muted" id="today-count"></span></h2>
+      <div id="today-body"><div class="skel w80"></div><div class="skel w60"></div></div>
+    </div>
 
     <div class="kpis" id="kpis" style="margin-bottom:16px"></div>
 
-    <div class="card hero" id="decision-card">
-      <h2>Решение<span class="spacer"></span><span class="muted" id="decision-hint"></span></h2>
-      <p class="purpose" style="margin-top:0">Зачем: одна проверка за раз. Аналитик предлагает
-        изменение, фиксирует базовый уровень и сам выносит вердикт, когда наберётся выборка —
-        поэтому во время проверки остальное трогать нельзя, иначе результат ничего не докажет.</p>
-      <div id="decision-body" class="muted">Загрузка…</div>
+    <!-- Отчёт агентов: только то, что они уже СДЕЛАЛИ сами. Их вопросы и
+         предложения не здесь — они наверху, в списке «Что сделать сегодня». -->
+    <div class="card" id="agents-done-card">
+      <h2>Агенты сделали сами<span class="spacer"></span><span class="muted" id="agents-done-count"></span></h2>
+      <div id="agents-done-body" class="muted"></div>
     </div>
 
-    <!-- Карточки проблем от всех агентов одним списком (задача про четырёх
-         агентов): раньше, чтобы понять, с чего начать день, нужно было
-         обойти вкладки по кругу. Каждая карточка подписана, кто её нашёл --
-         это витрина поверх уже работающих alerts/growth_loop, не новая
-         диагностика. -->
-    <div class="card">
-      <h2>Проблемы<span class="spacer"></span><span class="muted" id="problems-count"></span></h2>
-      <p class="purpose" style="margin-top:0">Зачем: одна доска вместо обхода вкладок агентов.
-        «Сделаю» уводит на вкладку нужного агента, где инструмент для правки; «Не буду» — в архив,
-        чтобы не предлагалось снова бездумно.</p>
-      <div id="problems-body">Загрузка…</div>
-    </div>
+    <!-- Сырьё, из которого собран список наверху. По умолчанию свёрнуто:
+         фаундеру нужны готовые шаги, а не борщ из всех данных сразу.
+         Внутри — прежние блоки с прежними id, чтобы вся логика и тесты
+         продолжали работать. -->
+    <details class="card" id="details-card">
+      <summary style="cursor:pointer;font-size:15px;font-weight:600">Подробности — всё, из чего собран список</summary>
+      <div style="margin-top:14px">
+        <h3 style="margin:14px 0 8px">Проверка, которая идёт сейчас<span class="muted" id="decision-hint" style="font-weight:400;margin-left:8px"></span></h3>
+        <div id="decision-body" class="muted">Загрузка…</div>
 
-    <!-- Уровень автономии (задача F6): одна ручка на проект, а не по одной
-         на каждого агента -- владелец договаривается с "аналитиком как с
-         гендиром" целиком. -->
-    <div class="card">
-      <h2>Уровень автономии</h2>
-      <p class="purpose" style="margin-top:0">Как вы хотите договориться с гендиром: он сам всё
-        решает и отчитывается постфактум, только ключевое выносит на ваше решение, или всё
-        предлагает и ничего не делает без вашей кнопки.</p>
-      <div id="autonomy-body">Загрузка…</div>
-    </div>
+        <h3 style="margin:20px 0 8px">Открытые проблемы <span class="muted" id="problems-count" style="font-weight:400"></span></h3>
+        <div id="problems-body">Загрузка…</div>
 
-    <!-- Что сделали (или предложили) агенты сами -- отдельная лента от
-         карточек проблем: там "что не так", здесь "что агент сам сделал
-         или хочет сделать по этому поводу". -->
-    <div class="card">
-      <h2>Что сделали агенты</h2>
-      <div id="agent-actions-body" class="muted">Загрузка…</div>
-    </div>
+        <h3 style="margin:20px 0 8px">Вся работа агентов</h3>
+        <div id="agent-actions-body" class="muted">Загрузка…</div>
 
-    <div class="card">
-      <h2>Источники данных</h2>
-      <div class="row" id="integrations-body"></div>
-    </div>
+        <h3 style="margin:20px 0 8px">Уровень автономии</h3>
+        <p class="muted" style="margin:0 0 8px">Сколько агенты решают сами: только предлагают —
+          мелкое делают сами — делают всё, что технически могут, и отчитываются.</p>
+        <div id="autonomy-body">Загрузка…</div>
+
+        <h3 style="margin:20px 0 8px">Источники данных</h3>
+        <div class="row" id="integrations-body"></div>
+      </div>
+    </details>
     </div><!-- /overview-content -->
 
     <!-- Общий чат: видит всё, по любому агенту. У каждой вкладки-агента
@@ -1256,13 +1248,22 @@ function renderIntegrations(list) {
   }).join('');
 }
 
-// Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
-// у чужих проектов это «Этап 1/2», пока их не переименуют (вкладка «Проекты»).
+// Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка.
+// Пока сервер не ответил, подписи берутся из русского словаря по умолчанию:
+// сырые ключи вроде SIGNUP/ACTIVATION_1 на экране владельца — это мусор,
+// а не подпись, даже на долю секунды.
 let STAGE_TITLES = {};
 let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_started','payment_success'];
-const stageTitle = k => STAGE_TITLES[k] || k;
+const DEFAULT_STAGE_TITLES = {
+  traffic: 'Клики рекламы', signup: 'Регистрации',
+  activation_1: 'Первый шаг в продукте', activation_2: 'Второй шаг в продукте',
+  payment_started: 'Оплата начата', payment_success: 'Оплата прошла',
+  revenue: 'Выручка',
+};
+const stageTitle = k => STAGE_TITLES[k] || DEFAULT_STAGE_TITLES[k] || k;
 
 async function loadDashboard() {
+  showSkeleton('today-body', skelLines(3));
   showSkeleton('kpis', skelKpis());
   showSkeleton('decision-body', skelLines(3));
   showSkeleton('integrations-body', skelLines(1, 'w60'));
@@ -1315,46 +1316,139 @@ async function loadDashboard() {
     // Скелетон без этой ветки пульсировал вечно: человек ждал данных,
     // которых уже не будет.
     console.error(e);
+    failCard('today-body', e.message);
     failCard('kpis', e.message);
     failCard('decision-body', e.message);
     failCard('problems-body', e.message);
   }
 }
 
-/* ---------------- Проблемы (доска фаундера) ---------------- */
-// Витрина поверх /api/alerts и /api/growth: раньше, чтобы понять, с чего
-// начать день, нужно было обойти вкладки агентов по кругу.
+/* ---------------- Доска: «Что сделать сегодня» ---------------- */
+// Один вопрос, на который отвечает главный экран: что от меня нужно.
+// Из сигналов, рекомендации и предложений агентов собирается короткий
+// нумерованный список готовых шагов; сырьё целиком лежит в свёрнутых
+// «Подробностях» ниже — фаундеру приносят решение, а не выгружают всё.
 async function loadDashboardProblems() {
   const box = $('problems-body');
   try {
     const r = await api('/api/dashboard');
-    $('problems-count').textContent = r.cards.length ? `${r.cards.length} открытых` : '';
-    if (!r.cards.length) {
-      box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
-      window._problemCards = [];
-      renderAutonomy(r.autonomy_level, r.autonomy_levels);
-      renderAgentActions(r.agent_actions || []);
-      return;
-    }
-    box.innerHTML = r.cards.map((c, i) => `<div class="item">
-      <div class="row" style="margin-bottom:5px">
-        <span class="tag">${esc(c.agent_title)}</span>
-        <h3 style="margin:0">${esc(c.title)}</h3>
-      </div>
-      <div class="body">${esc(c.message || '')}</div>
-      <div class="muted" style="font-size:13px;margin-top:4px">${esc(c.found_by)}${
-        c.tested_by ? ' · ' + esc(c.tested_by) : ''}</div>
-      <div class="row" style="margin-top:9px">
-        ${c.actions.map(a => `<button class="btn sm" onclick="actOnProblem(${i},'${a.action}')">${
-          esc(a.label)}</button>`).join('')}
-        <button class="btn sm" onclick="switchTab('${c.agent}')">Открыть у ${esc(c.agent_title).toLowerCase()}а</button>
-      </div>
-    </div>`).join('');
     window._problemCards = r.cards;
+    renderToday(r);
+    renderAgentsDone(r.agent_actions || []);
+    renderProblemsDetails(r);
     renderAutonomy(r.autonomy_level, r.autonomy_levels);
     renderAgentActions(r.agent_actions || []);
-  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
-    `<p class="error-text">${esc(e.message)}</p>`; }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    failCard('today-body', e.message);
+    box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+  }
+}
+
+function renderToday(r) {
+  const steps = [];
+
+  // 1. Вопросы агентов: они уже поработали и ждут только «да» или «нет».
+  (r.agent_actions || []).filter(a => a.status === 'proposed').forEach(a => steps.push({
+    who: a.agent_title,
+    title: 'Ответьте: ' + (a.domain === 'metrika_goal' ? 'починить цель в Метрике?'
+           : a.domain === 'direct_negative_keywords' ? 'добавить минус-фразы в Директ?'
+           : 'применить предложение?'),
+    text: a.reasoning,
+    buttons: [
+      {label: 'Сделаю сам', on: `decideAgentAction(${a.id},'apply')`, primary: true},
+      {label: 'Не буду', on: `decideAgentAction(${a.id},'reject')`},
+    ],
+  }));
+
+  // 2. Рекомендация аналитика, ждущая решения.
+  (r.cards || []).forEach((c, i) => {
+    if (c.source !== 'recommendation') return;
+    steps.push({
+      who: c.agent_title,
+      title: `Примите или отклоните: «${c.title}»`,
+      text: c.message,
+      buttons: (c.actions || []).map((a, j) => (
+        {label: a.label, on: `actOnProblem(${i},'${a.action}')`, primary: j === 0})),
+    });
+  });
+
+  // 3. Открытые проблемы — по убыванию тяжести, как их отдал сервер.
+  (r.cards || []).forEach((c, i) => {
+    if (c.source !== 'alert') return;
+    steps.push({
+      who: c.agent_title,
+      title: c.title,
+      text: c.message,
+      buttons: [...(c.actions || []).map(a => ({label: a.label, on: `actOnProblem(${i},'${a.action}')`})),
+                {label: 'Разобраться', on: `switchTab('${c.agent}')`}],
+    });
+  });
+
+  // Идущая проверка — не шаг (делать ничего не нужно), а строка состояния.
+  const running = (r.cards || []).find(c => c.source === 'experiment');
+
+  const SHOW = 3;
+  const extra = steps.length - SHOW;
+  $('today-count').textContent = steps.length ? `${steps.length} ${plural(steps.length, 'шаг', 'шага', 'шагов')}` : '';
+  $('today-body').innerHTML = (steps.length
+    ? steps.slice(0, SHOW).map((s, n) => `<div class="step now">
+        <div class="mark">${n + 1}</div>
+        <div class="text">
+          <b>${esc(s.title)}</b>
+          <span>${esc(s.who)}: ${esc(s.text || '')}</span>
+          <div class="row" style="margin-top:8px">${s.buttons.map(b =>
+            `<button class="btn sm${b.primary ? ' primary' : ''}" onclick="${b.on}">${esc(b.label)}</button>`).join('')}</div>
+        </div>
+      </div>`).join('')
+      + (extra > 0 ? `<p class="muted" style="margin:10px 0 0">И ещё ${extra} — в подробностях ниже.</p>` : '')
+    : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
+       <p class="muted" style="margin:6px 0 0">Агенты продолжают наблюдать. Как только появится
+       проблема или готовое предложение, здесь будет короткий список шагов.</p>`)
+    + (running ? `<p class="muted" style="margin:12px 0 0">⏳ ${esc(running.tested_by || 'Идёт проверка')} —
+       во время проверки ничего не меняйте, иначе результат ничего не докажет.</p>` : '');
+}
+
+// «Агенты сделали сами» — отчёт о выполненной работе. Вопросы агентов
+// здесь не показываются: они наверху, в списке шагов.
+function renderAgentsDone(actions) {
+  const done = actions.filter(a => a.status === 'applied' || a.status === 'blocked_not_configured');
+  const card = $('agents-done-card');
+  if (!done.length) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  $('agents-done-count').textContent = `${done.length} за неделю`;
+  $('agents-done-body').innerHTML = done.slice(0, 5).map(a => `<div class="item">
+      <div class="row" style="margin-bottom:5px">
+        <span class="tag">${esc(a.agent_title)}</span>
+        <span class="tag ${AGENT_STATUS_TAG[a.status] || ''}">${esc(a.status_label)}</span>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">${esc(fmtWhen(a.applied_at || a.created_at))}</span>
+      </div>
+      <div class="body">${esc(a.reasoning)}</div>
+    </div>`).join('');
+}
+
+function renderProblemsDetails(r) {
+  const box = $('problems-body');
+  $('problems-count').textContent = r.cards.length ? `${r.cards.length}` : '';
+  if (!r.cards.length) {
+    box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
+    return;
+  }
+  box.innerHTML = r.cards.map((c, i) => `<div class="item">
+    <div class="row" style="margin-bottom:5px">
+      <span class="tag">${esc(c.agent_title)}</span>
+      <h3 style="margin:0">${esc(c.title)}</h3>
+    </div>
+    <div class="body">${esc(c.message || '')}</div>
+    <div class="muted" style="font-size:13px;margin-top:4px">${esc(c.found_by)}${
+      c.tested_by ? ' · ' + esc(c.tested_by) : ''}</div>
+    <div class="row" style="margin-top:9px">
+      ${c.actions.map(a => `<button class="btn sm" onclick="actOnProblem(${i},'${a.action}')">${
+        esc(a.label)}</button>`).join('')}
+      <button class="btn sm" onclick="switchTab('${c.agent}')">Открыть у ${esc(c.agent_title).toLowerCase()}а</button>
+    </div>
+  </div>`).join('');
 }
 
 function renderAutonomy(level, levels) {
