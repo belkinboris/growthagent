@@ -2,11 +2,15 @@
 FastAPI приложение -- точка входа для Railway.
 
 Маршруты:
-- GET  /health           -- liveness check, без обращения к БД
+- GET  /health           -- liveness check + метка сборки, без обращения к БД
 - GET  /status            -- состояние проекта, интеграций, последний прогон
 - POST /api/run             -- ручной запуск цикла (то же, что /run в Telegram)
 - GET  /api/alerts            -- список последних алертов (для веб-интерфейса)
 - GET  /api/snapshots           -- последние снэпшоты метрик
+
+Всё, кроме /health и /webhook, требует авторизации: раньше эти пять
+легаси-маршрутов (дубли /growth/api/*) отдавали сырую аналитику проекта,
+сигналы и снимки метрик кому угодно без пароля.
 - POST /webhook/{secret}          -- Telegram webhook (если используется webhook,
                                       а не polling -- выбор через TELEGRAM_USE_WEBHOOK)
 - GET  /                            -- статическая страница (static/index.html)
@@ -18,7 +22,7 @@ FastAPI приложение -- точка входа для Railway.
 import asyncio
 import logging
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import select
@@ -28,6 +32,7 @@ from app.config import BUILD_MARKER, RUN_CYCLE_TIMEOUT_SECONDS, get_settings
 from app.db import get_session, init_db
 from app.models import Alert, Integration, MetricSnapshot, Project
 from app.platform_api import router as platform_router
+from app.platform_auth import require_admin
 from app.scheduler import run_cycle_once_sync_with_timeout, start_scheduler, stop_scheduler
 from app.telegram_bot import build_application, send_cycle_notification
 
@@ -185,11 +190,16 @@ async def health():
     Чистый liveness check -- не трогает БД и внешние сервисы. Railway/
     любой оркестратор дёргает это часто, важно чтобы это было быстро и
     не зависело от состояния БД или коннекторов.
+
+    Метка сборки здесь, а не только в /status: после деплоя её надо чем-то
+    проверить, а /status теперь под авторизацией (он отдаёт состав
+    интеграций и число открытых сигналов -- это не публичные данные).
+    Сама метка ничего не раскрывает.
     """
-    return {"status": "ok"}
+    return {"status": "ok", "build_marker": BUILD_MARKER}
 
 
-@app.get("/api/memory")
+@app.get("/api/memory", dependencies=[Depends(require_admin)])
 async def api_memory():
     """
     Текущая память процесса -- диагностика OOM без панели хостинга.
@@ -205,7 +215,7 @@ async def api_memory():
     return {"current_rss_mb": _read_current_rss_mb(), "peak_rss_mb": round(peak)}
 
 
-@app.get("/status")
+@app.get("/status", dependencies=[Depends(require_admin)])
 async def status():
     settings = get_settings()
     from app.config import BUILD_MARKER
@@ -252,7 +262,7 @@ async def status():
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/run")
+@app.post("/api/run", dependencies=[Depends(require_admin)])
 async def api_run():
     """
     Ручной запуск цикла. Идентичен /run в Telegram по результату, но
@@ -307,7 +317,7 @@ def _candidate_to_dict(candidate) -> dict | None:
     }
 
 
-@app.get("/api/alerts")
+@app.get("/api/alerts", dependencies=[Depends(require_admin)])
 async def api_alerts(limit: int = 20):
     with get_session() as session:
         project = session.exec(select(Project).where(Project.is_active == True)).first()
@@ -337,7 +347,7 @@ async def api_alerts(limit: int = 20):
         ]
 
 
-@app.get("/api/snapshots")
+@app.get("/api/snapshots", dependencies=[Depends(require_admin)])
 async def api_snapshots(limit: int = 20):
     with get_session() as session:
         project = session.exec(select(Project).where(Project.is_active == True)).first()

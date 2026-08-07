@@ -553,29 +553,49 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
         # integration_down: проверяем свежесть/доступность для каждого источника
         # ОТДЕЛЬНО от бизнес-анализа. Эта проверка использует данные собранные
         # выше за 24h окно как репрезентативные для статуса интеграции.
+        # Настроен ли источник -- знает только это место. Без этого флага
+        # ненастроенная интеграция помечалась «ok» со свежей датой
+        # синхронизации: экран «Источники данных» показывал YooKassa как
+        # работающую, хотя её коннектор -- заглушка без единого запроса.
+        sj = project.settings_json or {}
+        product_configured = bool(project.base_url and _project_token(project))
+        metrika_configured = bool(
+            settings.yandex_oauth_token
+            and (sj.get("metrika_counter_id") or settings.metrika_counter_id)
+        )
+        direct_configured = bool(
+            settings.effective_direct_oauth_token
+            and (sj.get("direct_client_login") or settings.direct_client_login)
+        )
+        yookassa_configured = bool(settings.yookassa_shop_id and settings.yookassa_secret_key)
+
         integration_changes = []
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.project_metrics_api,
                 as_of=product_as_of, error=all_errors.get("product"),
+                configured=product_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.metrika,
                 as_of=None, error=all_errors.get("metrika"),
+                configured=metrika_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.direct,
                 as_of=None, error=all_errors.get("direct"),
+                configured=direct_configured,
             )
         )
         integration_changes.append(
             check_integration_freshness(
                 session, project, IntegrationType.yookassa,
                 as_of=None, error=all_errors.get("yookassa"),
+                configured=yookassa_configured,
             )
         )
         integration_changes = [c for c in integration_changes if c is not None]
@@ -827,14 +847,33 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                 }
                 logger.warning("Payment-path diagnostics failed: %s", payment_path_outcome.get("error"))
 
-        # Direct Intelligence: /run ТОЛЬКО читает последний сохранённый кэш.
-        # Тяжёлый Direct granular report НЕ запускается в /run --
-        # только через /deep_direct или background refresh.
-        # Читаем ORM-объект DeepDiagnosticsCache: поля .ok и .result_json,
-        # а НЕ .get("ok")/.get("result") -- это не dict.
+        # Direct Intelligence: разбор поисковых запросов на «победители» и
+        # «безопасные минус-слова». Раньше в плановом цикле он ТОЛЬКО читал
+        # кэш, а наполняла кэш единственная ручная команда в Telegram
+        # (/deep_direct). Из-за этого вкладка «Минус-фразы» в вебе вечно
+        # писала «глубокой проверки ещё не было» -- и Маркетологу нечего
+        # было применять на уровне автономии 2/3. Теперь плановый цикл сам
+        # обновляет кэш, когда тот протух; ручной /run по-прежнему только
+        # читает (тяжёлый отчёт Директа не должен растягивать ожидание
+        # человека у кнопки).
         direct_intel_cached = get_cached_diagnostics(
             session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
         )
+        if direct_intel_cached is None and not manual_context and settings.direct_client_login:
+            try:
+                refreshed = await run_direct_intelligence_for_project(
+                    project, settings, period_hours=24 * 7,
+                    payment_path_data=result.payment_path_diagnostics,
+                )
+                if refreshed.get("status") == "ok":
+                    direct_intel_cached = get_cached_diagnostics(
+                        session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+                    )
+                else:
+                    logger.info("Direct Intelligence refresh skipped: %s", refreshed.get("status"))
+            except Exception:
+                # Разбор запросов -- не причина ронять весь цикл сбора.
+                logger.exception("Direct Intelligence refresh failed (project=%s)", project.id)
         if direct_intel_cached is not None and direct_intel_cached.ok:
             result.direct_intelligence = dict(direct_intel_cached.result_json or {})
             logger.info(
@@ -851,6 +890,17 @@ async def run_cycle_once(project_id: int | None = None) -> CycleResult:
                 DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY,
                 direct_intel_cached is not None,
             )
+
+        # R4: мусорные поисковые запросы -> минус-фразы. На уровне автономии
+        # 2 и выше Маркетолог добавляет их в Директ сам; на уровне 1 просто
+        # предлагает. Именно это раньше обещало описание уровня 3, но не
+        # делало.
+        try:
+            from app.marketer_actions import handle_safe_negatives
+
+            await handle_safe_negatives(session, project, result.direct_intelligence, level)
+        except Exception:
+            logger.exception("Marketer negatives step failed (project=%s)", project.id)
 
         return result
 

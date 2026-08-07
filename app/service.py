@@ -325,6 +325,7 @@ def check_integration_freshness(
     integration_type: IntegrationType,
     as_of: datetime | None,
     error: str | None,
+    configured: bool = True,
 ) -> AlertChange | None:
     """
     Вызывается scheduler.py после попытки получить данные от источника.
@@ -349,6 +350,20 @@ def check_integration_freshness(
         as_of is not None
         and (utcnow() - as_of) > timedelta(minutes=settings.integration_stale_minutes)
     )
+
+    # Ненастроенный источник приходит сюда без ошибки (коннектор бросает
+    # NotConfiguredError, и scheduler честно превращает это в error=None) --
+    # и раньше он получал статус «ok» со свежей датой синхронизации. На
+    # экране «Источники данных» это выглядело как «подключено и работает»
+    # там, где не задан ни один ключ, а у YooKassa вообще нет реализации.
+    # «Не настроено» -- это состояние, а не успех.
+    if not configured:
+        if integration and integration.status != IntegrationStatus.not_configured:
+            integration.status = IntegrationStatus.not_configured
+            integration.last_error = None
+            session.add(integration)
+            session.commit()
+        return None
 
     if error:
         if integration:
@@ -704,9 +719,22 @@ ALERT_MODES = ("off", "smart", "founder")
 def get_alert_mode(session: Session, project_id: int) -> str:
     """
     Текущий режим live-уведомлений для проекта. По умолчанию "smart".
-    Хранится через DeepDiagnosticsCache (без миграции схемы БД) --
-    последняя сохранённая запись с этим period_key считается активной.
+
+    Живёт в `Project.settings_json`, а НЕ в кэше диагностик, как раньше:
+    у кэша TTL 6 часов, и через шесть часов после того, как владелец
+    выключил уведомления, они сами включались обратно на "smart". Настройка
+    человека не имеет срока годности -- это была не оптимизация, а потеря
+    выбора. Старое значение из кэша читаем один раз при миграции ниже,
+    чтобы уже сделанный выбор не потерялся при обновлении.
     """
+    project = session.get(Project, project_id)
+    if project is not None:
+        mode = (project.settings_json or {}).get("alert_mode")
+        if mode in ALERT_MODES:
+            return mode
+
+    # Совместимость со старым хранением: подхватываем выбор, сделанный до
+    # переезда, пока запись в кэше ещё жива.
     cached = get_cached_diagnostics(session, project_id, ALERT_MODE_CACHE_KEY)
     if cached is not None and cached.ok:
         mode = (cached.result_json or {}).get("mode")
@@ -719,10 +747,14 @@ def set_alert_mode(session: Session, project_id: int, mode: str) -> None:
     """Сохраняет режим live-уведомлений. mode должен быть одним из ALERT_MODES."""
     if mode not in ALERT_MODES:
         raise ValueError(f"Unknown alert mode: {mode!r}. Expected one of {ALERT_MODES}.")
-    save_diagnostics_cache(
-        session, project_id, ALERT_MODE_CACHE_KEY,
-        "manual_set", {"mode": mode}, ok=True,
-    )
+    project = session.get(Project, project_id)
+    if project is None:
+        raise ValueError(f"Project {project_id} not found")
+    sj = dict(project.settings_json or {})
+    sj["alert_mode"] = mode
+    project.settings_json = sj
+    session.add(project)
+    session.commit()
 
 
 

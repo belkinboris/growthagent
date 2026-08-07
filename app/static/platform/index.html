@@ -7,16 +7,28 @@
 <title>Аналитик Воронки</title>
 <style>
   /* Внутренний инструмент владельца — тема намеренно одна (тёмная).
-     Цвета серий — валидированные шаги под тёмную поверхность #171a21. */
+     Цвета серий — валидированные шаги под тёмную поверхность.
+
+     Про иерархию. Раньше заголовок карточки был 13px, uppercase, цветом
+     --muted, то есть СЛАБЕЕ обычного текста: глаз цеплялся за абзацы
+     «Зачем», а не за названия разделов. Здесь заголовок снова главнее
+     содержимого, а пояснения приглушены. */
   :root{
-    --bg:#0f1115; --surface:#171a21; --surface-2:#1e222b; --border:#2a2f3a;
+    --bg:#0f1115; --surface:#171a21; --surface-2:#1e222b; --surface-3:#252a35;
+    --border:#2a2f3a; --border-strong:#3a4150;
     --text:#e8eaf0; --text-2:#a6adbb; --muted:#7d8595;
-    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
-    --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
-    --radius:12px;
+    --series-1:#4a90e8; --series-2:#e0663a; --series-3:#22b07d;
+    /* Прежний --good #0ca30c давал контраст 3.1:1 на тёмной поверхности —
+       ниже порога читаемости для текста. */
+    --good:#2fb344; --warning:#fab219; --serious:#ec835a; --critical:#e2504f;
+    --accent:#4a90e8; --accent-bg:rgba(74,144,232,.12);
+    /* Одна шкала скруглений вместо пяти вразнобой (4/8/12/14/16px). */
+    --r-sm:8px; --r:12px; --r-lg:16px; --radius:12px;
+    --shadow-1:0 1px 2px rgba(0,0,0,.3);
+    --shadow-2:0 4px 16px rgba(0,0,0,.35);
   }
   *{box-sizing:border-box}
-  a{color:var(--series-1);text-decoration:none}
+  a{color:var(--accent);text-decoration:none}
   a:hover{text-decoration:underline}
   body{margin:0;background:var(--bg);color:var(--text);
     font:15px/1.55 -apple-system,"Segoe UI",Roboto,Arial,sans-serif;
@@ -24,6 +36,9 @@
   h1,h2,h3{margin:0;font-weight:600}
   button{font:inherit;cursor:pointer}
   .hidden{display:none !important}
+  /* Ни одного правила фокуса не было на весь файл: навигация с клавиатуры
+     была полностью невидимой. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 
   /* Шапка */
   header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
@@ -31,7 +46,6 @@
   header .logo{font-size:15px;font-weight:600;white-space:nowrap}
   header .proj{color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;
     white-space:nowrap;flex:1 1 0;min-width:0}
-  header .spacer{flex:1}
   /* Кто вошёл. Не .proj: у той строки flex:1, и два растягивающихся
      элемента съедали место у вкладок. На телефоне прячется -- там та же
      строка есть на вкладке «Проекты». */
@@ -49,47 +63,101 @@
   .nav-wrap.at-end::after{opacity:0}
   nav{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
   nav::-webkit-scrollbar{display:none}
-  nav button{background:none;border:none;color:var(--muted);font-size:14px;
-    padding:8px 13px;border-radius:8px;white-space:nowrap}
-  nav button:hover{color:var(--text)}
-  nav button.active{color:var(--text);background:var(--surface-2)}
-  .btn{background:var(--surface-2);color:var(--text);border:1px solid var(--border);
-    border-radius:8px;padding:8px 14px;font-size:14px}
-  .btn:hover{border-color:var(--muted)}
-  .btn.primary{background:var(--series-1);border-color:var(--series-1);color:#08111c;font-weight:600}
+  nav button{background:none;border:none;color:var(--text-2);font-size:14px;
+    padding:8px 13px;border-radius:var(--r-sm);white-space:nowrap;position:relative;
+    transition:color .15s,background .15s}
+  nav button:hover{color:var(--text);background:var(--surface-2)}
+  /* Активная вкладка отличалась только фоном, почти неотличимым от шапки.
+     Подчёркивание — привычный признак «вы здесь». */
+  nav button.active{color:var(--text);background:var(--surface-2);font-weight:600}
+  nav button.active::after{content:'';position:absolute;left:13px;right:13px;bottom:2px;
+    height:2px;border-radius:2px;background:var(--accent)}
+  /* Выход стоял внутри <nav> и выглядел седьмой вкладкой: промах пальцем
+     на телефоне выкидывал из аккаунта. */
+  #logout-btn{margin-left:8px;padding-left:12px;border-left:1px solid var(--border);
+    border-radius:0;color:var(--muted);font-size:13px}
+  #logout-btn:hover{color:var(--critical);background:none}
+
+  /* Кнопки. Раньше фон кнопки отличался от фона карточки на 3% яркости,
+     а :hover менял только цвет рамки — кнопка не читалась как кнопка. */
+  .btn{background:var(--surface-3);color:var(--text);border:1px solid var(--border-strong);
+    border-radius:var(--r-sm);padding:8px 14px;font-size:14px;
+    transition:background .15s,border-color .15s,transform .05s}
+  .btn:hover:not(:disabled){background:#2e3441;border-color:var(--muted)}
+  .btn:active:not(:disabled){transform:translateY(1px)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#08111c;font-weight:600}
+  .btn.primary:hover:not(:disabled){background:#5b9cef;border-color:#5b9cef}
+  .btn.danger{color:var(--critical);border-color:var(--critical)}
   .btn.sm{padding:5px 11px;font-size:13px}
-  .btn:disabled{opacity:.45;cursor:default}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  /* Единый вид «идёт работа» вместо четырёх самодельных: раньше каждая
+     кнопка изобретала свой способ показать загрузку. */
+  .btn.loading{position:relative;color:transparent;pointer-events:none}
+  .btn.loading::after{content:'';position:absolute;inset:0;margin:auto;width:14px;height:14px;
+    border:2px solid currentColor;border-top-color:transparent;border-radius:50%;
+    color:var(--text);animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
 
   main{max-width:1080px;margin:0 auto;padding:20px 20px 60px}
   .card{background:var(--surface);border:1px solid var(--border);
-    border-radius:var(--radius);padding:18px 20px;margin-bottom:16px}
-  .card > h2{font-size:13px;color:var(--muted);text-transform:uppercase;
-    letter-spacing:.05em;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+    border-radius:var(--r);padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow-1)}
+  /* Заголовок раздела снова главнее содержимого. */
+  .card > h2{font-size:16px;color:var(--text);margin-bottom:14px;
+    display:flex;align-items:center;gap:10px;letter-spacing:-.01em}
   .card > h2 .spacer{flex:1}
+  /* Главная карточка экрана — визуально выделена, чтобы «Решение» не
+     выглядело так же, как «Названия событий в ленте». */
+  .card.hero{border-color:var(--border-strong);box-shadow:var(--shadow-2)}
+  .card.hero > h2{font-size:18px}
   .muted{color:var(--muted);font-size:13px}
-  .purpose{color:var(--text-2);font-size:13px;line-height:1.5;margin:0 0 14px;
-    padding:10px 14px;background:var(--surface);border:1px solid var(--border);
-    border-left:3px solid var(--series-1);border-radius:8px}
-  .card .purpose{background:var(--surface-2);border-left-color:var(--series-1)}
+  /* «Зачем этот экран» — 27 таких абзацев отодвигали реальные данные ниже
+     первого экрана и создавали ощущение, что владельца грузят методичкой.
+     Скрыты целиком: назначение экрана должно быть понятно из его
+     содержимого, а не из сопроводительного текста. Разметка оставлена —
+     это же готовые подсказки, если решим показывать их по запросу. */
+  .purpose{display:none}
   .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .spacer{flex:1}
 
-  /* KPI-плитки */
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-  .kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-    padding:14px 16px}
+  /* KPI-плитки — главные числа экрана, они не должны выглядеть как
+     очередная карточка настроек. */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px}
+  .kpi{background:linear-gradient(180deg,var(--surface-2),var(--surface));
+    border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
   .kpi .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-  .kpi .value{font-size:26px;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums}
-  .kpi .sub{font-size:12px;color:var(--text-2);margin-top:2px}
+  .kpi .value{font-size:28px;font-weight:650;margin-top:6px;font-variant-numeric:tabular-nums;
+    letter-spacing:-.02em;line-height:1.15}
+  .kpi .sub{font-size:12px;color:var(--text-2);margin-top:3px;min-height:16px}
+  /* Раньше при неизвестной доле .sub был пустой строкой, и плитки в ряду
+     разъезжались по высоте — min-height держит ряд ровным. */
+  .kpi .delta{font-size:12px;font-variant-numeric:tabular-nums}
+  .kpi .delta.up{color:var(--good)} .kpi .delta.down{color:var(--critical)}
 
   /* Воронка */
   .funnel-row{display:grid;grid-template-columns:150px 1fr 64px;align-items:center;
     gap:12px;margin-bottom:2px;padding:5px 0}
   .funnel-label{font-size:14px;color:var(--text-2)}
   .funnel-track{background:var(--surface-2);border-radius:4px;height:26px;position:relative}
+  /* min-width убран: полоска в 2px при нуле читалась как «немного есть». */
   .funnel-bar{background:var(--series-1);height:100%;border-radius:0 4px 4px 0;
-    min-width:2px;transition:width .3s}
-  .funnel-value{text-align:right;font-variant-numeric:tabular-nums;font-size:14px}
-  .funnel-conv{grid-column:2;font-size:12px;color:var(--muted);padding:1px 0 3px}
+    transition:width .3s}
+  .funnel-value{text-align:right;font-variant-numeric:tabular-nums;font-size:14px;font-weight:600}
+  .funnel-conv{font-size:12px;color:var(--muted);padding:1px 0 3px 162px}
+
+  /* Цепочка шагов в разборе: «сколько человек дошло и какая конверсия».
+     Не .funnel-row -- там полоса-график, здесь нужен компактный список,
+     который читается как расчёт: шаг, число, процент перехода. */
+  .chain-row{display:grid;grid-template-columns:1fr auto 116px;gap:12px;align-items:baseline;
+    padding:6px 8px;border-radius:6px}
+  .chain-row.worst{background:var(--accent-bg)}
+  .chain-label{color:var(--text-2);font-size:14px}
+  .chain-value{font-variant-numeric:tabular-nums;font-weight:600}
+  .chain-conv{color:var(--muted);font-size:12px;text-align:right}
+  .chain-row.worst .chain-conv{color:var(--accent)}
+  @media(max-width:700px){
+    .chain-row{grid-template-columns:1fr auto;gap:2px 10px}
+    .chain-conv{grid-column:1 / -1;text-align:left}
+  }
 
   /* График динамики */
   .chart-wrap{overflow-x:auto}
@@ -104,21 +172,28 @@
   /* Сигналы / решение */
   .item{border-top:1px solid var(--border);padding:13px 0}
   .item:first-of-type{border-top:none;padding-top:0}
-  .item h3{font-size:15px;margin-bottom:4px}
+  .item h3{font-size:15px;font-weight:600;margin-bottom:4px}
   .item .body{color:var(--text-2);font-size:14px;white-space:pre-wrap}
-  .item.active{background:var(--accent-bg,rgba(90,140,255,.08));border-radius:8px;padding-left:10px;padding-right:10px;margin:0 -10px}
+  .item.active{background:var(--accent-bg);border-radius:var(--r-sm);
+    padding-left:12px;padding-right:12px;margin:0 -12px;border-top-color:transparent}
+  /* Кликабельный блок должен выглядеть кликабельным: выбор уровня
+     автономии раньше отличался только курсором. */
+  .item.pick{cursor:pointer;border-radius:var(--r-sm);padding-left:12px;padding-right:12px;
+    margin:0 -12px;transition:background .15s}
+  .item.pick:hover{background:var(--surface-2)}
   .tag{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:99px;
-    font-size:12px;border:1px solid var(--border);color:var(--text-2)}
+    font-size:12px;border:1px solid var(--border);color:var(--text-2);white-space:nowrap}
   .tag.critical{color:var(--critical);border-color:var(--critical)}
   .tag.serious{color:var(--serious);border-color:var(--serious)}
   .tag.warning{color:var(--warning);border-color:var(--warning)}
   .tag.good{color:var(--good);border-color:var(--good)}
-  .decision{border-left:3px solid var(--series-1);padding-left:16px}
+  .tag.accent{color:var(--accent);border-color:var(--accent)}
+  .decision{border-left:3px solid var(--accent);padding-left:16px}
   .progress{background:var(--surface-2);border-radius:4px;height:8px;margin:10px 0 6px}
-  .progress > div{background:var(--series-3);height:100%;border-radius:4px}
+  .progress > div{background:var(--series-3);height:100%;border-radius:4px;min-width:2px}
   ul.plain{margin:8px 0 0;padding-left:20px;color:var(--text-2);font-size:14px}
   ul.plain li{margin-bottom:3px}
-  .locked{background:var(--surface-2);border-radius:8px;padding:10px 14px;margin-top:12px;
+  .locked{background:var(--surface-2);border-radius:var(--r-sm);padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
   /* Скелетоны загрузки. Это ФОРМА будущего содержимого, а не данные:
@@ -132,6 +207,7 @@
   @keyframes skel-pulse{0%,100%{opacity:.45}50%{opacity:.85}}
   @media (prefers-reduced-motion: reduce){
     .skel{animation:none;opacity:.6}
+    .btn.loading::after{animation:none}
   }
 
   /* Строка настройки этапа: ключ — поле — пояснение */
@@ -142,14 +218,16 @@
   .stage-row .stage-note{font-size:12px;color:var(--muted)}
 
   /* Подсказка «откуда это число». Клик, а не наведение: с телефона
-     наведения нет, а смотрят с телефона чаще всего. */
+     наведения нет, а смотрят с телефона чаще всего. Круг был 17×17 —
+     промах пальцем гарантирован; теперь тап-зона больше самого кружка. */
   .hint{background:none;border:1px solid var(--border);color:var(--muted);
-    width:17px;height:17px;border-radius:50%;font-size:11px;line-height:1;
-    padding:0;margin-left:6px;vertical-align:middle}
+    width:20px;height:20px;border-radius:50%;font-size:11px;line-height:1;
+    padding:0;margin-left:6px;vertical-align:middle;position:relative}
+  .hint::before{content:'';position:absolute;inset:-12px}
   .hint:hover{color:var(--text);border-color:var(--muted)}
   .hint-pop{margin-top:8px;padding:9px 11px;background:var(--surface-2);
-    border:1px solid var(--border);border-left:3px solid var(--series-1);
-    border-radius:8px;font-size:12px;line-height:1.5;color:var(--text-2)}
+    border:1px solid var(--border);border-left:3px solid var(--accent);
+    border-radius:var(--r-sm);font-size:12px;line-height:1.5;color:var(--text-2)}
 
   /* Шаги первого запуска */
   .step{display:flex;gap:12px;align-items:flex-start;padding:11px 0;
@@ -159,7 +237,7 @@
     align-items:center;justify-content:center;font-size:12px;font-weight:600;
     background:var(--surface-2);color:var(--muted);border:1px solid var(--border)}
   .step.done .mark{background:var(--good);border-color:var(--good);color:#04210a}
-  .step.now .mark{background:var(--series-1);border-color:var(--series-1);color:#08111c}
+  .step.now .mark{background:var(--accent);border-color:var(--accent);color:#08111c}
   .step .text{flex:1}
   .step .text b{display:block;margin-bottom:2px}
   .step .text span{color:var(--muted);font-size:13px}
@@ -167,21 +245,27 @@
   /* Отчёты */
   .report{white-space:pre-wrap;font-size:14px;line-height:1.6;color:var(--text-2)}
   .report b{color:var(--text)}
-  .subnav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
 
   /* Формы / чат / проекты */
   input,select,textarea{width:100%;background:var(--surface-2);color:var(--text);
-    border:1px solid var(--border);border-radius:8px;padding:9px 12px;font:inherit;margin:4px 0 12px}
+    border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 12px;font:inherit;
+    margin:4px 0 12px;transition:border-color .15s}
+  input:hover,select:hover,textarea:hover{border-color:var(--border-strong)}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   label{font-size:13px;color:var(--muted)}
   table{width:100%;border-collapse:collapse;font-size:14px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}
   th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  tbody tr{transition:background .12s}
+  tbody tr:hover{background:var(--surface-2)}
   tr:last-child td{border-bottom:none}
+  /* Числа в колонках не выравнивались по разряду: «40 / 4 / 10%» гуляли. */
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   /* Экран для тех, кто ещё не вошёл: описание продукта + форма входа.
      Раньше здесь была только форма шириной 380px, и человек, попавший
      на адрес впервые, видел поле пароля без единого слова о продукте. */
   #login-view{max-width:1000px;margin:0 auto;padding-top:24px}
-  #login-view .intro h1{font-size:28px;margin:0 0 8px}
+  #login-view .intro h1{font-size:30px;margin:0 0 8px;letter-spacing:-.02em}
   #login-view .lead{font-size:16px;color:var(--text-2);margin:0 0 22px;max-width:640px}
   #login-view .intro-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:22px}
   #login-view .intro-grid .card{margin:0}
@@ -191,7 +275,7 @@
   }
   /* Код для вставки к себе. Перенос строк выключен намеренно: сломанный
      переносом отступ в питоне -- это код, который не заработает. */
-  pre.code{background:#0e1116;border:1px solid var(--border);border-radius:8px;
+  pre.code{background:#0e1116;border:1px solid var(--border);border-radius:var(--r-sm);
     padding:12px 14px;overflow-x:auto;font-size:12.5px;line-height:1.5;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     white-space:pre;max-height:420px;overflow-y:auto}
@@ -202,14 +286,16 @@
      это уведомление о факте, а не то, что нужно закрывать руками. */
   #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:50;
     max-width:min(520px,92vw);background:var(--surface-2);border:1px solid var(--border);
-    border-radius:10px;padding:12px 16px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+    border-radius:10px;padding:12px 16px;font-size:14px;box-shadow:var(--shadow-2)}
   #toast.hidden{display:none}
+  #toast.toast-ok{border-color:var(--good);box-shadow:var(--shadow-2),inset 3px 0 0 var(--good)}
+  #toast.toast-error{border-color:var(--critical);box-shadow:var(--shadow-2),inset 3px 0 0 var(--critical)}
   .error-text{color:var(--critical);font-size:13px;margin:6px 0}
   .ok-text{color:var(--good);font-size:13px;margin:6px 0}
   .chat-log{display:flex;flex-direction:column;gap:10px;max-height:56vh;overflow-y:auto;margin-bottom:12px}
-  .msg{padding:11px 15px;border-radius:14px;max-width:86%;white-space:pre-wrap;font-size:14px}
-  .msg.user{align-self:flex-end;background:#22375c}
-  .msg.bot{align-self:flex-start;background:var(--surface-2)}
+  .msg{padding:11px 15px;border-radius:var(--r-lg);max-width:86%;white-space:pre-wrap;font-size:14px}
+  .msg.user{align-self:flex-end;background:#2a4470;border-bottom-right-radius:4px}
+  .msg.bot{align-self:flex-start;background:var(--surface-2);border-bottom-left-radius:4px}
   .chat-row{display:flex;gap:10px}
   .chat-row textarea{flex:1;margin:0;resize:vertical;min-height:46px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
@@ -219,7 +305,9 @@
   }
   @media(max-width:700px){
     .grid2{grid-template-columns:1fr}
-    .funnel-row{grid-template-columns:110px 1fr 52px}
+    .funnel-row{grid-template-columns:104px 1fr 52px;gap:8px}
+    .funnel-conv{padding-left:112px}
+    .funnel-label{font-size:13px}
     .stage-row{grid-template-columns:1fr;gap:4px;padding:10px 0;margin-bottom:0;
       border-top:1px solid var(--border)}
     header .proj{display:none}
@@ -240,12 +328,22 @@
     table.stack, table.stack tbody, table.stack tr, table.stack td{display:block;width:100%}
     table.stack tr{border-bottom:1px solid var(--border);padding:12px 0}
     table.stack tr:last-child{border-bottom:none}
-    table.stack td{border:none;padding:3px 0}
+    table.stack tr:hover{background:none}
+    table.stack td{border:none;padding:3px 0;text-align:left}
     /* На телефоне строка разворачивается в столбик, и числа остаются без
        заголовка -- «40 / 4 / 10%» не читается. Подпись переезжает внутрь
        ячейки, а шапка убирается: иначе она висит отдельным непонятным блоком. */
     table.stack thead{display:none}
     table.stack td[data-label]::before{content:attr(data-label) ": ";color:var(--muted)}
+    /* Первая ячейка развёрнутой строки — её заголовок. */
+    table.stack td:first-child{font-weight:600;margin-bottom:2px}
+  }
+  /* Ниже 420px «1 234 567» не влезало в плитку и переносилось. */
+  @media(max-width:420px){
+    .kpis{grid-template-columns:1fr 1fr;gap:8px}
+    .kpi{padding:12px}
+    .kpi .value{font-size:22px}
+    #login-view .intro h1{font-size:24px}
   }
 </style>
 </head>
@@ -258,13 +356,13 @@
   <span class="who" id="hdr-user"></span>
   <div class="nav-wrap" id="nav-wrap">
   <nav id="tabs" class="hidden">
-    <button data-tab="dashboard" class="active">Доска</button>
-    <button data-tab="diagnostician">Диагност</button>
-    <button data-tab="marketer">Маркетолог</button>
-    <button data-tab="product">Продакт</button>
-    <button data-tab="tester">Тестировщик</button>
-    <button data-tab="projects">Проекты</button>
-    <button id="logout-btn">Выйти</button>
+    <button data-tab="dashboard" class="active" title="Результат и все проблемы одним списком">Доска</button>
+    <button data-tab="diagnostician" title="Воронка: где теряются люди">Диагност</button>
+    <button data-tab="marketer" title="Реклама: кого приводим и за сколько">Маркетолог</button>
+    <button data-tab="product" title="Продукт: что не нравится в результате">Продакт</button>
+    <button data-tab="tester" title="Проверки: помогло ли то, что меняли">Тестировщик</button>
+    <button data-tab="projects" title="Подключение и настройки">Проекты</button>
+    <button id="logout-btn" title="Выйти из аккаунта">Выйти</button>
   </nav>
   </div>
 </header>
@@ -276,7 +374,10 @@
        владельца платформы одним паролем из окружения. Отдельными экранами
        это было бы три ссылки в пустоту -- человек не должен выбирать
        «какой у меня тип входа», он просто вводит то, что у него есть. -->
-  <div id="login-view">
+  <!-- Скрыт до ответа сервера: раньше уже вошедший человек при каждом
+       заходе видел вспышку страницы входа с полем пароля, которую через
+       мгновение сменяло приложение. -->
+  <div id="login-view" class="hidden">
     <!-- Страница-описание для входящих. Раньше незнакомый человек попадал
          сразу на форму пароля и не понимал, куда пришёл. Тут коротко:
          что это, кому, как подключается и чего аналитик НЕ делает —
@@ -409,57 +510,55 @@
       <p class="muted" id="first-run-note" style="margin:14px 0 0"></p>
     </div>
 
-    <p class="purpose">Зачем этот экран: одним взглядом понять, что происходит с продуктом
-      и что делать дальше — без обхода вкладок агентов по кругу. Сверху — числа за неделю,
-      ниже — единственное решение, которое аналитик предлагает принять сейчас, дальше —
-      открытые проблемы от всех агентов одним списком.</p>
+    <!-- Разбор: единственное, что владелец обязан прочитать. Где теряются
+         деньги, что из этого причина, а что следствие, и один шаг. Всё
+         обоснование — под свёрнутой строкой «Откуда это видно». -->
+    <div class="card hero" id="diagnosis-card">
+      <h2>Разбор<span class="spacer"></span><span class="muted" id="diagnosis-confidence"></span></h2>
+      <div id="diagnosis-body"><div class="skel w80"></div><div class="skel w60"></div></div>
+    </div>
+
+    <!-- Готовые шаги: нумерованный короткий список, а не сырьё из сигналов,
+         рекомендаций и лент. Всё, из чего он собран, — в подробностях ниже. -->
+    <div class="card hero" id="today-card">
+      <h2>Что сделать сегодня<span class="spacer"></span><span class="muted" id="today-count"></span></h2>
+      <div id="today-body"><div class="skel w80"></div><div class="skel w60"></div></div>
+    </div>
 
     <div class="kpis" id="kpis" style="margin-bottom:16px"></div>
 
-    <div class="card" id="decision-card">
-      <h2>Решение<span class="spacer"></span><span class="muted" id="decision-hint"></span></h2>
-      <p class="purpose" style="margin-top:0">Зачем: одна проверка за раз. Аналитик предлагает
-        изменение, фиксирует базовый уровень и сам выносит вердикт, когда наберётся выборка —
-        поэтому во время проверки остальное трогать нельзя, иначе результат ничего не докажет.</p>
-      <div id="decision-body" class="muted">Загрузка…</div>
+    <!-- Отчёт агентов: только то, что они уже СДЕЛАЛИ сами. Их вопросы и
+         предложения не здесь — они наверху, в списке «Что сделать сегодня». -->
+    <div class="card" id="agents-done-card">
+      <h2>Агенты сделали сами<span class="spacer"></span><span class="muted" id="agents-done-count"></span></h2>
+      <div id="agents-done-body" class="muted"></div>
     </div>
 
-    <!-- Карточки проблем от всех агентов одним списком (задача про четырёх
-         агентов): раньше, чтобы понять, с чего начать день, нужно было
-         обойти вкладки по кругу. Каждая карточка подписана, кто её нашёл --
-         это витрина поверх уже работающих alerts/growth_loop, не новая
-         диагностика. -->
-    <div class="card">
-      <h2>Проблемы<span class="spacer"></span><span class="muted" id="problems-count"></span></h2>
-      <p class="purpose" style="margin-top:0">Зачем: одна доска вместо обхода вкладок агентов.
-        «Сделаю» уводит на вкладку нужного агента, где инструмент для правки; «Не буду» — в архив,
-        чтобы не предлагалось снова бездумно.</p>
-      <div id="problems-body">Загрузка…</div>
-    </div>
+    <!-- Сырьё, из которого собран список наверху. По умолчанию свёрнуто:
+         фаундеру нужны готовые шаги, а не борщ из всех данных сразу.
+         Внутри — прежние блоки с прежними id, чтобы вся логика и тесты
+         продолжали работать. -->
+    <details class="card" id="details-card">
+      <summary style="cursor:pointer;font-size:15px;font-weight:600">Подробности — всё, из чего собран список</summary>
+      <div style="margin-top:14px">
+        <h3 style="margin:14px 0 8px">Проверка, которая идёт сейчас<span class="muted" id="decision-hint" style="font-weight:400;margin-left:8px"></span></h3>
+        <div id="decision-body" class="muted">Загрузка…</div>
 
-    <!-- Уровень автономии (задача F6): одна ручка на проект, а не по одной
-         на каждого агента -- владелец договаривается с "аналитиком как с
-         гендиром" целиком. -->
-    <div class="card">
-      <h2>Уровень автономии</h2>
-      <p class="purpose" style="margin-top:0">Как вы хотите договориться с гендиром: он сам всё
-        решает и отчитывается постфактум, только ключевое выносит на ваше решение, или всё
-        предлагает и ничего не делает без вашей кнопки.</p>
-      <div id="autonomy-body">Загрузка…</div>
-    </div>
+        <h3 style="margin:20px 0 8px">Открытые проблемы <span class="muted" id="problems-count" style="font-weight:400"></span></h3>
+        <div id="problems-body">Загрузка…</div>
 
-    <!-- Что сделали (или предложили) агенты сами -- отдельная лента от
-         карточек проблем: там "что не так", здесь "что агент сам сделал
-         или хочет сделать по этому поводу". -->
-    <div class="card">
-      <h2>Что сделали агенты</h2>
-      <div id="agent-actions-body" class="muted">Загрузка…</div>
-    </div>
+        <h3 style="margin:20px 0 8px">Вся работа агентов</h3>
+        <div id="agent-actions-body" class="muted">Загрузка…</div>
 
-    <div class="card">
-      <h2>Источники данных</h2>
-      <div class="row" id="integrations-body"></div>
-    </div>
+        <h3 style="margin:20px 0 8px">Уровень автономии</h3>
+        <p class="muted" style="margin:0 0 8px">Сколько агенты решают сами: только предлагают —
+          мелкое делают сами — делают всё, что технически могут, и отчитываются.</p>
+        <div id="autonomy-body">Загрузка…</div>
+
+        <h3 style="margin:20px 0 8px">Источники данных</h3>
+        <div class="row" id="integrations-body"></div>
+      </div>
+    </details>
     </div><!-- /overview-content -->
 
     <!-- Общий чат: видит всё, по любому агенту. У каждой вкладки-агента
@@ -586,7 +685,7 @@
     <div class="card">
       <h2>Откуда приходят и что из этого выходит<span class="spacer"></span>
         <span class="muted">7 дней</span></h2>
-      <div class="chart-wrap"><table id="ads-table"><tbody></tbody></table></div>
+      <div class="chart-wrap"><table id="ads-table" class="stack"><tbody></tbody></table></div>
       <p class="muted" id="ads-note" style="margin:12px 0 0"></p>
     </div>
 
@@ -891,12 +990,15 @@ async function api(path, opts = {}) {
 }
 
 let toastTimer = null;
-function toast(text) {
+// kind: 'ok' | 'error' | '' -- раньше успех и ошибка выглядели одинаково
+// серыми, и «Сохранено» не отличалось от «Не удалось сохранить».
+function toast(text, kind) {
   const el = $('toast');
   el.textContent = text;
+  el.className = kind ? 'toast-' + kind : '';
   el.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add('hidden'), 7000);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), kind === 'error' ? 9000 : 6000);
 }
 
 const VIEWS = ['dashboard','diagnostician','marketer','product','tester','projects'];
@@ -917,7 +1019,10 @@ function showApp() {
   // Переключатель грузим ДО первой отрисовки: обзор смотрит, виден ли он,
   // чтобы не дублировать название проекта. Иначе получалась гонка --
   // название то появлялось, то нет.
-  loadProjectSwitch().then(() => switchTab('dashboard'));
+  // Вкладка из адреса, если она там есть: перезагрузка и ссылка должны
+  // возвращать туда же, а не всегда на Доску.
+  const wanted = location.hash.slice(1);
+  loadProjectSwitch().then(() => switchTab(VIEWS.includes(wanted) ? wanted : 'dashboard', true));
   loadWho();
 }
 
@@ -950,6 +1055,15 @@ async function loadProjectSwitch() {
 
 $('hdr-switch').onchange = () => {
   setProjectCookie($('hdr-switch').value);
+  // Кэш «какой проект сейчас» ОБЯЗАН сброситься: без этого «Названия
+  // этапов», «Уведомления» и «Отметки об изменениях» продолжали править
+  // ПРЕДЫДУЩИЙ проект, пока человек не откроет вкладку «Проекты». Правка
+  // молча уходила не туда.
+  window._activeProjectId = Number($('hdr-switch').value) || null;
+  // Данные прошлого проекта тоже сбрасываем -- иначе «Скопировать список»
+  // отдаст чужие минус-фразы.
+  window._problemCards = null; window._alerts = null; window._funnel = null;
+  negativeText = '';
   // Перерисовываем текущую вкладку, а не всю страницу: человек остаётся
   // там, где был, и сразу видит данные выбранного проекта.
   const activeTab = document.querySelector('#tabs button.active');
@@ -969,10 +1083,25 @@ async function loadWho() {
       (me.kind === 'account' ? '. Здесь только ваши проекты.' : '. Видны все проекты платформы.');
   } catch (e) { /* 401 уже увёл на экран входа */ }
 }
-function switchTab(tab) {
+// Названия вкладок для заголовка окна: раньше в браузере всегда висело
+// «Аналитик Воронки», и открытые рядом вкладки было не различить.
+const TAB_TITLES = {
+  dashboard: 'Доска', diagnostician: 'Диагност', marketer: 'Маркетолог',
+  product: 'Продакт', tester: 'Тестировщик', projects: 'Проекты',
+};
+
+function switchTab(tab, fromHistory) {
+  if (!VIEWS.includes(tab)) tab = 'dashboard';
   VIEWS.forEach(v => $('view-'+v).classList.toggle('hidden', v !== tab));
   document.querySelectorAll('#tabs button[data-tab]').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === tab));
+  // Адрес отражает вкладку: без этого кнопка «назад» выкидывала с сайта,
+  // F5 всегда возвращал на Доску, а ссылку на нужный экран нельзя было
+  // никому отправить.
+  if (!fromHistory && location.hash !== '#' + tab) {
+    history.pushState({tab}, '', '#' + tab);
+  }
+  document.title = (TAB_TITLES[tab] || '') + ' · Аналитик Воронки';
   if (tab === 'dashboard') loadDashboard();
   if (tab === 'diagnostician') loadDiagnostician();
   if (tab === 'marketer') loadMarketer();
@@ -980,6 +1109,10 @@ function switchTab(tab) {
   if (tab === 'tester') loadTester();
   if (tab === 'projects') loadProjects();
 }
+window.addEventListener('popstate', e => {
+  if ($('tabs').classList.contains('hidden')) return;   // ещё не вошли
+  switchTab((e.state && e.state.tab) || location.hash.slice(1) || 'dashboard', true);
+});
 
 /* ---------------- Вход ---------------- */
 // Один экран, три режима. Владелец платформы входит паролем из окружения
@@ -1097,6 +1230,15 @@ function showSkeleton(id, html) {
   const el = $(id);
   if (el) el.innerHTML = html;
 }
+// Скелетон обязан во что-то смениться. Раньше упавший запрос оставлял
+// пульсирующие полоски навсегда, и человек ждал данных, которых не будет.
+function failCard(id, message) {
+  const el = $(id);
+  if (!el) return;
+  el.innerHTML = `<p class="error-text">Не удалось загрузить: ${esc(message || 'ошибка связи')}.</p>
+    <p class="muted" style="margin-top:6px">Это сбой запроса, а не «данных нет» —
+      обновите страницу или попробуйте позже.</p>`;
+}
 
 /* ---------------- Обзор ---------------- */
 // Обязателен один источник — внутренний API продукта. Остальные добавляют
@@ -1127,13 +1269,23 @@ function renderIntegrations(list) {
   }).join('');
 }
 
-// Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка,
-// у чужих проектов это «Этап 1/2», пока их не переименуют (вкладка «Проекты»).
+// Порядок и названия шагов задаёт сервер: у каждого проекта своя воронка.
+// Пока сервер не ответил, подписи берутся из русского словаря по умолчанию:
+// сырые ключи вроде SIGNUP/ACTIVATION_1 на экране владельца — это мусор,
+// а не подпись, даже на долю секунды.
 let STAGE_TITLES = {};
 let STAGE_ORDER = ['traffic','signup','activation_1','activation_2','payment_started','payment_success'];
-const stageTitle = k => STAGE_TITLES[k] || k;
+const DEFAULT_STAGE_TITLES = {
+  traffic: 'Клики рекламы', signup: 'Регистрации',
+  activation_1: 'Первый шаг в продукте', activation_2: 'Второй шаг в продукте',
+  payment_started: 'Оплата начата', payment_success: 'Оплата прошла',
+  revenue: 'Выручка',
+};
+const stageTitle = k => STAGE_TITLES[k] || DEFAULT_STAGE_TITLES[k] || k;
 
 async function loadDashboard() {
+  showSkeleton('diagnosis-body', skelLines(3));
+  showSkeleton('today-body', skelLines(3));
   showSkeleton('kpis', skelKpis());
   showSkeleton('decision-body', skelLines(3));
   showSkeleton('integrations-body', skelLines(1, 'w60'));
@@ -1159,101 +1311,273 @@ async function loadDashboard() {
 
     // allSettled, а не all: если один источник отвалился, остальные панели
     // должны отрисоваться — каждая сама честно скажет, что данных нет.
-    const [f, g] = (await Promise.allSettled([
+    const [fr, gr] = await Promise.allSettled([
       api('/api/funnel'), api('/api/growth'),
-    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+    ]);
+    const f = fr.status === 'fulfilled' ? fr.value : null;
+    const g = gr.status === 'fulfilled' ? gr.value : null;
+    // «Запрос упал» и «данных ещё нет» -- разные вещи. Раньше оба случая
+    // давали null, и экран уверенно писал «данных ещё нет», хотя данные
+    // могли быть -- просто мы их не получили.
+    const funnelFailed = fr.status === 'rejected';
+
+    // Подписи шагов приходят с воронкой. Раньше их клал только Диагност,
+    // и на Доске при первом входе плитки подписывались сырыми ключами
+    // (signup, activation_1) по-английски, пока человек не сходит на
+    // соседнюю вкладку и обратно.
+    if (f && f.stage_titles) STAGE_TITLES = f.stage_titles;
 
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
-    renderKpis(f && f.windows ? f.windows['7d'] : null);
-    renderDecision(g);
+    renderKpis(f && f.windows ? f.windows['7d'] : null, funnelFailed);
+    renderDecision(g, gr.status === 'rejected');
     renderFirstRun(o, hasSnapshots);
     renderIntegrations(o.integrations || []);
     loadDashboardProblems();
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    // Скелетон без этой ветки пульсировал вечно: человек ждал данных,
+    // которых уже не будет.
+    console.error(e);
+    failCard('today-body', e.message);
+    failCard('kpis', e.message);
+    failCard('decision-body', e.message);
+    failCard('problems-body', e.message);
+  }
 }
 
-/* ---------------- Проблемы (доска фаундера) ---------------- */
-// Витрина поверх /api/alerts и /api/growth: раньше, чтобы понять, с чего
-// начать день, нужно было обойти вкладки агентов по кругу.
+/* ---------------- Доска: «Что сделать сегодня» ---------------- */
+// Один вопрос, на который отвечает главный экран: что от меня нужно.
+// Из сигналов, рекомендации и предложений агентов собирается короткий
+// нумерованный список готовых шагов; сырьё целиком лежит в свёрнутых
+// «Подробностях» ниже — фаундеру приносят решение, а не выгружают всё.
 async function loadDashboardProblems() {
   const box = $('problems-body');
   try {
     const r = await api('/api/dashboard');
-    $('problems-count').textContent = r.cards.length ? `${r.cards.length} открытых` : '';
-    if (!r.cards.length) {
-      box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
-      window._problemCards = [];
-      renderAutonomy(r.autonomy_level, r.autonomy_levels);
-      renderAgentActions(r.agent_actions || []);
-      return;
-    }
-    box.innerHTML = r.cards.map((c, i) => `<div class="item">
-      <div class="row" style="margin-bottom:5px">
-        <span class="tag">${esc(c.agent_title)}</span>
-        <h3 style="margin:0">${esc(c.title)}</h3>
-      </div>
-      <div class="body">${esc(c.message || '')}</div>
-      <div class="muted" style="font-size:13px;margin-top:4px">${esc(c.found_by)}${
-        c.tested_by ? ' · ' + esc(c.tested_by) : ''}</div>
-      <div class="row" style="margin-top:9px">
-        ${c.actions.map(a => `<button class="btn sm" onclick="actOnProblem(${i},'${a.action}')">${
-          esc(a.label)}</button>`).join('')}
-        <button class="btn sm" onclick="switchTab('${c.agent}')">Открыть у ${esc(c.agent_title).toLowerCase()}а</button>
-      </div>
-    </div>`).join('');
     window._problemCards = r.cards;
+    renderDiagnosis(r.diagnosis);
+    renderToday(r);
+    renderAgentsDone(r.agent_actions || []);
+    renderProblemsDetails(r);
     renderAutonomy(r.autonomy_level, r.autonomy_levels);
     renderAgentActions(r.agent_actions || []);
-  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
-    `<p class="error-text">${esc(e.message)}</p>`; }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    failCard('today-body', e.message);
+    box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+  }
+}
+
+// Разбор воронки. Вывод крупно, обоснование — под свёрнутой строкой:
+// владельцу нужен ответ «где теряются деньги», а не таблица шагов, из
+// которой он должен вывести ответ сам.
+function renderDiagnosis(d) {
+  const box = $('diagnosis-body'), conf = $('diagnosis-confidence');
+  if (!d) { box.innerHTML = '<p class="muted">Разбор недоступен.</p>'; conf.textContent = ''; return; }
+  if (!d.ok) {
+    conf.textContent = '';
+    box.innerHTML = `<p class="muted" style="margin:0">${esc(d.hint || 'Данных для разбора пока нет.')}</p>`;
+    return;
+  }
+  conf.textContent = d.confidence_note || '';
+  const chain = (d.chain || []).map(s => `<div class="chain-row${s.is_worst ? ' worst' : ''}">
+      <span class="chain-label">${esc(s.label)}</span>
+      <span class="chain-value">${nf(s.value)}</span>
+      <span class="chain-conv">${s.conversion == null ? ''
+        : (s.conversion + '%' + (s.is_worst ? ' — главный обрыв' : ''))}</span>
+    </div>`).join('');
+  box.innerHTML = `
+    <p style="font-size:18px;font-weight:600;margin:0 0 10px;line-height:1.35">${esc(d.headline)}</p>
+    ${d.root_cause ? `<p style="margin:0 0 12px;color:var(--text-2)">${esc(d.root_cause)}</p>` : ''}
+    ${d.action ? `<div class="locked" style="border-left:3px solid var(--good);margin-top:0">
+      <b>Что делать:</b> ${esc(d.action)}</div>` : ''}
+    <details style="margin-top:12px">
+      <summary class="muted" style="cursor:pointer;font-size:13px">Откуда это видно</summary>
+      <ul class="plain" style="margin-top:10px">${(d.evidence || []).map(e => `<li>${esc(e)}</li>`).join('')}</ul>
+      <div style="margin-top:12px">${chain}</div>
+    </details>`;
+}
+
+function renderToday(r) {
+  const steps = [];
+
+  // 1. Вопросы агентов: они уже поработали и ждут только «да» или «нет».
+  (r.agent_actions || []).filter(a => a.status === 'proposed').forEach(a => steps.push({
+    who: a.agent_title,
+    title: 'Ответьте: ' + (a.domain === 'metrika_goal' ? 'починить цель в Метрике?'
+           : a.domain === 'direct_negative_keywords' ? 'добавить минус-фразы в Директ?'
+           : 'применить предложение?'),
+    text: a.reasoning,
+    buttons: [
+      {label: 'Сделаю сам', on: `decideAgentAction(${a.id},'apply')`, primary: true},
+      {label: 'Не буду', on: `decideAgentAction(${a.id},'reject')`},
+    ],
+  }));
+
+  // 2. Рекомендация аналитика, ждущая решения.
+  (r.cards || []).forEach((c, i) => {
+    if (c.source !== 'recommendation') return;
+    steps.push({
+      who: c.agent_title,
+      title: `Примите или отклоните: «${c.title}»`,
+      text: c.message,
+      buttons: (c.actions || []).map((a, j) => (
+        {label: a.label, on: `actOnProblem(${i},'${a.action}')`, primary: j === 0})),
+    });
+  });
+
+  // 3. Открытые проблемы — по убыванию тяжести, как их отдал сервер.
+  (r.cards || []).forEach((c, i) => {
+    if (c.source !== 'alert') return;
+    steps.push({
+      who: c.agent_title,
+      title: c.title,
+      text: c.message,
+      buttons: [...(c.actions || []).map(a => ({label: a.label, on: `actOnProblem(${i},'${a.action}')`})),
+                {label: 'Разобраться', on: `switchTab('${c.agent}')`}],
+    });
+  });
+
+  // Идущая проверка — не шаг (делать ничего не нужно), а строка состояния.
+  const running = (r.cards || []).find(c => c.source === 'experiment');
+
+  const SHOW = 3;
+  const extra = steps.length - SHOW;
+  $('today-count').textContent = steps.length ? `${steps.length} ${plural(steps.length, 'шаг', 'шага', 'шагов')}` : '';
+  $('today-body').innerHTML = (steps.length
+    ? steps.slice(0, SHOW).map((s, n) => `<div class="step now">
+        <div class="mark">${n + 1}</div>
+        <div class="text">
+          <b>${esc(s.title)}</b>
+          <span>${esc(s.who)}: ${esc(s.text || '')}</span>
+          <div class="row" style="margin-top:8px">${s.buttons.map(b =>
+            `<button class="btn sm${b.primary ? ' primary' : ''}" onclick="${b.on}">${esc(b.label)}</button>`).join('')}</div>
+        </div>
+      </div>`).join('')
+      + (extra > 0 ? `<p class="muted" style="margin:10px 0 0">И ещё ${extra} — в подробностях ниже.</p>` : '')
+    : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
+       <p class="muted" style="margin:6px 0 0">Агенты продолжают наблюдать. Как только появится
+       проблема или готовое предложение, здесь будет короткий список шагов.</p>`)
+    + (running ? `<p class="muted" style="margin:12px 0 0">⏳ ${esc(running.tested_by || 'Идёт проверка')} —
+       во время проверки ничего не меняйте, иначе результат ничего не докажет.</p>` : '');
+}
+
+// «Агенты сделали сами» — отчёт о выполненной работе. Вопросы агентов
+// здесь не показываются: они наверху, в списке шагов.
+function renderAgentsDone(actions) {
+  const done = actions.filter(a => a.status === 'applied' || a.status === 'blocked_not_configured');
+  const card = $('agents-done-card');
+  if (!done.length) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  $('agents-done-count').textContent = `${done.length} за неделю`;
+  $('agents-done-body').innerHTML = done.slice(0, 5).map(a => `<div class="item">
+      <div class="row" style="margin-bottom:5px">
+        <span class="tag">${esc(a.agent_title)}</span>
+        <span class="tag ${AGENT_STATUS_TAG[a.status] || ''}">${esc(a.status_label)}</span>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">${esc(fmtWhen(a.applied_at || a.created_at))}</span>
+      </div>
+      <div class="body">${esc(a.reasoning)}</div>
+    </div>`).join('');
+}
+
+function renderProblemsDetails(r) {
+  const box = $('problems-body');
+  $('problems-count').textContent = r.cards.length ? `${r.cards.length}` : '';
+  if (!r.cards.length) {
+    box.innerHTML = `<p class="muted">${esc(r.hint)}</p>`;
+    return;
+  }
+  box.innerHTML = r.cards.map((c, i) => `<div class="item">
+    <div class="row" style="margin-bottom:5px">
+      <span class="tag">${esc(c.agent_title)}</span>
+      <h3 style="margin:0">${esc(c.title)}</h3>
+    </div>
+    <div class="body">${esc(c.message || '')}</div>
+    <div class="muted" style="font-size:13px;margin-top:4px">${esc(c.found_by)}${
+      c.tested_by ? ' · ' + esc(c.tested_by) : ''}</div>
+    <div class="row" style="margin-top:9px">
+      ${c.actions.map(a => `<button class="btn sm" onclick="actOnProblem(${i},'${a.action}')">${
+        esc(a.label)}</button>`).join('')}
+      <button class="btn sm" onclick="switchTab('${c.agent}')">Открыть у ${esc(c.agent_title).toLowerCase()}а</button>
+    </div>
+  </div>`).join('');
 }
 
 function renderAutonomy(level, levels) {
   const box = $('autonomy-body');
-  if (!levels) { box.innerHTML = ''; return; }
+  // Пустая карточка с заголовком и без содержимого читается как поломка.
+  if (!levels) {
+    box.innerHTML = '<p class="muted">Уровень не удалось прочитать — обновите страницу.</p>';
+    return;
+  }
   box.innerHTML = Object.keys(levels).sort().map(k => {
     const l = levels[k];
     const active = Number(k) === level;
-    return `<div class="item${active ? ' active' : ''}" style="cursor:pointer" onclick="setAutonomyLevel(${k})">
+    return `<div class="item pick${active ? ' active' : ''}" role="button" tabindex="0"
+        data-level="${esc(k)}" aria-pressed="${active}">
       <div class="row" style="margin-bottom:4px">
-        <b>${esc(l.title)}</b>${active ? '<span class="tag">текущий</span>' : ''}
+        <b>${esc(l.title)}</b>
+        ${active ? '<span class="tag accent">текущий</span>'
+                 : '<span class="muted" style="font-size:12px">нажмите, чтобы выбрать</span>'}
       </div>
       <div class="muted" style="font-size:13px">${esc(l.description)}</div>
     </div>`;
   }).join('');
+  // Обработчик один на контейнер, а не в атрибуте у каждой строки:
+  // клавиатурой выбор тоже должен работать.
+  box.querySelectorAll('.item.pick').forEach(el => {
+    const pick = () => setAutonomyLevel(Number(el.dataset.level));
+    el.onclick = pick;
+    el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+  });
 }
 window.setAutonomyLevel = async (level) => {
   const id = await currentProjectId();
   if (!id) return;
   try {
-    await api(`/api/projects/${id}/autonomy`, {method: 'POST', body: JSON.stringify({level})});
+    const r = await api(`/api/projects/${id}/autonomy`, {method: 'POST', body: JSON.stringify({level})});
+    toast('Уровень автономии изменён', 'ok');
     loadDashboardProblems();
-  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
+};
+
+// Как показывать статус действия агента: цвет должен отличать «сделал сам»
+// от «не смог» с одного взгляда.
+const AGENT_STATUS_TAG = {
+  applied: 'good', proposed: 'accent', rejected: '', blocked_not_configured: 'warning',
 };
 
 function renderAgentActions(actions) {
   const box = $('agent-actions-body');
   if (!actions.length) {
-    box.innerHTML = '<p class="muted">Агенты пока ничего сами не предлагали и не делали.</p>';
+    box.innerHTML = '<p class="muted">Агенты пока ничего сами не предлагали и не делали. '
+      + 'Здесь появится всё, что они найдут и починят — с причиной и с тем, что было до.</p>';
     return;
   }
-  box.innerHTML = actions.map(a => `<div class="item">
+  box.innerHTML = actions.map(a => {
+    const when = a.applied_at || a.created_at;
+    return `<div class="item">
       <div class="row" style="margin-bottom:5px">
         <span class="tag">${esc(a.agent_title)}</span>
-        <b style="margin:0">${esc(a.status_label)}</b>
+        <span class="tag ${AGENT_STATUS_TAG[a.status] || ''}">${esc(a.status_label)}</span>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">${esc(fmtWhen(when))}</span>
       </div>
       <div class="body">${esc(a.reasoning)}</div>
       ${a.status === 'proposed' ? `<div class="row" style="margin-top:9px">
         <button class="btn sm" onclick="decideAgentAction(${a.id},'apply')">Сделаю сам</button>
         <button class="btn sm" onclick="decideAgentAction(${a.id},'reject')">Не буду</button>
       </div>` : ''}
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 window.decideAgentAction = async (id, decision) => {
   try {
     await api(`/api/agent-actions/${id}/${decision}`, {method: 'POST'});
+    toast(decision === 'apply' ? 'Отмечено как сделанное' : 'Предложение отклонено', 'ok');
     loadDashboardProblems();
-  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.actOnProblem = async (i, action) => {
   const card = (window._problemCards || [])[i];
@@ -1274,32 +1598,50 @@ async function loadDiagnostician() {
   showSkeleton('dynamics-body', skelLines(4));
   showSkeleton('alerts-body', skelLines(2));
   try {
-    const [f, d, alerts] = (await Promise.allSettled([
+    const [fr, dr, ar] = await Promise.allSettled([
       api('/api/funnel'), api('/api/dynamics?days=14'), api('/api/alerts?limit=20'),
-    ])).map(r => r.status === 'fulfilled' ? r.value : null);
+    ]);
+    const f = fr.status === 'fulfilled' ? fr.value : null;
+    const d = dr.status === 'fulfilled' ? dr.value : null;
+    const alerts = ar.status === 'fulfilled' ? ar.value : null;
 
     window._funnel = (f && f.windows) || {};
-    STAGE_TITLES = (f && f.stage_titles) || {};
+    if (f && f.stage_titles) STAGE_TITLES = f.stage_titles;
     STAGE_ORDER = ((f && f.stage_order) || STAGE_ORDER).filter(k => k !== 'revenue');
 
-    renderFunnel($('funnel-window').value);
-    renderDynamics(d);
+    if (fr.status === 'rejected') failCard('funnel-body', fr.reason && fr.reason.message);
+    else renderFunnel($('funnel-window').value);
+    if (dr.status === 'rejected') failCard('dynamics-body', dr.reason && dr.reason.message);
+    else renderDynamics(d);
     loadCompare();
     loadReadiness();
     // Есть ли вообще хоть один снимок: без этого «сигналов нет» означало бы
     // «всё в норме», хотя на деле ни одна проверка ещё не выполнялась.
     const hasSnapshots = !!(f && f.windows && Object.values(f.windows).some(Boolean));
-    renderAlerts(alerts, hasSnapshots);
+    // Упавший запрос сигналов -- НЕ «сигналов нет». Раньше экран в этом
+    // случае писал «всё в норме»: аналитик уверенно заявлял, что проблем
+    // нет, не получив ни одного ответа.
+    if (ar.status === 'rejected') failCard('alerts-body', ar.reason && ar.reason.message);
+    else renderAlerts(alerts, hasSnapshots);
     loadLive();
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    console.error(e);
+    failCard('funnel-body', e.message);
+    failCard('dynamics-body', e.message);
+    failCard('alerts-body', e.message);
+  }
 }
 
-function renderKpis(win) {
+function renderKpis(win, failed) {
   const fu = (win && win.funnel) || {};
   // Пока цикл ни разу не отработал, снимка нет вовсе. Показать шесть
   // прочерков и молчать — значит заставить человека гадать, сломалось
   // что-то или просто рано.
   const noData = !win;
+  // Три разных состояния прочерка, и их нельзя путать: «запрос упал»,
+  // «сбора ещё не было», «собрали, но продукт не отдал этот шаг».
+  const subNoData = failed ? 'не удалось получить' : 'данных ещё нет';
   // Откуда берётся число — часть самого числа. Без этого «40» на шаге,
   // где на предыдущем «8», выглядит ошибкой, а прочерк читается как ноль.
   const FROM_PRODUCT = 'Считает сам продукт и отдаёт по своему внутреннему API. '
@@ -1332,7 +1674,7 @@ function renderKpis(win) {
     `<div class="kpi"><div class="label">${esc(t.label)}${
        t.hint ? `<button class="hint" data-hint="kpi-${i}" title="Откуда это число">?</button>` : ''}</div>
      <div class="value">${nf(t.value)}</div>
-     <div class="sub">${esc(noData ? 'данных ещё нет' : (t.sub || ''))}</div>
+     <div class="sub">${esc(noData ? subNoData : (t.sub || (t.value == null ? 'продукт не отдал этот шаг' : '')))}</div>
      ${t.hint ? `<div class="hint-pop hidden" id="hint-kpi-${i}">${esc(t.hint)}</div>` : ''}
      </div>`).join('');
 }
@@ -1502,19 +1844,33 @@ function renderDecision(g) {
   box.innerHTML = '<p class="muted">Активных предложений нет. Аналитик копит данные '
     + 'и предложит следующий шаг, когда выборка станет осмысленной.</p>';
 }
+// Все три раньше не ловили ошибку: нажатие на «Принять» при упавшем
+// запросе не делало ничего и ничего не говорило -- кнопка выглядела
+// сломанной.
 window.decide = async (id, action) => {
   if (action === 'reject' && !confirm('Отклонить предложение?')) return;
-  await api(`/api/growth/recommendation/${id}/${action}`, {method:'POST', body: JSON.stringify({})});
-  loadDashboard();
+  try {
+    await api(`/api/growth/recommendation/${id}/${action}`, {method:'POST', body: JSON.stringify({})});
+    loadDashboard();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.cancelExp = async id => {
   if (!confirm('Отменить идущую проверку?')) return;
-  await api(`/api/growth/experiment/${id}/cancel`, {method:'POST', body: JSON.stringify({})});
-  loadDashboard();
+  try {
+    await api(`/api/growth/experiment/${id}/cancel`, {method:'POST', body: JSON.stringify({})});
+    loadDashboard();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.why = async id => {
-  const r = await api(`/api/growth/recommendation/${id}/why`);
-  $('why-box').innerHTML = renderReport(r.text);
+  const box = $('why-box');
+  try {
+    const r = await api(`/api/growth/recommendation/${id}/why`);
+    if (box) box.innerHTML = renderReport(r.text);
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    if (box) box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+    else toast(e.message, 'error');
+  }
 };
 
 function renderAlerts(alerts, hasSnapshots) {
@@ -1530,25 +1886,36 @@ function renderAlerts(alerts, hasSnapshots) {
     return;
   }
   const sevClass = s => ({P0:'critical', P1:'critical', P2:'warning', P3:'serious'})[s] || '';
-  $('alerts-body').innerHTML = alerts.map(a => `<div class="item">
+  // Текст сигнала передаём по индексу, а не подстановкой в атрибут:
+  // JSON.stringify внутри onclick="..." рвал разметку на первой же кавычке
+  // (кнопка «В разработку» не работала), и заодно пускал текст сигнала
+  // в HTML без экранирования.
+  window._alerts = alerts;
+  $('alerts-body').innerHTML = alerts.map((a, i) => `<div class="item">
     <div class="row" style="margin-bottom:5px">
       <span class="tag ${sevClass(a.severity)}">${esc(a.severity)}</span>
       <h3 style="margin:0">${esc(a.title)}</h3>
       <div class="spacer" style="flex:1"></div>
-      <span class="muted">${(a.periods || []).join(', ')} · ×${a.occurrence_count}</span>
+      <span class="muted">${esc((a.periods || []).join(', '))} · ×${esc(String(a.occurrence_count))}</span>
     </div>
     <div class="body">${esc(a.message)}</div>
     <div class="row" style="margin-top:9px">
       <button class="btn sm" onclick="alertAction(${a.id},'ack')">Понял</button>
       <button class="btn sm" onclick="alertAction(${a.id},'snooze')">Отложить на сутки</button>
-      <button class="btn sm" onclick="sendToDev(${JSON.stringify(a.title)}, ${JSON.stringify(
-        a.message + '\n\nИсточник: Аналитик Воронки, сигнал ' + a.severity + '.')})">В разработку</button>
-      <span class="muted">${esc(a.last_seen_at.slice(0,16).replace('T',' '))}</span>
+      <button class="btn sm" onclick="alertToDev(${i})">В разработку</button>
+      <span class="muted">${esc((a.last_seen_at || '').slice(0,16).replace('T',' '))}</span>
     </div></div>`).join('');
 }
+window.alertToDev = i => {
+  const a = (window._alerts || [])[i];
+  if (!a) return;
+  sendToDev(a.title, a.message + '\n\nИсточник: Аналитик Воронки, сигнал ' + a.severity + '.');
+};
 window.alertAction = async (id, action) => {
-  await api(`/api/alerts/${id}/${action}`, {method:'POST'});
-  loadDiagnostician();
+  try {
+    await api(`/api/alerts/${id}/${action}`, {method:'POST'});
+    loadDiagnostician();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 
 $('run-btn').onclick = async () => {
@@ -1981,17 +2348,34 @@ async function loadMarketer() {
 
     const st = a.stage_titles || {};
     const rows = a.by_source || [];
-    const head = `<tr><th>Источник</th><th>Расход</th><th>Клики</th>
-      <th>${esc(st.signup || 'Регистрации')}</th><th>${esc(st.activation_1 || 'Активация')}</th>
-      <th>Тарифы</th><th>${esc(st.payment_started || 'Оплата начата')}</th>
-      <th>${esc(st.payment_success || 'Оплачено')}</th><th>Цена рег.</th></tr>`;
+    // Девять колонок на 390px не помещаются никогда: без data-label строка,
+    // развёрнутая в столбик, превращалась в безымянные числа. Таблица
+    // размечена под table.stack (см. медиазапрос ≤700px).
+    const cols = [
+      ['Источник', null], ['Расход', 'Расход'], ['Клики', 'Клики'],
+      [st.signup || 'Регистрации', st.signup || 'Регистрации'],
+      [st.activation_1 || 'Активация', st.activation_1 || 'Активация'],
+      ['Тарифы', 'Тарифы'],
+      [st.payment_started || 'Оплата начата', st.payment_started || 'Оплата начата'],
+      [st.payment_success || 'Оплачено', st.payment_success || 'Оплачено'],
+      ['Цена рег.', 'Цена рег.'],
+    ];
+    const head = '<tr>' + cols.map(([t], i) =>
+      `<th${i ? ' class="num"' : ''}>${esc(t)}</th>`).join('') + '</tr>';
+    const cell = (v, label, suffix) =>
+      `<td class="num" data-label="${esc(label)}">${
+        v == null ? '<span class="muted" title="Мы этого не знаем, это не ноль">—</span>'
+                  : nf(v) + (suffix || '')}</td>`;
     $('ads-table').tBodies[0].innerHTML = rows.length ? head + rows.map(r => `<tr>
       <td><b>${esc(r.source)}</b></td>
-      <td>${r.spend == null ? '<span class="muted">—</span>' : nf(r.spend) + ' ₽'}</td>
-      <td>${nf(r.clicks)}</td><td>${nf(r.registrations)}</td><td>${nf(r.activation)}</td>
-      <td>${nf(r.pricing_viewed)}</td><td>${nf(r.payment_started)}</td>
-      <td>${nf(r.payment_success)}</td>
-      <td>${r.cpa == null ? '<span class="muted">—</span>' : nf(r.cpa) + ' ₽'}</td></tr>`).join('')
+      ${cell(r.spend, 'Расход', ' ₽')}
+      ${cell(r.clicks, 'Клики')}
+      ${cell(r.registrations, st.signup || 'Регистрации')}
+      ${cell(r.activation, st.activation_1 || 'Активация')}
+      ${cell(r.pricing_viewed, 'Тарифы')}
+      ${cell(r.payment_started, st.payment_started || 'Оплата начата')}
+      ${cell(r.payment_success, st.payment_success || 'Оплачено')}
+      ${cell(r.cpa, 'Цена рег.', ' ₽')}</tr>`).join('')
       : '<tr><td class="muted">Разреза по источникам пока нет — продукт не отдаёт source_breakdown '
         + 'либо событий слишком мало.</td></tr>';
     $('ads-note').textContent = 'Расход известен только по Директу, поэтому цена регистрации '
@@ -2420,18 +2804,29 @@ async function loadProjects() {
 // обходит все включённые, поэтому «включить свой» больше не значит
 // «выключить чужой».
 window.activate = async id => {
-  await api(`/api/projects/${id}/activate`, {method:'POST'});
-  loadProjects(); loadProjectSwitch();
+  try {
+    await api(`/api/projects/${id}/activate`, {method:'POST'});
+    toast('Сбор включён', 'ok');
+    loadProjects(); loadProjectSwitch();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.pause = async id => {
-  await api(`/api/projects/${id}/pause`, {method:'POST'});
-  loadProjects(); loadProjectSwitch();
+  try {
+    await api(`/api/projects/${id}/pause`, {method:'POST'});
+    toast('Сбор выключен', 'ok');
+    loadProjects(); loadProjectSwitch();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 window.retest = async id => {
-  const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
-  alert(r.ok ? 'Связь есть. Endpoints: ' + r.available_endpoints.join(', ')
-             : 'Проблема: ' + (r.hint || JSON.stringify(r.errors)));
-  loadProjects();
+  try {
+    const r = await api(`/api/projects/${id}/retest`, {method:'POST'});
+    // Системное окно alert() показывало сырой JSON ошибок -- заменено на
+    // обычный тост, как в остальном интерфейсе.
+    toast(r.ok ? 'Связь есть: ' + (r.available_endpoints || []).join(', ')
+               : 'Проблема: ' + (r.hint || 'продукт не ответил как ожидалось'),
+          r.ok ? 'ok' : 'error');
+    loadProjects();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 /* ---- Готовый код endpoint'а для стороны продукта ---- */
 // Грузим по первому раскрытию, а не при загрузке вкладки: у большинства

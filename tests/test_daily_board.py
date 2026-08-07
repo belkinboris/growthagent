@@ -539,3 +539,71 @@ class TestQuietHours:
             return True
         ok = asyncio.run(send_daily_board(_send=ok_send, _session_factory=factory, _settings=S()))
         assert ok is True and len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Честность пустых состояний (ревизия R1)
+# ---------------------------------------------------------------------------
+
+class TestHonestEmptyState:
+    """
+    Нули на доске означали две разные вещи -- «измерили, получилось ноль» и
+    «не смогли собрать данные». Владелец получил утреннюю сводку, где НЕДЕЛЯ
+    показывала 0/20 с прогресс-барами 0%, а ДИНАМИКА рядом -- реальные 17
+    регистраций из вчерашних снимков. Первое читалось как «за неделю никто
+    не пришёл», хотя платёжный путь просто не собрался.
+    """
+
+    def test_no_payment_path_shows_dashes_not_zeros(self):
+        from app.commercial_report import build_board_report
+
+        text = build_board_report("АвтоПост", None, payment_path=None, skip_decision=True)
+        assert "0 / 20" not in text, "нет данных, а показано «0 из 20» как факт"
+        assert "0%" not in text, "прогресс-бар на нуле читается как «ничего не достигли»"
+        assert "данных нет" in text
+        assert "продукт не отдал данные" in text
+
+    def test_real_zero_stays_zero(self):
+        """Настоящий ноль -- факт, его прятать за прочерком нельзя."""
+        from app.commercial_report import build_board_report
+
+        pp = dict(registrations=0, first_post_feedback_good=0, first_post_feedback_bad=0,
+                  pricing_viewed=0, payment_started=0, payment_success=0)
+        text = build_board_report("АвтоПост", None, payment_path=pp,
+                                  new_registrations_since_deploy=0, skip_decision=True)
+        assert "0 / 20" in text
+        assert "данных нет" not in text
+
+    def test_partial_data_marks_only_missing_lines(self):
+        """Часть шагов продукт отдал, часть -- нет: прочерк только у тех, кого нет."""
+        from app.commercial_report import build_board_report
+
+        pp = dict(registrations=17, payment_started=2, payment_success=3)  # без отзывов и тарифов
+        text = build_board_report("АвтоПост", None, payment_path=pp,
+                                  new_registrations_since_deploy=17, skip_decision=True)
+        assert "17 / 20" in text
+        assert "Оплаты        3" in text or "Оплаты" in text
+        lines = {ln.split()[0]: ln for ln in text.splitlines() if ln.strip()}
+        assert "данных нет" in lines["Отзывы"]
+        assert "данных нет" in lines["Тарифы"]
+        # Общей приписки быть не должно: данные есть, просто неполные
+        assert "продукт не отдал данные" not in text
+
+    def test_morning_story_does_not_claim_silence_without_data(self):
+        from app.commercial_report import build_morning_story
+
+        text = build_morning_story([], None, "ничего.")
+        assert "новых событий не было" not in text, "тишина заявлена без единого измерения"
+        assert "сравнивать не с чем" in text
+
+    def test_morning_story_names_the_decline(self):
+        """Спад -- событие, а не тишина."""
+        from app.commercial_report import build_morning_story
+
+        history = [
+            {"registrations": 19, "feedback_total": 12, "pricing_viewed": 5, "payment_success": 0},
+            {"registrations": 17, "feedback_total": 12, "pricing_viewed": 5, "payment_success": 0},
+        ]
+        text = build_morning_story(history, None, "ничего.")
+        assert "новых событий не было" not in text
+        assert "снизилось" in text and "регистрации −2" in text
