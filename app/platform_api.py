@@ -868,10 +868,19 @@ def _agent_action_to_dict(a) -> dict:
 async def dashboard(identity=Depends(require_admin)):
     """Открытые проблемы всех агентов одним списком -- доска фаундера."""
     from app import growth_loop
+    from app.diagnosis import diagnose
     from app.models import AgentAction
+    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
 
     with get_session() as session:
         project = _active_project(session, identity)
+
+        # Разбор воронки -- главное, что владелец должен прочитать: где
+        # теряются деньги и что из этого причина, а что следствие. Считается
+        # детерминированно по данным платёжного пути (см. app/diagnosis.py).
+        pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
+        pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
+        diagnosis = diagnose(pp_dict).as_dict()
 
         alert_rows = session.exec(
             select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
@@ -936,6 +945,7 @@ async def dashboard(identity=Depends(require_admin)):
     return {
         "cards": cards, "hint": None if cards else
             "Открытых проблем нет: по всем проверяемым правилам всё в норме.",
+        "diagnosis": diagnosis,
         "autonomy_level": level,
         "autonomy_levels": {str(k): v for k, v in AUTONOMY_LEVELS.items()},
         "agent_actions": [_agent_action_to_dict(a) for a in agent_action_rows],

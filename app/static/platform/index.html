@@ -144,6 +144,21 @@
   .funnel-value{text-align:right;font-variant-numeric:tabular-nums;font-size:14px;font-weight:600}
   .funnel-conv{font-size:12px;color:var(--muted);padding:1px 0 3px 162px}
 
+  /* Цепочка шагов в разборе: «сколько человек дошло и какая конверсия».
+     Не .funnel-row -- там полоса-график, здесь нужен компактный список,
+     который читается как расчёт: шаг, число, процент перехода. */
+  .chain-row{display:grid;grid-template-columns:1fr auto 116px;gap:12px;align-items:baseline;
+    padding:6px 8px;border-radius:6px}
+  .chain-row.worst{background:var(--accent-bg)}
+  .chain-label{color:var(--text-2);font-size:14px}
+  .chain-value{font-variant-numeric:tabular-nums;font-weight:600}
+  .chain-conv{color:var(--muted);font-size:12px;text-align:right}
+  .chain-row.worst .chain-conv{color:var(--accent)}
+  @media(max-width:700px){
+    .chain-row{grid-template-columns:1fr auto;gap:2px 10px}
+    .chain-conv{grid-column:1 / -1;text-align:left}
+  }
+
   /* График динамики */
   .chart-wrap{overflow-x:auto}
   svg .grid{stroke:var(--border);stroke-width:1}
@@ -495,10 +510,16 @@
       <p class="muted" id="first-run-note" style="margin:14px 0 0"></p>
     </div>
 
-    <!-- Главная карточка доски. Фаундер открывает экран с одним вопросом:
-         «что мне сделать?» — и получает нумерованный короткий список
-         готовых шагов, а не сырьё из сигналов, рекомендаций и лент.
-         Всё, из чего список собран, лежит ниже в свёрнутых подробностях. -->
+    <!-- Разбор: единственное, что владелец обязан прочитать. Где теряются
+         деньги, что из этого причина, а что следствие, и один шаг. Всё
+         обоснование — под свёрнутой строкой «Откуда это видно». -->
+    <div class="card hero" id="diagnosis-card">
+      <h2>Разбор<span class="spacer"></span><span class="muted" id="diagnosis-confidence"></span></h2>
+      <div id="diagnosis-body"><div class="skel w80"></div><div class="skel w60"></div></div>
+    </div>
+
+    <!-- Готовые шаги: нумерованный короткий список, а не сырьё из сигналов,
+         рекомендаций и лент. Всё, из чего он собран, — в подробностях ниже. -->
     <div class="card hero" id="today-card">
       <h2>Что сделать сегодня<span class="spacer"></span><span class="muted" id="today-count"></span></h2>
       <div id="today-body"><div class="skel w80"></div><div class="skel w60"></div></div>
@@ -1263,6 +1284,7 @@ const DEFAULT_STAGE_TITLES = {
 const stageTitle = k => STAGE_TITLES[k] || DEFAULT_STAGE_TITLES[k] || k;
 
 async function loadDashboard() {
+  showSkeleton('diagnosis-body', skelLines(3));
   showSkeleton('today-body', skelLines(3));
   showSkeleton('kpis', skelKpis());
   showSkeleton('decision-body', skelLines(3));
@@ -1333,6 +1355,7 @@ async function loadDashboardProblems() {
   try {
     const r = await api('/api/dashboard');
     window._problemCards = r.cards;
+    renderDiagnosis(r.diagnosis);
     renderToday(r);
     renderAgentsDone(r.agent_actions || []);
     renderProblemsDetails(r);
@@ -1343,6 +1366,36 @@ async function loadDashboardProblems() {
     failCard('today-body', e.message);
     box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
   }
+}
+
+// Разбор воронки. Вывод крупно, обоснование — под свёрнутой строкой:
+// владельцу нужен ответ «где теряются деньги», а не таблица шагов, из
+// которой он должен вывести ответ сам.
+function renderDiagnosis(d) {
+  const box = $('diagnosis-body'), conf = $('diagnosis-confidence');
+  if (!d) { box.innerHTML = '<p class="muted">Разбор недоступен.</p>'; conf.textContent = ''; return; }
+  if (!d.ok) {
+    conf.textContent = '';
+    box.innerHTML = `<p class="muted" style="margin:0">${esc(d.hint || 'Данных для разбора пока нет.')}</p>`;
+    return;
+  }
+  conf.textContent = d.confidence_note || '';
+  const chain = (d.chain || []).map(s => `<div class="chain-row${s.is_worst ? ' worst' : ''}">
+      <span class="chain-label">${esc(s.label)}</span>
+      <span class="chain-value">${nf(s.value)}</span>
+      <span class="chain-conv">${s.conversion == null ? ''
+        : (s.conversion + '%' + (s.is_worst ? ' — главный обрыв' : ''))}</span>
+    </div>`).join('');
+  box.innerHTML = `
+    <p style="font-size:18px;font-weight:600;margin:0 0 10px;line-height:1.35">${esc(d.headline)}</p>
+    ${d.root_cause ? `<p style="margin:0 0 12px;color:var(--text-2)">${esc(d.root_cause)}</p>` : ''}
+    ${d.action ? `<div class="locked" style="border-left:3px solid var(--good);margin-top:0">
+      <b>Что делать:</b> ${esc(d.action)}</div>` : ''}
+    <details style="margin-top:12px">
+      <summary class="muted" style="cursor:pointer;font-size:13px">Откуда это видно</summary>
+      <ul class="plain" style="margin-top:10px">${(d.evidence || []).map(e => `<li>${esc(e)}</li>`).join('')}</ul>
+      <div style="margin-top:12px">${chain}</div>
+    </details>`;
 }
 
 function renderToday(r) {
