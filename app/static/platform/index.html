@@ -1823,10 +1823,14 @@ function renderDecision(g) {
       <h3>${esc(e.title)}</h3>
       ${e.hypothesis ? `<div class="body">${esc(e.hypothesis)}</div>` : ''}
       <div class="progress"><div style="width:${Math.min(100, done / target * 100)}%"></div></div>
-      <p class="muted">Набрано ${done} из ${target} (${esc(e.sample_metric)}) · с ${e.started_at.slice(0,10)}</p>
-      ${e.locked_variables.length ? `<div class="locked">🔒 Не менять до вердикта:
+      <p class="muted">Набрано ${done} из ${target}${e.sample_metric_title ? ' (' + esc(e.sample_metric_title) + ')' : ''} · с ${e.started_at.slice(0,10)}</p>
+      <div class="locked" style="border-left:3px solid var(--good)">
+        ✋ От вас сейчас ничего не нужно — мы просто ждём, пока наберётся выборка,
+        и сами скажем, помогло ли.
+      </div>
+      ${e.locked_variables.length ? `<div class="locked">🔒 Пока проверка идёт, не меняем:
         ${e.locked_variables.map(esc).join(', ')}</div>` : ''}
-      ${e.success_criterion ? `<p class="muted" style="margin:10px 0 0">Успех: ${esc(e.success_criterion)}</p>` : ''}
+      ${e.success_criterion ? `<p class="muted" style="margin:10px 0 0">Проверка удалась, если: ${esc(e.success_criterion)}</p>` : ''}
       <div class="row" style="margin-top:14px">
         <button class="btn sm" onclick="cancelExp(${e.id})">Отменить проверку</button>
       </div></div>`;
@@ -2534,7 +2538,7 @@ async function loadTester() {
         <div class="row" style="margin-bottom:4px">
           <h3 style="margin:0">${esc(i.title)}</h3>
           <span class="tag">${esc(REC_STATUS[i.status] || i.status)}</span>
-          <span class="tag">${esc(i.area)}</span>
+          <span class="tag">${esc(i.area_title || i.area)}</span>
           <div style="flex:1"></div>
           <span class="muted">${esc(i.created_at.slice(0,10))}</span>
         </div>

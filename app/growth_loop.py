@@ -567,7 +567,8 @@ def maybe_finish_experiment(
 def cancel_experiment(session: Session, exp: GrowthExperiment, reason: str = "") -> GrowthExperiment:
     """Откат/отмена вручную: эксперимент закрывается без вердикта о метрике."""
     exp.status = GrowthExperimentStatus.cancelled
-    exp.verdict = "ОТМЕНЁН ВЛАДЕЛЬЦЕМ"
+    # Сплошные заглавные читаются как крик, а не как статус.
+    exp.verdict = "Отменено вручную"
     exp.result_summary = (reason or "отменён вручную")[:500]
     exp.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
     session.add(exp)

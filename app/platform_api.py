@@ -699,6 +699,7 @@ def _rec_to_dict(rec) -> dict:
     return {
         "id": rec.id,
         "area": rec.area,
+        "area_title": AREA_TITLES.get(rec.area, rec.area),
         "title": rec.title,
         "action": rec.action,
         "hypothesis": rec.hypothesis,
@@ -740,9 +741,11 @@ async def growth_state(identity=Depends(require_admin)):
                 "id": running.id,
                 "title": running.title,
                 "area": running.area,
+                "area_title": AREA_TITLES.get(running.area, running.area),
                 "hypothesis": running.hypothesis,
                 "primary_metric": running.primary_metric,
                 "sample_metric": running.sample_metric,
+                "sample_metric_title": _metric_title(running.sample_metric),
                 "target_sample": running.target_sample,
                 "locked_variables": running.locked_variables_json or [],
                 "success_criterion": running.success_criterion,
@@ -805,6 +808,41 @@ AREA_TO_AGENT: dict[str, str] = {
     "collect_feedback": "product",
     "commercial_bridge": "product",
 }
+
+# Русские названия области (growth_loop.diagnose()) и метрики выборки
+# эксперимента -- владелец видел на экране сырые коды вроде «first_post»
+# и «(first_post_feedback_total)», которые ничего не говорят человеку без
+# доступа к коду. Тут единственное место перевода для истории решений и
+# карточки идущей проверки.
+AREA_TITLES: dict[str, str] = {
+    "tracking": "точность данных",
+    "collect_data": "сбор данных",
+    "onboarding": "первые шаги в продукте",
+    "payment_path": "путь к оплате",
+    "scale": "масштабирование",
+    "pricing_screen": "тарифный экран",
+    "first_post": "первый пост",
+    "collect_feedback": "сбор отзывов",
+    "commercial_bridge": "переход к оплате",
+}
+
+METRIC_TITLES: dict[str, str] = {
+    "registrations": "регистраций",
+    "channels_created": "каналов создано",
+    "post_generations": "постов сгенерировано",
+    "first_post_feedback_good": "хороших отзывов",
+    "first_post_feedback_total": "отзывов о первом посте",
+    "pricing_viewed": "просмотров тарифов",
+    "payment_cta_clicked": "нажатий «выбрать тариф»",
+    "payment_started": "начатых оплат",
+    "payment_success": "успешных оплат",
+}
+
+
+def _metric_title(key: str | None) -> str:
+    if not key:
+        return ""
+    return METRIC_TITLES.get(key, key)
 
 AGENT_TITLES: dict[str, str] = {
     "diagnostician": "Диагност", "marketer": "Маркетолог",
@@ -2335,6 +2373,7 @@ async def decisions_history(limit: int = 50, identity=Depends(require_admin)):
                 "id": r.id,
                 "title": r.title,
                 "area": r.area,
+                "area_title": AREA_TITLES.get(r.area, r.area),
                 "action": r.action,
                 "hypothesis": r.hypothesis,
                 "status": r.status.value,

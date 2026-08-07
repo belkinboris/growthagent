@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.readiness import ENOUGH_FOR_A_CONCLUSION, MIN_FOR_A_TREND
-from app.vocabulary import feedback_reason_label
+from app.vocabulary import TopReason, top_feedback_reason
 
 # Доля отрицательных отзывов, начиная с которой результат продукта считается
 # проблемой, а не поводом для наблюдения. Не 50%: около половины -- это
@@ -125,25 +125,6 @@ def _n(v) -> Optional[int]:
         return None
 
 
-def _top_reason(reasons: dict | None) -> Optional[tuple[str, int]]:
-    """Самая частая причина недовольства: («не тот стиль», 26)."""
-    if not isinstance(reasons, dict):
-        return None
-    merged: dict[str, int] = {}
-    for key, count in reasons.items():
-        try:
-            count = int(count)
-        except (TypeError, ValueError):
-            continue
-        if count <= 0:
-            continue
-        label = feedback_reason_label(key)
-        merged[label] = merged.get(label, 0) + count
-    if not merged:
-        return None
-    return max(merged.items(), key=lambda kv: kv[1])
-
-
 def _build_chain(pp: dict) -> list[Step]:
     steps: list[Step] = []
     prev_value: Optional[int] = None
@@ -193,22 +174,22 @@ def diagnose(payment_path: dict | None) -> Diagnosis:
     """
     if not payment_path:
         return Diagnosis(ok=False, hint=(
-            "Разбор появится после первого удачного сбора: продукт пока не отдал "
-            "данные о пути к оплате."
+            "Ещё нет данных о том, как люди доходят до оплаты. Как только соберём "
+            "первую партию — разбор появится здесь сам."
         ))
 
     steps = _build_chain(payment_path)
     if len(steps) < 2:
         return Diagnosis(ok=False, chain=steps, hint=(
-            "Продукт отдаёт слишком мало шагов воронки, чтобы связать их в цепочку. "
-            "Какие поля он присылает — видно на вкладке «Проекты»."
+            "Известно слишком мало шагов пути к оплате, чтобы построить разбор. "
+            "Проверьте на вкладке «Проекты», какие шаги присылает АвтоПост."
         ))
 
     first = steps[0]
     if first.value < MIN_FOR_A_TREND:
         return Diagnosis(ok=False, chain=steps, hint=(
-            f"За неделю всего {first.value} — на таких числах любой вывод будет "
-            "случайным. Разбор появится, когда людей станет больше."
+            f"За неделю пришло всего {first.value} человек — на таком количестве "
+            "любой вывод будет случайным. Разбор появится, когда людей станет больше."
         ))
 
     worst = _worst_step(steps)
@@ -219,7 +200,7 @@ def diagnose(payment_path: dict | None) -> Diagnosis:
     fb_total = fb_good + fb_bad
     bad_share = (fb_bad / fb_total) if fb_total else 0.0
     quality_is_bad = fb_total >= MIN_FEEDBACK_FOR_CAUSE and bad_share >= BAD_FEEDBACK_SHARE
-    top_reason = _top_reason(payment_path.get("first_post_feedback_reasons"))
+    top_reason = top_feedback_reason(payment_path.get("first_post_feedback_reasons"))
 
     diag = Diagnosis(ok=True, chain=steps)
     for s in steps:
@@ -248,10 +229,25 @@ def diagnose(payment_path: dict | None) -> Diagnosis:
     )
 
     if quality_is_bad:
-        reason_text = f", главная причина — «{top_reason[0]}»" if top_reason else ""
+        # «Другое» — это отсутствие содержательного ответа, а не сама частая
+        # причина: показывать его как «главную причину» значит выдавать
+        # пустоту за вывод. Конкретную причину называем только когда она
+        # реально есть; если люди просто не написали, что не так, так и
+        # говорим и предлагаем прочитать отзывы самому.
+        reason_clause = f", чаще всего называют «{top_reason.label}»" if top_reason and top_reason.is_specific else ""
         diag.evidence.append(
             f"Первый пост людям не нравится: {fb_bad} «плохо» против {fb_good} «хорошо» "
-            f"({round(bad_share * 100)}% недовольны){reason_text}."
+            f"({round(bad_share * 100)}% недовольны){reason_clause}."
+        )
+        if top_reason and not top_reason.is_specific:
+            diag.evidence.append(
+                f"{top_reason.count} человек поставили «плохо», не написав, что именно "
+                "не понравилось — стоит открыть эти отзывы и прочитать своими глазами."
+            )
+        cause_phrase = f" ({top_reason.label})" if top_reason and top_reason.is_specific else ""
+        start_phrase = (
+            f", начиная с причины «{top_reason.label}»" if top_reason and top_reason.is_specific
+            else " — начните с чтения свежих отзывов, там не написана общая причина"
         )
         if quality_upstream_of_break:
             diag.headline = (
@@ -260,27 +256,20 @@ def diagnose(payment_path: dict | None) -> Diagnosis:
             )
             diag.root_cause = (
                 "Человек получает результат, который его не устраивает"
-                + (f" ({top_reason[0]})" if top_reason else "")
+                + cause_phrase
                 + f" — и дальше смотрит на цену уже без доверия. Поэтому обрыв "
                   f"виден на шаге «{worst.label}», а чинить надо то, что выше."
             )
             diag.action = (
                 "Заняться качеством первого поста"
-                + (f", начиная с причины «{top_reason[0]}»" if top_reason else "")
+                + start_phrase
                 + ". Тарифный экран и кнопку оплаты пока не трогать: пока результат "
                   "разочаровывает, их правка ничего не изменит."
             )
         else:
             diag.headline = "Главная проблема — качество первого поста."
-            diag.root_cause = (
-                "Большинству людей результат не нравится"
-                + (f", чаще всего — «{top_reason[0]}»" if top_reason else "") + "."
-            )
-            diag.action = (
-                "Разобраться, почему первый пост не нравится"
-                + (f" — начните с «{top_reason[0]}»" if top_reason else "")
-                + ", и починить это. Остальное подождёт."
-            )
+            diag.root_cause = "Большинству людей результат не нравится" + cause_phrase + "."
+            diag.action = "Разобраться, почему первый пост не нравится" + start_phrase + ", и починить это. Остальное подождёт."
     elif worst is not None:
         idx = steps.index(worst)
         prev = steps[idx - 1]

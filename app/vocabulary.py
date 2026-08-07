@@ -181,6 +181,55 @@ def feedback_reason_label(key: str) -> str:
     return FEEDBACK_REASON_LABELS.get(str(key), str(key))
 
 
+# "other" -- признак того, что человек не написал ничего конкретного, а не
+# отдельная содержательная причина. Раньше это выводилось на экран как
+# «Главная причина — другое», если таких ответов набиралось больше всего --
+# формулировка звучала как содержательный вывод, хотя на деле означала
+# «мы не знаем, что именно не понравилось».
+GENERIC_REASON_KEYS = {"other"}
+
+
+@dataclass(frozen=True)
+class TopReason:
+    label: str          # что показать владельцу
+    count: int          # сколько раз встретилась
+    is_specific: bool    # False -- это «другое»/неопределено, не конкретная причина
+
+
+def top_feedback_reason(reasons: dict | None) -> Optional[TopReason]:
+    """
+    Самая частая КОНКРЕТНАЯ причина недовольства -- специально предпочитает
+    «не тот стиль» над «другое», даже если «другое» набрало больше голосов.
+    «Другое» -- это отсутствие содержательного ответа, а не сама частая
+    причина; называть его «главной причиной» значит выдавать пустоту за
+    вывод. Если содержательных причин нет вовсе, честно возвращает
+    is_specific=False с количеством неопределённых ответов -- решение,
+    что с этим делать, остаётся за текстом, который это показывает.
+    """
+    if not isinstance(reasons, dict):
+        return None
+    specific: dict[str, int] = {}
+    generic_count = 0
+    for key, count in reasons.items():
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        if str(key) in GENERIC_REASON_KEYS:
+            generic_count += count
+            continue
+        label = feedback_reason_label(key)
+        specific[label] = specific.get(label, 0) + count
+    if specific:
+        label, count = max(specific.items(), key=lambda kv: kv[1])
+        return TopReason(label=label, count=count, is_specific=True)
+    if generic_count:
+        return TopReason(label="причину не уточнили", count=generic_count, is_specific=False)
+    return None
+
+
 def format_feedback_reasons(reasons: dict | None) -> str:
     """
     Причины отзывов человеческой строкой: «не тот стиль — 1, другое — 1».

@@ -116,6 +116,32 @@ class TestOwnerLanguage:
         assert "причина не указана" in rec["action"]
         assert "не прислал" in rec["extra_evidence"][0]
 
+    def test_generic_reason_is_not_named_the_main_cause(self):
+        """Баг с живого продукта: «other» набрало больше голосов, чем
+        конкретная причина, и текст писал «Главная причина — другое» --
+        формулировка, которая ничего не говорит владельцу о том, что чинить.
+        Конкретная причина должна побеждать «другое», даже если у него
+        больше голосов, а если конкретных причин нет вовсе -- честно так и
+        сказать, а не подставить бессмысленное «другое»."""
+        pp = dict(PAYMENT_PATH, first_post_feedback_reasons={"other": 20, "wrong_style": 3})
+        rec = truepost_playbook("first_post", pp, THRESHOLDS)
+        assert "другое" not in rec["action"].lower()
+        assert "не тот стиль" in rec["action"]
+
+        pp_only_generic = dict(PAYMENT_PATH, first_post_feedback_reasons={"other": 5})
+        rec2 = truepost_playbook("first_post", pp_only_generic, THRESHOLDS)
+        assert "другое" not in rec2["action"].lower()
+        assert "поставили «плохо»" in rec2["action"]
+
+    def test_no_jargon_about_generator_lock(self):
+        """«Снимаем запрет с генератора» -- фраза, непонятная владельцу без
+        технического бэкграунда. Текст должен объяснять простыми словами,
+        что вообще происходит: меняем, как ИИ пишет пост."""
+        rec = truepost_playbook("first_post", PAYMENT_PATH, THRESHOLDS)
+        assert "запрет" not in rec["action"].lower()
+        assert "промпт" not in rec["action"].lower()
+        assert "ии" in rec["action"].lower()
+
 
 # ---------------------------------------------------------------------------
 # Одно уведомление -- одно письмо

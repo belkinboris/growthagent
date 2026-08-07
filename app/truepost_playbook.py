@@ -146,32 +146,45 @@ def _first_post(pp: dict, t: dict) -> dict:
     # Текст читает владелец, а не разработчик: английские ключи продукта
     # (wrong_style, too_generic) и слова bad/good переводим здесь, у самого
     # источника. Словарь — в vocabulary.py, единственном месте переводов.
-    from app.vocabulary import feedback_reason_label, format_feedback_reasons
+    from app.vocabulary import format_feedback_reasons, top_feedback_reason
 
     good = _n(pp.get("first_post_feedback_good"))
     bad = _n(pp.get("first_post_feedback_bad"))
     reasons = pp.get("first_post_feedback_reasons") or {}
-    # Причины с нулём ничего не сообщают — топом считаем только ненулевые.
-    nonzero = {k: _n(v) for k, v in reasons.items() if _n(v) > 0}
-    top_key = max(nonzero, key=nonzero.get) if nonzero else None
-    top_reason = feedback_reason_label(top_key) if top_key else "причина не указана"
+    top = top_feedback_reason(reasons)
     reasons_line = format_feedback_reasons(reasons)
+
+    # «Другое» — это отсутствие содержательного ответа, а не сама частая
+    # причина. top_feedback_reason() уже предпочитает конкретную причину
+    # над ней; здесь остаётся честно сформулировать текст под три случая:
+    # причина названа, причина не названа (только «плохо» без пояснения),
+    # причин не прислали вовсе.
+    if top is None:
+        reason_clause = "причина не указана"
+        change_target = "по образцам хороших постов — точной причины нет"
+    elif top.is_specific:
+        reason_clause = f"чаще всего пишут «{top.label}»"
+        change_target = f"причину «{top.label}»"
+    else:
+        reason_clause = f"{top.count} человек просто поставили «плохо», не написав почему"
+        change_target = "то, что покажут свежие отзывы — общей причины они не называют"
+
     return {
         "title": "Чиним качество первого поста",
         "action": (
             f"Отзывы подтверждают проблему первого результата: "
-            f"{bad} плохих из {good + bad}. "
-            f"Главная причина — {top_reason}. Снимаем запрет с генератора и делаем "
-            "ОДНУ правку промпта под эту причину. Больше ничего не менять."
+            f"{bad} плохих из {good + bad}, {reason_clause}. Один раз меняем "
+            "инструкции для ИИ, который пишет первый пост, и десять дней больше "
+            "ничего не трогаем — чтобы чётко увидеть, помогло ли."
         ),
-        "hypothesis": "Одна адресная правка промпта под главную причину снизит долю плохих отзывов.",
+        "hypothesis": "Одна адресная правка инструкций ИИ под главную причину снизит долю плохих отзывов.",
         "change_set": [
-            f"одна правка промпта генератора под причину «{top_reason}»",
+            f"одна правка инструкций для ИИ-генератора под {change_target}",
             "остальные причины не трогать в этой правке",
             "первые шаги в продукте, тарифы и рекламу не менять",
         ],
         "expected_effect": "доля плохих отзывов ниже порога на следующих отзывах",
-        "risk": "средний: правка генератора, откат = вернуть прежний промпт",
+        "risk": "средний: правка того, как ИИ пишет пост, откат = вернуть прежнюю версию",
         "measure": "доля хороших отзывов среди НОВЫХ (после правки)",
         "primary_metric": "first_post_feedback_good",
         "sample_metric": "first_post_feedback_total",
@@ -179,7 +192,7 @@ def _first_post(pp: dict, t: dict) -> dict:
         "min_runtime_days": 3,
         "max_runtime_days": 14,
         "success_criterion": f"плохих меньше {t['bad_feedback_share']:.0%} на новых отзывах",
-        "failure_criterion": "доля плохих не снизилась — откатить промпт, разбирать причину глубже",
+        "failure_criterion": "доля плохих не снизилась — вернуть прежнюю версию, разбирать причину глубже",
         "locked_variables": ["первые шаги в продукте", "тарифы", "цены", "реклама", "лендинг"],
         "extra_evidence": [
             f"почему так оценили: {reasons_line}" if reasons_line

@@ -64,6 +64,39 @@ class TestOwnerCase:
         ]
 
 
+class TestGenericReasonIsNotAnInsight:
+    """
+    Баг, найденный владельцем на живом продукте: если самая частая причина
+    в отзывах — «другое» (человек поставил «плохо», не написав, что не
+    так), разбор писал «главная причина — другое». Это звучит как вывод,
+    хотя означает «мы не знаем» — владелец не понимает, что делать с такой
+    формулировкой.
+    """
+
+    def test_generic_reason_is_not_named_as_the_cause(self):
+        case = dict(OWNER_CASE, first_post_feedback_reasons={"other": 20, "wrong_style": 3})
+        d = diagnose(case)
+        assert "другое" not in d.headline.lower()
+        assert "другое" not in (d.root_cause or "").lower()
+        assert "другое" not in (d.action or "").lower()
+
+    def test_specific_reason_wins_even_if_fewer_votes_than_other(self):
+        """«Другое» не должно перетягивать вывод на себя, даже если голосов
+        за него больше: конкретная причина полезнее для действия."""
+        case = dict(OWNER_CASE, first_post_feedback_reasons={"other": 20, "wrong_style": 3})
+        d = diagnose(case)
+        assert "не тот стиль" in d.root_cause
+
+    def test_all_generic_is_stated_honestly(self):
+        """Если ни одной конкретной причины нет вообще -- так и говорим,
+        а не выдумываем причину и не называем пустоту выводом."""
+        case = dict(OWNER_CASE, first_post_feedback_reasons={"other": 20})
+        d = diagnose(case)
+        assert "другое" not in d.headline.lower()
+        assert any("не написав" in e or "не уточнили" in e for e in d.evidence)
+        assert "прочитать" in d.action.lower() or "отзыв" in d.action.lower()
+
+
 class TestWithoutQualitySignal:
     """Без отзывов корень назвать нельзя -- значит, и не называем."""
 
@@ -91,7 +124,7 @@ class TestWithoutQualitySignal:
 class TestHonestRefusal:
     def test_no_data_at_all(self):
         d = diagnose(None)
-        assert not d.ok and "не отдал" in d.hint
+        assert not d.ok and "нет данных" in d.hint
 
     def test_empty_dict(self):
         d = diagnose({})
@@ -176,3 +209,64 @@ class TestDashboardIntegration:
         d = client.get("/growth/api/dashboard").json()["diagnosis"]
         assert d["ok"] is False
         assert d["hint"]
+
+
+class TestAreaAndMetricTitlesAreRussian:
+    """
+    Владелец видел сырые коды area/sample_metric на экранах истории решений
+    и идущей проверки («first_post», «(first_post_feedback_total)») --
+    /api/growth и /api/history обязаны отдавать готовые русские подписи,
+    а не только код для внутренних расчётов.
+    """
+
+    def test_recommendation_has_area_title(self, monkeypatch, tmp_path):
+        from tests.test_platform_api import _client, _login, _project_id
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = _project_id(session_factory)
+        from app import growth_loop
+        from app.models import GrowthRecommendation
+
+        with session_factory() as session:
+            session.add(GrowthRecommendation(
+                project_id=pid, area="first_post", title="Чиним качество первого поста",
+                action="...", hypothesis="...", confidence="сигнал",
+                primary_metric="first_post_feedback_good",
+                sample_metric="first_post_feedback_total", target_sample=10,
+                fingerprint=f"{pid}/first_post/x",
+            ))
+            session.commit()
+        _login(client)
+        g = client.get("/growth/api/growth").json()
+        assert g["recommendation"]["area_title"] == "первый пост"
+        assert "first_post" not in g["recommendation"]["area_title"]
+
+    def test_running_experiment_has_readable_sample_metric(self, monkeypatch, tmp_path):
+        from tests.test_platform_api import _client, _login, _project_id
+        from app.models import GrowthExperiment, GrowthRecommendation
+
+        client, session_factory = _client(monkeypatch, tmp_path)
+        pid = _project_id(session_factory)
+        with session_factory() as session:
+            rec = GrowthRecommendation(
+                project_id=pid, area="first_post", title="Чиним качество первого поста",
+                action="...", hypothesis="...", confidence="сигнал",
+                primary_metric="first_post_feedback_good",
+                sample_metric="first_post_feedback_total", target_sample=10,
+                fingerprint=f"{pid}/first_post/y", status="accepted",
+            )
+            session.add(rec)
+            session.commit()
+            session.refresh(rec)
+            session.add(GrowthExperiment(
+                project_id=pid, recommendation_id=rec.id, area="first_post",
+                title="Чиним качество первого поста",
+                hypothesis="...", status="running",
+                primary_metric="first_post_feedback_good",
+                sample_metric="first_post_feedback_total", target_sample=10,
+            ))
+            session.commit()
+        _login(client)
+        g = client.get("/growth/api/growth").json()
+        assert g["experiment"]["sample_metric_title"] == "отзывов о первом посте"
+        assert g["experiment"]["area_title"] == "первый пост"
