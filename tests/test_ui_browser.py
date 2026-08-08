@@ -203,6 +203,45 @@ class TestOverviewWithoutData:
         page.close()
 
 
+class TestOverviewFailure:
+    def test_broken_overview_clears_every_skeleton(self, server, browser):
+        """Раньше loadDashboard() ловил упавший /api/overview и чистил
+        скелетоны только у четырёх из шести панелей -- «Разбор» и «Источники
+        данных» пульсировали вечно, будто ответ вот-вот придёт, хотя запрос
+        уже провалился."""
+        base, _ = server
+        page, _ = _page(browser)
+        _login_owner(page, base)
+        page.wait_for_selector("#kpis", timeout=10000)
+
+        page.route(
+            "**/api/overview",
+            lambda route: route.fulfill(
+                status=500, content_type="application/json",
+                body='{"detail": "тестовый сбой"}',
+            ),
+        )
+        # Перезаходим на доску, чтобы loadDashboard() выполнился заново
+        # уже с перехваченным запросом.
+        page.click("#tabs button[data-tab='diagnostician']")
+        page.wait_for_selector("#view-diagnostician:not(.hidden)", timeout=10000)
+        page.click("#tabs button[data-tab='dashboard']")
+        page.wait_for_function(
+            "document.getElementById('today-body').innerText.includes('Не удалось загрузить')",
+            timeout=10000,
+        )
+
+        # Часть панелей (integrations-body, decision-body, problems-body)
+        # живёт под свёрнутым блоком «Подробности» (R6) и поэтому не видна
+        # -- проверяем innerHTML, а не inner_text, которая для скрытых
+        # элементов всегда пустая независимо от содержимого.
+        for box_id in ["diagnosis-body", "integrations-body", "today-body", "kpis", "decision-body", "problems-body"]:
+            html = page.eval_on_selector(f"#{box_id}", "el => el.innerHTML").lower()
+            assert "skel" not in html, f"#{box_id} остался скелетоном после упавшего /api/overview"
+            assert "не удалось загрузить" in html, f"#{box_id} не показал ошибку: {html!r}"
+        page.close()
+
+
 class TestTabsAndProjects:
     def test_every_tab_opens_without_js_errors(self, server, browser):
         """Вкладки рисуются целиком на JS: сломанный обработчик виден
