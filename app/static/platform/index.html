@@ -1590,7 +1590,7 @@ window.actOnProblem = async (i, action) => {
   try {
     await api(url, {method: 'POST'});
     loadDashboardProblems();
-  } catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };
 
 async function loadDiagnostician() {
