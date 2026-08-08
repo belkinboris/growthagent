@@ -271,6 +271,32 @@ class TestOverviewFailure:
         assert "не удалось загрузить" in table_html
         page.close()
 
+    def test_broken_projects_clears_table_skeleton(self, server, browser):
+        """loadProjects() на упавшем /api/projects тоже только логировал
+        ошибку в консоль -- таблица проектов оставалась скелетоном
+        навсегда, ровно как в loadMarketer до фикса."""
+        base, _ = server
+        page, _ = _page(browser)
+        _login_owner(page, base)
+
+        page.route(
+            "**/api/projects",
+            lambda route: route.fulfill(
+                status=500, content_type="application/json",
+                body='{"detail": "тестовый сбой проектов"}',
+            ),
+        )
+        page.click("#tabs button[data-tab='projects']")
+        page.wait_for_function(
+            "document.getElementById('projects-table').innerText.includes('Не удалось загрузить')",
+            timeout=10000,
+        )
+
+        table_html = page.eval_on_selector("#projects-table tbody", "el => el.innerHTML").lower()
+        assert "skel" not in table_html, "Таблица проектов осталась скелетоном после упавшего /api/projects"
+        assert "не удалось загрузить" in table_html
+        page.close()
+
 
 class TestTabsAndProjects:
     def test_every_tab_opens_without_js_errors(self, server, browser):

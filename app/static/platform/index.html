@@ -2817,7 +2817,16 @@ async function loadProjects() {
        <td class="muted">${(p.available_endpoints || []).length} endpoints</td>
        <td><button class="btn sm" onclick="retest(${p.id})">перепроверить</button></td></tr>`).join('')
       : '<tr><td class="muted">Проектов пока нет.</td></tr>';
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    // Та же болезнь, что чинили в loadDashboard/loadMarketer: упавший
+    // запрос только логировался, а таблица проектов пульсировала бы
+    // скелетоном вечно.
+    console.error(e);
+    $('projects-table').tBodies[0].innerHTML =
+      `<tr><td class="error-text">Не удалось загрузить: ${esc(e.message || 'ошибка связи')}. `
+      + `Это сбой запроса, а не «данных нет» — обновите страницу или попробуйте позже.</td></tr>`;
+  }
 }
 // Сбор включается и выключается у каждого проекта отдельно: планировщик
 // обходит все включённые, поэтому «включить свой» больше не значит
