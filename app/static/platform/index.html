@@ -2390,7 +2390,17 @@ async function loadMarketer() {
     $('ads-note').textContent = 'Расход известен только по Директу, поэтому цена регистрации '
       + 'считается для него. Прочерк в расходе не значит «бесплатно» — значит «мы этого не знаем».'
       + (a.as_of ? ' Данные на ' + a.as_of.slice(0,16).replace('T',' ') + '.' : '');
-  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+  } catch (e) {
+    if (e.message === 'unauthorized') return;
+    // Раньше упавший /api/ads только логировался в консоль -- KPI и таблица
+    // источников так и оставались скелетоном навсегда, будто ответ вот-вот
+    // придёт (та же болезнь, что чинили в loadDashboard).
+    console.error(e);
+    failCard('ads-kpis', e.message);
+    $('ads-table').tBodies[0].innerHTML =
+      `<tr><td class="error-text">Не удалось загрузить: ${esc(e.message || 'ошибка связи')}. `
+      + `Это сбой запроса, а не «данных нет» — обновите страницу или попробуйте позже.</td></tr>`;
+  }
 }
 $('deep-btn').onclick = async () => {
   $('deep-btn').disabled = true;

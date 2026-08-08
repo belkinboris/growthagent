@@ -241,6 +241,36 @@ class TestOverviewFailure:
             assert "не удалось загрузить" in html, f"#{box_id} не показал ошибку: {html!r}"
         page.close()
 
+    def test_broken_ads_clears_marketer_skeletons(self, server, browser):
+        """loadMarketer() на упавшем /api/ads только логировал ошибку в
+        консоль и не трогал разметку -- KPI и таблица источников на вкладке
+        Маркетолога так и оставались скелетоном навсегда."""
+        base, _ = server
+        page, _ = _page(browser)
+        _login_owner(page, base)
+
+        page.route(
+            "**/api/ads",
+            lambda route: route.fulfill(
+                status=500, content_type="application/json",
+                body='{"detail": "тестовый сбой рекламы"}',
+            ),
+        )
+        page.click("#tabs button[data-tab='marketer']")
+        page.wait_for_function(
+            "document.getElementById('ads-kpis').innerText.includes('Не удалось загрузить')",
+            timeout=10000,
+        )
+
+        kpis_html = page.eval_on_selector("#ads-kpis", "el => el.innerHTML").lower()
+        assert "skel" not in kpis_html, "KPI рекламы остались скелетоном после упавшего /api/ads"
+        assert "не удалось загрузить" in kpis_html
+
+        table_html = page.eval_on_selector("#ads-table tbody", "el => el.innerHTML").lower()
+        assert "skel" not in table_html, "Таблица источников осталась скелетоном после упавшего /api/ads"
+        assert "не удалось загрузить" in table_html
+        page.close()
+
 
 class TestTabsAndProjects:
     def test_every_tab_opens_without_js_errors(self, server, browser):
