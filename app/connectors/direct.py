@@ -70,7 +70,63 @@ def _period_to_dates(period_hours: int) -> tuple:
     return date_from, date_to
 
 
-def _build_report_definition(campaign_ids: list, date_from: str, date_to: str) -> dict:
+# Модель атрибуции по умолчанию. LSCCD -- «последний значимый переход,
+# кросс-девайс»: та же модель, которую Директ показывает в своём
+# интерфейсе, поэтому числа в платформе и в кабинете сходятся. Если
+# запросить другую, владелец увидит расхождение и справедливо решит, что
+# врёт платформа.
+DEFAULT_ATTRIBUTION_MODEL = "LSCCD"
+
+
+def _with_goals(params: dict, goal_ids: Optional[list],
+                attribution_model: str = DEFAULT_ATTRIBUTION_MODEL) -> dict:
+    """
+    Добавляет к отчёту конверсии по целям Метрики.
+
+    Goals и AttributionModels лежат в корне params -- РЯДОМ с
+    SelectionCriteria, а не внутри неё (частая ошибка: внутри критериев
+    API их молча игнорирует, отчёт приходит без колонок конверсий и
+    выглядит как «целей нет»).
+
+    Колонки в ответе называются Conversions_<GoalId>_<Model> -- по одной
+    на каждую пару цель/модель, поэтому парсер ищет их по префиксу, а не
+    по фиксированному имени.
+    """
+    if not goal_ids:
+        return params
+    params["Goals"] = [str(g) for g in goal_ids]
+    params["AttributionModels"] = [attribution_model]
+    field_names = params.get("FieldNames") or []
+    if "Conversions" not in field_names:
+        field_names.append("Conversions")
+    params["FieldNames"] = field_names
+    return params
+
+
+def _conversions_from_row(row: dict) -> dict:
+    """
+    Достаёт из строки отчёта конверсии по целям: {goal_id: количество}.
+
+    Пустое значение приходит как "--" (так Директ обозначает «нет
+    данных») -- это ноль конверсий, а не ошибка разбора.
+    """
+    out: dict = {}
+    for key, value in row.items():
+        if not key.startswith("Conversions_"):
+            continue
+        parts = key.split("_")
+        if len(parts) < 2:
+            continue
+        goal_id = parts[1]
+        try:
+            out[goal_id] = int(float(value))
+        except (TypeError, ValueError):
+            out[goal_id] = 0
+    return out
+
+
+def _build_report_definition(campaign_ids: list, date_from: str, date_to: str,
+                             goal_ids: Optional[list] = None) -> dict:
     selection_criteria = {"DateFrom": date_from, "DateTo": date_to}
     if campaign_ids:
         selection_criteria["Filter"] = [
@@ -78,7 +134,7 @@ def _build_report_definition(campaign_ids: list, date_from: str, date_to: str) -
         ]
 
     return {
-        "params": {
+        "params": _with_goals({
             "SelectionCriteria": selection_criteria,
             "FieldNames": [
                 "CampaignId",
@@ -95,7 +151,7 @@ def _build_report_definition(campaign_ids: list, date_from: str, date_to: str) -
             "Format": "TSV",
             "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
-        }
+        }, goal_ids)
     }
 
 
@@ -283,10 +339,17 @@ async def fetch_metrics(
     sandbox: bool = False,
     timeout_seconds: float = 30.0,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    goal_ids: Optional[list] = None,
 ) -> dict:
     """
     Campaign-level summary (как было). Возвращает dict: spend, clicks,
     impressions, ctr, cpc, campaigns_count, "_diagnostics".
+
+    goal_ids -- цели Метрики, по которым нужны конверсии. Если заданы,
+    в ответе появляется "conversions" ({goal_id: количество}) и
+    "campaigns" (построчно, с конверсиями каждой кампании) -- без этого
+    платформа видит только расход и не может сказать, КАКАЯ кампания
+    приводит людей, которые платят.
 
     campaign_ids может быть пустым списком -- тогда отчёт строится по ВСЕМ
     кампаниям аккаунта (без фильтра CampaignId). Это сознательное
@@ -301,7 +364,7 @@ async def fetch_metrics(
         raise NotConfiguredError("DIRECT_OAUTH_TOKEN (or YANDEX_OAUTH_TOKEN) or DIRECT_CLIENT_LOGIN not set")
 
     date_from, date_to = _period_to_dates(period_hours)
-    report_definition = _build_report_definition(campaign_ids, date_from, date_to)
+    report_definition = _build_report_definition(campaign_ids, date_from, date_to, goal_ids)
 
     text, attempt_statuses = await _execute_report_request(
         report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
@@ -318,6 +381,25 @@ def _handle_success(text: str, attempt_statuses: list, date_from: str, date_to: 
         result = {"spend": 0.0, "clicks": 0, "impressions": 0, "ctr": 0.0, "cpc": 0.0, "campaigns_count": 0}
     else:
         result = _aggregate_rows(data_rows)
+        # Конверсии появляются в ответе, только если в запросе были Goals.
+        # Разбираем их отдельно от денег: суммарно (для экономики) и
+        # построчно (чтобы было видно, какая кампания их приносит).
+        campaigns = []
+        totals: dict = {}
+        for row in data_rows:
+            row_conversions = _conversions_from_row(row)
+            for goal_id, count in row_conversions.items():
+                totals[goal_id] = totals.get(goal_id, 0) + count
+            if row_conversions:
+                campaigns.append({
+                    "campaign_id": row.get("CampaignId", ""),
+                    "campaign_name": row.get("CampaignName", ""),
+                    **_row_metrics(row),
+                    "conversions": row_conversions,
+                })
+        if totals:
+            result["conversions"] = totals
+            result["campaigns"] = campaigns
 
     result["_diagnostics"] = {
         "attempt_statuses": attempt_statuses,
@@ -339,7 +421,8 @@ def _handle_success(text: str, attempt_statuses: list, date_from: str, date_to: 
 # добавлен отдельно, если понадобится, без изменения существующих функций.
 
 
-def _build_ad_group_report_definition(campaign_ids: list, date_from: str, date_to: str) -> dict:
+def _build_ad_group_report_definition(campaign_ids: list, date_from: str, date_to: str,
+                                      goal_ids: Optional[list] = None) -> dict:
     selection_criteria = {"DateFrom": date_from, "DateTo": date_to}
     if campaign_ids:
         selection_criteria["Filter"] = [
@@ -347,7 +430,7 @@ def _build_ad_group_report_definition(campaign_ids: list, date_from: str, date_t
         ]
 
     return {
-        "params": {
+        "params": _with_goals({
             "SelectionCriteria": selection_criteria,
             "FieldNames": [
                 "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
@@ -359,11 +442,12 @@ def _build_ad_group_report_definition(campaign_ids: list, date_from: str, date_t
             "Format": "TSV",
             "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
-        }
+        }, goal_ids)
     }
 
 
-def _build_search_query_report_definition(campaign_ids: list, date_from: str, date_to: str) -> dict:
+def _build_search_query_report_definition(campaign_ids: list, date_from: str, date_to: str,
+                                          goal_ids: Optional[list] = None) -> dict:
     selection_criteria = {"DateFrom": date_from, "DateTo": date_to}
     if campaign_ids:
         selection_criteria["Filter"] = [
@@ -371,7 +455,7 @@ def _build_search_query_report_definition(campaign_ids: list, date_from: str, da
         ]
 
     return {
-        "params": {
+        "params": _with_goals({
             "SelectionCriteria": selection_criteria,
             # AdGroupName в SEARCH_QUERY_PERFORMANCE_REPORT не всегда
             # доступен (зависит от типа кампании) -- запрашиваем, но
@@ -387,7 +471,7 @@ def _build_search_query_report_definition(campaign_ids: list, date_from: str, da
             "Format": "TSV",
             "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
-        }
+        }, goal_ids)
     }
 
 

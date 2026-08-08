@@ -684,6 +684,11 @@
       Если источник даёт регистрации, но не даёт оплат, проблема не в рекламе,
       а в продукте после регистрации.</p>
     <div id="ads-optional" class="hidden"></div>
+    <!-- Окупаемость идёт ПЕРВОЙ, до таблицы источников. Цена регистрации
+         сама по себе не отвечает на вопрос «я зарабатываю или теряю» --
+         владелец смотрел на приличные 300 ₽ за регистрацию и не видел,
+         что теряет деньги (см. app/ad_economics.py). -->
+    <div id="ads-economics" style="margin-bottom:16px"></div>
     <div class="kpis" id="ads-kpis" style="margin-bottom:16px"></div>
     <div class="card">
       <h2>Откуда приходят и что из этого выходит<span class="spacer"></span>
@@ -1443,8 +1448,22 @@ function renderToday(r) {
     });
   });
 
-  // Идущая проверка — не шаг (делать ничего не нужно), а строка состояния.
+  // Идущая проверка обычно не шаг, а строка состояния. Но если у принятой
+  // рекомендации есть работа, которую вносит человек (правка инструкций ИИ,
+  // текста, цены), — это самый настоящий шаг на сегодня, и он идёт в список
+  // первым. Иначе доска говорит «ничего не требуется» человеку, который
+  // только что нажал «Принять» и ждёт указаний (дефект 08.08.2026).
   const running = (r.cards || []).find(c => c.source === 'experiment');
+  const pendingWork = running && (running.change_set || []).length ? running : null;
+  if (pendingWork) {
+    steps.unshift({
+      who: pendingWork.agent_title,
+      title: pendingWork.title + ' — сделайте правку',
+      text: 'Это вносите вы, руками: ' + (pendingWork.change_set || []).join('; ')
+            + '. Пока правка не внесена, проверять нечего.',
+      buttons: [{label: 'Подробнее', on: `switchTab('tester')`}],
+    });
+  }
 
   const SHOW = 3;
   const extra = steps.length - SHOW;
@@ -1460,11 +1479,15 @@ function renderToday(r) {
         </div>
       </div>`).join('')
       + (extra > 0 ? `<p class="muted" style="margin:10px 0 0">И ещё ${extra} — в подробностях ниже.</p>` : '')
+    // «Ничего не меняйте» уместно, только когда правка уже внесена: пока она
+    // ждёт владельца, та же фраза прямо противоречит шагу выше.
     : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
        <p class="muted" style="margin:6px 0 0">Агенты продолжают наблюдать. Как только появится
        проблема или готовое предложение, здесь будет короткий список шагов.</p>`)
-    + (running ? `<p class="muted" style="margin:12px 0 0">⏳ ${esc(running.tested_by || 'Идёт проверка')} —
-       во время проверки ничего не меняйте, иначе результат ничего не докажет.</p>` : '');
+    + (running ? `<p class="muted" style="margin:12px 0 0">⏳ ${esc(running.tested_by || 'Идёт проверка')} — ${
+       pendingWork
+         ? 'счётчик идёт, но пока правка не внесена, он меряет старую версию.'
+         : 'во время проверки больше ничего не меняйте, иначе результат ничего не докажет.'}</p>` : '');
 }
 
 // «Агенты сделали сами» — отчёт о выполненной работе. Вопросы агентов
@@ -1829,10 +1852,15 @@ function renderDecision(g) {
       ${e.hypothesis ? `<div class="body">${esc(e.hypothesis)}</div>` : ''}
       <div class="progress"><div style="width:${Math.min(100, done / target * 100)}%"></div></div>
       <p class="muted">Набрано ${done} из ${target}${e.sample_metric_title ? ' (' + esc(e.sample_metric_title) + ')' : ''} · с ${e.started_at.slice(0,10)}</p>
-      <div class="locked" style="border-left:3px solid var(--good)">
+      ${(e.change_set && e.change_set.length) ? `<div class="locked" style="border-left:3px solid var(--warning)">
+        <b>Это нужно сделать вам, руками — платформа не может сделать это за вас:</b>
+        <ul class="plain" style="margin:8px 0 0">${e.change_set.map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+        <p class="muted" style="margin:8px 0 0">Пока правка не внесена, счётчик ниже наберётся,
+        но проверять будет нечего — вердикт получится про старую версию.</p>
+      </div>` : `<div class="locked" style="border-left:3px solid var(--good)">
         ✋ От вас сейчас ничего не нужно — мы просто ждём, пока наберётся выборка,
         и сами скажем, помогло ли.
-      </div>
+      </div>`}
       ${e.locked_variables.length ? `<div class="locked">🔒 Пока проверка идёт, не меняем:
         ${e.locked_variables.map(esc).join(', ')}</div>` : ''}
       ${e.success_criterion ? `<p class="muted" style="margin:10px 0 0">Проверка удалась, если: ${esc(e.success_criterion)}</p>` : ''}
@@ -2333,6 +2361,33 @@ function renderOptionalSources(sources, hasDirectData) {
   }).join('');
 }
 
+// Окупаемость рекламы. Главная карточка Маркетолога: отвечает не «сколько
+// стоит регистрация», а «я зарабатываю или теряю» -- владелец смотрел на
+// приемлемую цену регистрации и не видел убытка (см. app/ad_economics.py).
+function renderAdEconomics(e) {
+  const box = $('ads-economics');
+  if (!box) return;
+  if (!e || !e.ok) {
+    box.innerHTML = e && e.hint
+      ? `<div class="card"><h2>Окупается ли реклама</h2>
+           <p class="muted" style="margin:0">${esc(e.hint)}</p></div>`
+      : '';
+    return;
+  }
+  // Цвет по вердикту: убыток нельзя показывать нейтрально -- это главное,
+  // что владелец должен унести с экрана.
+  const colour = e.verdict === 'теряем' ? 'var(--critical)'
+    : e.verdict === 'окупается' ? 'var(--good)' : 'var(--warning)';
+  box.innerHTML = `<div class="card" style="border-left:3px solid ${colour}">
+    <h2>Окупается ли реклама</h2>
+    <p style="font-size:18px;font-weight:600;margin:0 0 10px">${esc(e.headline)}</p>
+    <ul class="plain">${(e.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+    ${e.action ? `<div class="locked" style="border-left:3px solid ${colour};margin-top:12px">
+      <b>Что делать:</b> ${esc(e.action)}</div>` : ''}
+    ${e.confidence_note ? `<p class="muted" style="margin:10px 0 0">${esc(e.confidence_note)}</p>` : ''}
+  </div>`;
+}
+
 async function loadMarketer() {
   loadNegatives();
   loadSources();
@@ -2346,6 +2401,7 @@ async function loadMarketer() {
     // она может врать. Если расход и клики пришли — Директ работает,
     // что бы ни было записано в статусе.
     renderOptionalSources(a.sources || {}, t.spend != null || t.clicks != null);
+    renderAdEconomics(a.economics);
     $('ads-kpis').innerHTML = [
       {label:'Расход', value: t.spend, sub:'₽ за 7 дней'},
       {label:'Клики', value: t.clicks, sub:'Яндекс.Директ'},

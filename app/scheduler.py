@@ -246,6 +246,11 @@ async def _fetch_direct_metrics(period_hours: int) -> tuple[dict | None, str | N
                 sandbox=settings.direct_sandbox,
                 timeout_seconds=DIRECT_SUMMARY_TIMEOUT_SECONDS,
                 max_retries=DIRECT_SUMMARY_MAX_RETRIES,
+                # Без целей отчёт показывает только расход, и платформа не
+                # может сказать, какая кампания приводит платящих. Берём те
+                # же цели, что уже настроены для Метрики -- отдельной
+                # настройки для этого заводить не нужно.
+                goal_ids=list((settings.metrika_goal_ids or {}).values()),
             ),
             CONNECTOR_CALL_TIMEOUT_SECONDS,
             "Direct summary",

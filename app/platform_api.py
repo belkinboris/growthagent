@@ -37,7 +37,7 @@ from app.config import (
     RUN_CYCLE_TIMEOUT_SECONDS,
     get_settings,
 )
-from app import accounts, connect_snippets
+from app import accounts, ad_economics, connect_snippets
 from app.error_text import humanize_error
 from app.readiness import (
     CHECKS,
@@ -721,6 +721,7 @@ async def growth_state(identity=Depends(require_admin)):
     """Состояние цикла роста: что предложено, что идёт, чем закончилось."""
     from app import growth_loop
     from app.commercial_report import build_experiment_block, build_verdict_block
+    from app.models import GrowthRecommendation
 
     with get_session() as session:
         project = _active_project(session, identity)
@@ -737,12 +738,23 @@ async def growth_state(identity=Depends(require_admin)):
             out["recommendation"] = _rec_to_dict(rec)
         if running is not None:
             progress = growth_loop.experiment_progress(running, pp)
+            # Что владелец должен сделать РУКАМИ. Дефект с живого продукта
+            # (08.08.2026): после «Принять» карточка рекомендации исчезала, а
+            # на её месте появлялась плашка «от вас ничего не нужно» -- и
+            # список изменений пропадал с экрана совсем. Но платформа не
+            # умеет менять чужой продукт: инструкции ИИ в АвтоПосте правит
+            # человек. Получалось, что мы обещали ждать результат правки,
+            # которую никто не сделал. Список берём по уже существующей
+            # связи recommendation_id, без новой колонки в таблице.
+            source_rec = session.get(GrowthRecommendation, running.recommendation_id)
             out["experiment"] = {
                 "id": running.id,
                 "title": running.title,
                 "area": running.area,
                 "area_title": AREA_TITLES.get(running.area, running.area),
                 "hypothesis": running.hypothesis,
+                "change_set": (source_rec.change_set_json or []) if source_rec else [],
+                "action": source_rec.action if source_rec else "",
                 "primary_metric": running.primary_metric,
                 "sample_metric": running.sample_metric,
                 "sample_metric_title": _metric_title(running.sample_metric),
@@ -907,7 +919,7 @@ async def dashboard(identity=Depends(require_admin)):
     """Открытые проблемы всех агентов одним списком -- доска фаундера."""
     from app import growth_loop
     from app.diagnosis import diagnose
-    from app.models import AgentAction
+    from app.models import AgentAction, GrowthRecommendation
     from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
 
     with get_session() as session:
@@ -970,10 +982,17 @@ async def dashboard(identity=Depends(require_admin)):
         # идёт, и владельцу важно видеть её на доске, а не только во вкладке
         # Тестировщика.
         agent = AREA_TO_AGENT.get(running.area, "diagnostician")
+        # Правку вносит владелец руками -- платформа не имеет доступа на
+        # запись в чужой продукт. Пока она не внесена, «идёт проверка» на
+        # доске означает не «ждём», а «ждём ВАС»: именно на этом владелец
+        # застрял 08.08.2026, приняв рекомендацию и увидев «ничего не
+        # требуется» (см. tests/test_experiment_change_set.py).
+        source_rec = session.get(GrowthRecommendation, running.recommendation_id)
         cards.append({
             "agent": agent, "agent_title": AGENT_TITLES[agent],
             "source": "experiment", "id": running.id, "severity": None,
             "title": running.title, "message": running.hypothesis,
+            "change_set": (source_rec.change_set_json or []) if source_rec else [],
             "found_by": f"{AGENT_TITLES[agent]} предложил",
             "tested_by": f"{AGENT_TITLES['tester']} проверяет: "
                         f"{running.current_sample}/{running.target_sample}",
@@ -1473,8 +1492,21 @@ async def ads_overview(identity=Depends(require_admin)):
     direct_regs = next((r["registrations"] for r in rows
                         if r["source"] in ("yandex_direct", "direct")), None)
     cpa_base = direct_regs if direct_regs else (pp or {}).get("registrations")
+
+    # Окупаемость. Цена регистрации сама по себе ни о чём не говорит: 300 ₽
+    # за регистрацию — это дёшево или разорительно в зависимости от того,
+    # сколько регистраций доходит до оплаты и сколько приносит оплата.
+    # Считаем это отдельно и явно (см. app/ad_economics.py).
+    economics = ad_economics.analyse(
+        spend=spend,
+        registrations=cpa_base,
+        payments=(pp or {}).get("payment_success"),
+        revenue=getattr(metrics, "revenue", None) if metrics else None,
+    ).as_dict()
+
     return {
         "period": "7d",
+        "economics": economics,
         "totals": {
             "spend": spend,
             "clicks": clicks,
