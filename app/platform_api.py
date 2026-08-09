@@ -919,8 +919,13 @@ async def dashboard(identity=Depends(require_admin)):
     """Открытые проблемы всех агентов одним списком -- доска фаундера."""
     from app import growth_loop
     from app.diagnosis import diagnose
-    from app.models import AgentAction, GrowthRecommendation
-    from app.service import PAYMENT_PATH_CACHE_PERIOD_KEY, get_cached_diagnostics
+    from app import course as course_mod
+    from app.models import AgentAction, GrowthExperiment, GrowthRecommendation, utcnow
+    from app.service import (
+        PAYMENT_PATH_CACHE_PERIOD_KEY,
+        extract_normalized_metrics_from_snapshot,
+        get_cached_diagnostics,
+    )
 
     with get_session() as session:
         project = _active_project(session, identity)
@@ -931,6 +936,34 @@ async def dashboard(identity=Depends(require_admin)):
         pp_cached = get_cached_diagnostics(session, project.id, PAYMENT_PATH_CACHE_PERIOD_KEY)
         pp_dict = dict(pp_cached.result_json or {}) if (pp_cached and pp_cached.ok) else None
         diagnosis = diagnose(pp_dict).as_dict()
+
+        # Курс продукта (R12): движется ли он вообще. Недельные точки берём
+        # из тех же снимков 7d, что и сравнение недель (D2): один снимок на
+        # календарную неделю, последние 6 недель. Без этого доска могла
+        # месяц писать «всё в норме», пока рост стоял на нуле.
+        week_rows = session.exec(
+            select(MetricSnapshot)
+            .where(MetricSnapshot.project_id == project.id)
+            .where(MetricSnapshot.period_key == "7d")
+            .where(MetricSnapshot.source.in_(("combined", "project_metrics_api")))
+            .order_by(MetricSnapshot.created_at.desc())
+            .limit(300)  # ~6 недель снимков раз в 3 часа; потолок от раздувания
+        ).all()
+        by_week: dict = {}
+        for snap in week_rows:  # rows идут новые -> старые; первый в неделе = свежайший
+            week_key = snap.created_at.isocalendar()[:2]
+            if week_key not in by_week:
+                by_week[week_key] = extract_normalized_metrics_from_snapshot(snap)
+        weekly_points = [by_week[k] for k in sorted(by_week)][-6:]
+
+        month_ago = utcnow() - timedelta(days=28)
+        finished_experiments = len(session.exec(
+            select(GrowthExperiment)
+            .where(GrowthExperiment.project_id == project.id)
+            .where(GrowthExperiment.ended_at != None)  # noqa: E711 -- SQLAlchemy
+            .where(GrowthExperiment.ended_at >= month_ago)
+        ).all())
+        course = course_mod.assess(weekly_points, finished_experiments).as_dict()
 
         alert_rows = session.exec(
             select(Alert).where(Alert.project_id == project.id, _visible_alerts_filter())
@@ -1003,6 +1036,7 @@ async def dashboard(identity=Depends(require_admin)):
         "cards": cards, "hint": None if cards else
             "Открытых проблем нет: по всем проверяемым правилам всё в норме.",
         "diagnosis": diagnosis,
+        "course": course,
         "autonomy_level": level,
         "autonomy_levels": {str(k): v for k, v in AUTONOMY_LEVELS.items()},
         "agent_actions": [_agent_action_to_dict(a) for a in agent_action_rows],

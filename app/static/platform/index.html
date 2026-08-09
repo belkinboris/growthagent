@@ -521,6 +521,15 @@
       <div id="diagnosis-body"><div class="skel w80"></div><div class="skel w60"></div></div>
     </div>
 
+    <!-- Курс продукта (R12): движется ли он вообще за последние недели.
+         Правила ниже смотрят на один срез; эта карточка — на месяц. Пока
+         она молчала, доска могла месяц писать «всё в норме» стоящему на
+         месте продукту. Скрыта, пока недель наблюдений меньше трёх. -->
+    <div class="card hero hidden" id="course-card">
+      <h2>Куда движется продукт<span class="spacer"></span><span class="muted" id="course-weeks"></span></h2>
+      <div id="course-body"></div>
+    </div>
+
     <!-- Готовые шаги: нумерованный короткий список, а не сырьё из сигналов,
          рекомендаций и лент. Всё, из чего он собран, — в подробностях ниже. -->
     <div class="card hero" id="today-card">
@@ -1366,6 +1375,7 @@ async function loadDashboardProblems() {
     const r = await api('/api/dashboard');
     window._problemCards = r.cards;
     renderDiagnosis(r.diagnosis);
+    renderCourse(r.course);
     renderToday(r);
     renderAgentsDone(r.agent_actions || []);
     renderProblemsDetails(r);
@@ -1376,6 +1386,33 @@ async function loadDashboardProblems() {
     failCard('today-body', e.message);
     box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
   }
+}
+
+// Курс продукта. Карточка появляется только когда есть что сказать
+// (3+ недель наблюдений): пустое место честнее преждевременного «тренда».
+// Пока продукт растёт, она тихая — одна зелёная строка, без советов:
+// советы под руку раздражают ровно тогда, когда всё и так работает.
+function renderCourse(c) {
+  const card = $('course-card');
+  if (!card) return;
+  if (!c || (!c.ok && !c.hint)) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  $('course-weeks').textContent = c.weeks ? `последние ${c.weeks} нед.` : '';
+  const body = $('course-body');
+  if (!c.ok) {
+    body.innerHTML = `<p class="muted" style="margin:0">${esc(c.hint)}</p>`;
+    return;
+  }
+  if (!c.stalled) {
+    body.innerHTML = `<p style="margin:0;color:var(--good);font-weight:600">✓ ${esc(c.headline)}</p>
+      ${(c.evidence || []).map(x => `<p class="muted" style="margin:6px 0 0">${esc(x)}</p>`).join('')}`;
+    return;
+  }
+  body.innerHTML = `
+    <p style="font-size:18px;font-weight:600;margin:0 0 10px;color:var(--serious)">${esc(c.headline)}</p>
+    <ul class="plain">${(c.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+    ${c.dead_end_note ? `<div class="locked" style="border-left:3px solid var(--critical);margin-top:10px">${esc(c.dead_end_note)}</div>` : ''}
+    ${c.action ? `<div class="locked" style="border-left:3px solid var(--serious);margin-top:10px"><b>Следующий шаг к product-market fit:</b> ${esc(c.action)}</div>` : ''}`;
 }
 
 // Разбор воронки. Вывод крупно, обоснование — под свёрнутой строкой:
@@ -1479,11 +1516,17 @@ function renderToday(r) {
         </div>
       </div>`).join('')
       + (extra > 0 ? `<p class="muted" style="margin:10px 0 0">И ещё ${extra} — в подробностях ниже.</p>` : '')
-    // «Ничего не меняйте» уместно, только когда правка уже внесена: пока она
-    // ждёт владельца, та же фраза прямо противоречит шагу выше.
-    : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
+    // Пустой список шагов при застое (R12) — не «всё в норме», а самое
+    // важное дело дня: продукт стоит. Совет о застое появляется ЗДЕСЬ
+    // только когда других шагов нет — если фаундер уже занят правкой или
+    // сигналами, под руку не лезем (карточка курса выше и так всё говорит).
+    : ((r.course && r.course.ok && r.course.stalled)
+      ? `<p style="margin:0;font-weight:600;color:var(--serious)">${esc(r.course.headline)}.</p>
+         <p class="muted" style="margin:6px 0 0">По отдельным правилам всё «в норме» — но это и есть
+         главная проблема: норма месяца — застой. Что делать — в карточке «Куда движется продукт» выше.</p>`
+      : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
        <p class="muted" style="margin:6px 0 0">Агенты продолжают наблюдать. Как только появится
-       проблема или готовое предложение, здесь будет короткий список шагов.</p>`)
+       проблема или готовое предложение, здесь будет короткий список шагов.</p>`))
     + (running ? `<p class="muted" style="margin:12px 0 0">⏳ ${esc(running.tested_by || 'Идёт проверка')} — ${
        pendingWork
          ? 'счётчик идёт, но пока правка не внесена, он меряет старую версию.'
