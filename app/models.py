@@ -722,3 +722,69 @@ class AgentAction(SQLModel, table=True):
     )
     created_at: datetime = Field(default_factory=utcnow, index=True)
     applied_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Электронный сбор ответов от людей (задача R14)
+# ---------------------------------------------------------------------------
+
+
+class UserQuestionStatus(str, Enum):
+    proposed = "proposed"    # аналитик предложил, владелец ещё не разрешил
+    asking = "asking"        # продукт забирает и задаёт вопрос людям
+    done = "done"            # ответов достаточно либо владелец остановил
+    rejected = "rejected"    # владелец отказался спрашивать
+
+
+class UserQuestion(SQLModel, table=True):
+    """
+    Один вопрос, который продукт задаёт своим людям от имени аналитика.
+
+    Зачем это существует. До R14 вывод «люди регистрируются и не платят»
+    заканчивался советом владельцу: «сходите и поговорите с пятью
+    незаплатившими». Это ручной труд фаундера — прямая противоположность
+    тому, ради чего платформа делается. Причину неоплаты знают только сами
+    люди, и спросить их должен продукт, а не человек с блокнотом.
+
+    Почему вопрос забирает продукт, а не аналитик рассылает. У аналитика
+    нет и не должно быть доступа к людям: наружу отдаются только анонимные
+    ключи (принцип 4, приватность). Кто такой `u_febdae54` в телеграме,
+    знает только сам продукт. Поэтому направление обратное: продукт
+    спрашивает у платформы «что мне спросить и у кого», сам находит этих
+    людей и сам возвращает ответы обезличенными. Тем же токеном, что уже
+    используется для отметок о выкатке (задача D7).
+
+    segment — на каком шаге застряли те, кого спрашиваем: значение поля
+    stuck_at из user-journeys (см. CONTRACT.md), например "pricing".
+    Продукт сам решает, кому из своих это соответствует.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    segment: str = Field(index=True)          # stuck_at: pricing | first_post | ...
+    question: str                              # текст вопроса, по-русски
+    reason: str = ""                           # почему спрашиваем — владельцу
+    status: UserQuestionStatus = Field(default=UserQuestionStatus.proposed, index=True)
+    target_answers: int = 5                    # сколько ответов считаем достаточным
+    autonomy_level_at_time: int = 1
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+
+
+class UserAnswer(SQLModel, table=True):
+    """
+    Ответ живого человека, пришедший из продукта. Текст — как написали, без
+    правки: пересказ своими словами уже был бы интерпретацией, а ценность
+    здесь именно в формулировках людей.
+
+    user_key — анонимный ключ из контракта, не телеграм-id и не почта.
+    Нужен только чтобы не засчитать одного человека дважды.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    question_id: int = Field(foreign_key="userquestion.id", index=True)
+    user_key: str = Field(index=True)
+    text: str
+    created_at: datetime = Field(default_factory=utcnow, index=True)

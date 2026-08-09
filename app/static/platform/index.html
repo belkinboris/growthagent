@@ -196,6 +196,16 @@
   .locked{background:var(--surface-2);border-radius:var(--r-sm);padding:10px 14px;margin-top:12px;
     font-size:13px;color:var(--text-2)}
 
+  /* Полоса состояния курса. Намеренно НЕ карточка: доска и так плотная,
+     а фаундер просил не заваливать её текстом. Одна строка + ссылка. */
+  .course-strip{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:10px 14px;margin-bottom:16px;border-radius:var(--r-sm);
+    background:var(--surface-2);border-left:3px solid var(--serious);font-size:14px}
+  .course-strip.good{border-left-color:var(--good)}
+  .course-strip .nums{color:var(--text-2);font-variant-numeric:tabular-nums}
+  .course-strip .spacer{flex:1}
+  .course-strip a{color:var(--accent);cursor:pointer;white-space:nowrap}
+
   /* Скелетоны загрузки. Это ФОРМА будущего содержимого, а не данные:
      ни одной цифры до ответа сервера не показываем — иначе нарушили бы
      принцип честности. Пустой экран, наоборот, читается как поломка. */
@@ -521,14 +531,12 @@
       <div id="diagnosis-body"><div class="skel w80"></div><div class="skel w60"></div></div>
     </div>
 
-    <!-- Курс продукта (R12): движется ли он вообще за последние недели.
-         Правила ниже смотрят на один срез; эта карточка — на месяц. Пока
-         она молчала, доска могла месяц писать «всё в норме» стоящему на
-         месте продукту. Скрыта, пока недель наблюдений меньше трёх. -->
-    <div class="card hero hidden" id="course-card">
-      <h2>Куда движется продукт<span class="spacer"></span><span class="muted" id="course-weeks"></span></h2>
-      <div id="course-body"></div>
-    </div>
+    <!-- Курс продукта (R12/R14). На доске — ОДНА строка состояния, не
+         разбор: владелец сказал прямо, что простыню текста читать не
+         хочет, и был прав — фаундер и так знает, что стоит на месте.
+         Полный разбор с числами и вопросом людям живёт у Продакта: PMF —
+         его предмет, а не доски. Скрыта, пока недель меньше трёх. -->
+    <div class="course-strip hidden" id="course-strip"></div>
 
     <!-- Готовые шаги: нумерованный короткий список, а не сырьё из сигналов,
          рекомендаций и лент. Всё, из чего он собран, — в подробностях ниже. -->
@@ -770,6 +778,27 @@
   <div id="view-product" class="hidden">
     <p class="purpose">Зачем этот агент: понять, что людям не нравится в результате --
       по отзывам о первом посте и причинам отказов.</p>
+
+    <!-- Курс продукта: полный разбор живёт здесь, а не на доске. PMF --
+         предмет Продакта; на доске от него остаётся одна строка. -->
+    <div class="card hidden" id="pcourse-card">
+      <h2>Куда движется продукт<span class="spacer"></span>
+        <span class="muted" id="pcourse-weeks"></span></h2>
+      <div id="pcourse-body"></div>
+    </div>
+
+    <!-- Электронный сбор ответов (R14). Раньше вывод «люди не платят»
+         заканчивался советом сходить и поговорить с пятью людьми -- то
+         есть ручной работой фаундера. Спрашивает продукт, платформа
+         формулирует вопрос и собирает ответы. -->
+    <div class="card" id="questions-card">
+      <h2>Спросить людей<span class="spacer"></span>
+        <span class="muted" id="questions-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: причину, по которой человек не заплатил,
+        не видно ни в одной метрике — её знает только он сам. Вопрос задаёт продукт в боте,
+        ответы приходят сюда обезличенными. Ходить и спрашивать никого не нужно.</p>
+      <div id="questions-body">Загрузка…</div>
+    </div>
 
     <!-- Отзывы о результате. Данные уже считал планировщик, но были видны
          только внутри длинных текстовых отчётов -- новой логики здесь нет,
@@ -1400,31 +1429,28 @@ async function loadDashboardProblems() {
   }
 }
 
-// Курс продукта. Карточка появляется только когда есть что сказать
-// (3+ недель наблюдений): пустое место честнее преждевременного «тренда».
-// Пока продукт растёт, она тихая — одна зелёная строка, без советов:
-// советы под руку раздражают ровно тогда, когда всё и так работает.
+// Курс продукта на доске — ОДНА строка, не разбор. Простыню текста
+// фаундер читать не станет (и сказал об этом прямо), а сам факт «стоим
+// на месте» он и так знает. Задача строки — не объяснить, а показать
+// состояние и увести туда, где с ним можно что-то сделать.
+// Пока данных мало — строки нет вовсе: молчание честнее «тренда» по двум
+// точкам. Пока продукт растёт — тихая зелёная строка без советов.
 function renderCourse(c) {
-  const card = $('course-card');
-  if (!card) return;
-  if (!c || (!c.ok && !c.hint)) { card.classList.add('hidden'); return; }
-  card.classList.remove('hidden');
-  $('course-weeks').textContent = c.weeks ? `последние ${c.weeks} нед.` : '';
-  const body = $('course-body');
-  if (!c.ok) {
-    body.innerHTML = `<p class="muted" style="margin:0">${esc(c.hint)}</p>`;
-    return;
-  }
+  const strip = $('course-strip');
+  if (!strip) return;
+  if (!c || !c.ok) { strip.classList.add('hidden'); return; }
+  strip.classList.remove('hidden');
+  strip.classList.toggle('good', !c.stalled);
+
+  const nums = (c.registrations_now != null || c.payments_now != null)
+    ? `<span class="nums">${nf(c.registrations_now)} рег. · ${nf(c.payments_now)} опл. за неделю</span>` : '';
   if (!c.stalled) {
-    body.innerHTML = `<p style="margin:0;color:var(--good);font-weight:600">✓ ${esc(c.headline)}</p>
-      ${(c.evidence || []).map(x => `<p class="muted" style="margin:6px 0 0">${esc(x)}</p>`).join('')}`;
+    strip.innerHTML = `<span>✓ ${esc(c.headline)}</span>${nums}`;
     return;
   }
-  body.innerHTML = `
-    <p style="font-size:18px;font-weight:600;margin:0 0 10px;color:var(--serious)">${esc(c.headline)}</p>
-    <ul class="plain">${(c.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
-    ${c.dead_end_note ? `<div class="locked" style="border-left:3px solid var(--critical);margin-top:10px">${esc(c.dead_end_note)}</div>` : ''}
-    ${c.action ? `<div class="locked" style="border-left:3px solid var(--serious);margin-top:10px"><b>Следующий шаг к product-market fit:</b> ${esc(c.action)}</div>` : ''}`;
+  strip.innerHTML = `<span style="color:var(--serious);font-weight:600">${esc(c.headline)}</span>
+    ${nums}<span class="spacer"></span>
+    <a onclick="switchTab('product')">Разобраться →</a>`;
 }
 
 // Разбор воронки. Вывод крупно, обоснование — под свёрнутой строкой:
@@ -1534,8 +1560,9 @@ function renderToday(r) {
     // сигналами, под руку не лезем (карточка курса выше и так всё говорит).
     : ((r.course && r.course.ok && r.course.stalled)
       ? `<p style="margin:0;font-weight:600;color:var(--serious)">${esc(r.course.headline)}.</p>
-         <p class="muted" style="margin:6px 0 0">По отдельным правилам всё «в норме» — но это и есть
-         главная проблема: норма месяца — застой. Что делать — в карточке «Куда движется продукт» выше.</p>`
+         <p class="muted" style="margin:6px 0 0">Отдельные правила молчат — и это само по себе
+         проблема: норма месяца стала застоем.
+         <a onclick="switchTab('product')" style="color:var(--accent);cursor:pointer">Спросить людей, почему →</a></p>`
       : `<p style="margin:0">Ничего не требуется — по проверяемым правилам всё в норме.</p>
        <p class="muted" style="margin:6px 0 0">Агенты продолжают наблюдать. Как только появится
        проблема или готовое предложение, здесь будет короткий список шагов.</p>`))
@@ -2391,7 +2418,92 @@ $('neg-copy').onclick = async () => {
 };
 
 /* ---------------- Продакт: отзывы о результате ---------------- */
+// Полный разбор курса — на вкладке Продакта (на доске только строка).
+function renderProductCourse(c) {
+  const card = $('pcourse-card');
+  if (!card) return;
+  if (!c || !c.ok) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  $('pcourse-weeks').textContent = c.weeks ? `последние ${c.weeks} нед.` : '';
+  $('pcourse-body').innerHTML = !c.stalled
+    ? `<p style="margin:0;color:var(--good);font-weight:600">✓ ${esc(c.headline)}</p>
+       ${(c.evidence || []).map(x => `<p class="muted" style="margin:6px 0 0">${esc(x)}</p>`).join('')}`
+    : `<p style="font-size:17px;font-weight:600;margin:0 0 10px;color:var(--serious)">${esc(c.headline)}</p>
+       <ul class="plain">${(c.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+       ${c.dead_end_note ? `<div class="locked" style="border-left:3px solid var(--critical)">${esc(c.dead_end_note)}</div>` : ''}`;
+}
+
+// «Спросить людей»: предложение вопроса, ход сбора и сами ответы.
+function renderQuestions(r) {
+  const box = $('questions-body');
+  if (!box) return;
+  const parts = [];
+  if (!r.delivery_ready && r.delivery_hint) {
+    parts.push(`<p class="muted" style="color:var(--serious);margin-top:0">${esc(r.delivery_hint)}</p>`);
+  }
+  for (const q of (r.questions || [])) {
+    const asking = q.status === 'asking';
+    const head = asking
+      ? `Спрашиваем: ${q.count} из ${q.target_answers} ответов`
+      : ({proposed: 'Ждёт вашего решения', done: 'Опрос закрыт',
+          rejected: 'Вы отказались спрашивать'}[q.status] || q.status);
+    parts.push(`<div class="item" style="margin-bottom:14px">
+      <div class="row" style="margin-bottom:6px"><span class="tag${asking ? '' : ' good'}">${esc(head)}</span></div>
+      <p style="margin:0 0 8px"><b>«${esc(q.question)}»</b></p>
+      ${q.answers.length ? `<ul class="plain">${q.answers.map(a =>
+        `<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+      <p class="muted" style="margin:8px 0 0">${esc(q.note)}</p>
+      ${asking ? `<div class="row" style="margin-top:10px">
+        <button class="btn sm" onclick="decideQuestion('stop', ${q.id})">Хватит, остановить</button>
+      </div>` : ''}
+    </div>`);
+  }
+  const s = r.suggestion;
+  if (s) {
+    parts.push(`<div class="locked" style="border-left:3px solid var(--accent)">
+      <p style="margin:0 0 8px">${esc(s.reason)}</p>
+      <p style="margin:0 0 10px">Предлагаю спросить тех, кто застрял на этом шаге:<br>
+        <b>«${esc(s.question)}»</b></p>
+      <div class="row">
+        <button class="btn primary sm" onclick="decideQuestion('ask')">Спросить</button>
+        <button class="btn sm" onclick="decideQuestion('reject')">Не спрашивать</button>
+      </div>
+    </div>`);
+    window._questionSuggestion = s;
+  } else if (!(r.questions || []).length) {
+    parts.push(`<p class="muted" style="margin:0">Спрашивать сейчас не о чем: продукт растёт
+      либо наблюдений пока мало. Вопрос появится сам, когда будет что выяснять — дёргать
+      людей без причины мы не станем.</p>`);
+  }
+  box.innerHTML = parts.join('');
+}
+
+window.decideQuestion = async (action, questionId) => {
+  const s = window._questionSuggestion || {};
+  const body = action === 'ask'
+    ? {action, question: s.question, segment: s.segment, reason: s.reason,
+       target_answers: s.target_answers}
+    : {action, question_id: questionId};
+  try {
+    await api('/api/questions/decide', {method: 'POST', body: JSON.stringify(body)});
+    toast(action === 'ask' ? 'Вопрос ушёл в продукт — ответы появятся здесь.'
+      : 'Готово.', 'ok');
+    loadQuestions();
+  } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
+};
+
+async function loadQuestions() {
+  try {
+    renderQuestions(await api('/api/questions'));
+  } catch (e) {
+    if (e.message !== 'unauthorized') failCard('questions-body', e.message);
+  }
+}
+
 async function loadProduct() {
+  loadQuestions();
+  // Курс считается на доске; берём тот же ответ, чтобы не считать дважды.
+  api('/api/dashboard').then(d => renderProductCourse(d.course)).catch(() => {});
   const box = $('feedback-body');
   box.innerHTML = skelLines(3);
   $('feedback-when').textContent = '';

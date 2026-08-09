@@ -1938,6 +1938,254 @@ async def add_project_change_public(project_id: int, payload: ChangeIn, authoriz
         return {"ok": True, "id": event.id}
 
 
+@router.get("/api/questions", dependencies=[Depends(require_admin)])
+async def owner_questions(identity=Depends(require_admin)):
+    """
+    Спросить людей вместо владельца (задача R14).
+
+    Экран отвечает на вопрос «почему не платят» словами самих людей. Если
+    спрашивать пока не о чем (продукт растёт или данных мало) — вопрос не
+    предлагается вовсе: каждый вопрос тратит терпение живого человека.
+    """
+    from app import course as course_mod
+    from app.models import (
+        MetricSnapshot as _Snap, UserAnswer, UserQuestion, UserQuestionStatus,
+    )
+    from app.questions import plan_for_course, summarize_answers
+    from app.service import extract_normalized_metrics_from_snapshot
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+
+        rows = session.exec(
+            select(UserQuestion)
+            .where(UserQuestion.project_id == project.id)
+            .order_by(UserQuestion.created_at.desc()).limit(10)
+        ).all()
+
+        items = []
+        for q in rows:
+            answers = session.exec(
+                select(UserAnswer).where(UserAnswer.question_id == q.id)
+                .order_by(UserAnswer.created_at.desc())
+            ).all()
+            items.append({
+                "id": q.id, "segment": q.segment, "question": q.question,
+                "reason": q.reason, "status": q.status.value,
+                "target_answers": q.target_answers,
+                **summarize_answers([a.text for a in answers]),
+            })
+
+        # Предложение нового вопроса -- только если ни один не в работе.
+        # Два одновременных вопроса одному человеку превращают продукт в
+        # анкету, и отвечать перестают на оба.
+        busy = any(i["status"] in ("proposed", "asking") for i in items)
+        suggestion = None
+        if not busy:
+            week_rows = session.exec(
+                select(_Snap).where(_Snap.project_id == project.id)
+                .where(_Snap.period_key == "7d")
+                .where(_Snap.source.in_(("combined", "project_metrics_api")))
+                .order_by(_Snap.created_at.desc()).limit(300)
+            ).all()
+            by_week: dict = {}
+            for snap in week_rows:
+                key = snap.created_at.isocalendar()[:2]
+                if key not in by_week:
+                    by_week[key] = extract_normalized_metrics_from_snapshot(snap)
+            course = course_mod.assess([by_week[k] for k in sorted(by_week)][-6:]).as_dict()
+            plan = plan_for_course(course)
+            if plan is not None:
+                suggestion = {
+                    "segment": plan.segment, "question": plan.question,
+                    "reason": plan.reason, "target_answers": plan.target_answers,
+                }
+
+        token_set = bool((project.settings_json or {}).get(INBOUND_TOKEN_KEY))
+
+    return {
+        "questions": items,
+        "suggestion": suggestion,
+        # Без токена продукт физически не сможет забрать вопрос -- честнее
+        # сказать это сразу, чем показать «спрашиваем» и молча не спросить.
+        "delivery_ready": token_set,
+        "delivery_hint": None if token_set else (
+            "Продукт пока не сможет забрать вопрос: на вкладке «Проекты» "
+            "нужно выпустить токен для автоматических отметок — он же "
+            "используется для вопросов."
+        ),
+    }
+
+
+class QuestionDecision(BaseModel):
+    action: str                    # ask | reject | stop
+    question: str | None = None
+    segment: str | None = None
+    reason: str | None = None
+    target_answers: int | None = None
+    question_id: int | None = None
+
+
+@router.post("/api/questions/decide", dependencies=[Depends(require_admin)])
+async def decide_question(payload: QuestionDecision, identity=Depends(require_admin)):
+    """
+    Решение владельца по вопросу к людям.
+
+    Спросить живых людей -- действие наружу, поэтому оно проходит через
+    ту же ручку автономии, что и правки рекламы (задача F6): на уровне 1
+    вопрос задаётся только после кнопки владельца. Автоматически, без
+    кнопки, вопрос уходит на уровне 2 и выше -- это делает планировщик,
+    не этот endpoint.
+    """
+    from app.models import UserQuestion, UserQuestionStatus, utcnow
+    from app.questions import DEFAULT_TARGET_ANSWERS
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+
+        if payload.action == "ask":
+            question = (payload.question or "").strip()
+            if not question:
+                raise HTTPException(status_code=400, detail="Пустой вопрос")
+            row = UserQuestion(
+                project_id=project.id,
+                segment=(payload.segment or "pricing").strip(),
+                question=question,
+                reason=(payload.reason or "").strip(),
+                status=UserQuestionStatus.asking,
+                target_answers=payload.target_answers or DEFAULT_TARGET_ANSWERS,
+                autonomy_level_at_time=autonomy_level(project),
+                started_at=utcnow(),
+            )
+            session.add(row)
+            session.commit()
+            _record_action(session, identity, "question_started",
+                           f"Разрешил спросить людей: {question[:80]}",
+                           project_id=project.id)
+            return {"ok": True, "id": row.id}
+
+        if payload.question_id is None:
+            raise HTTPException(status_code=400, detail="Не указан вопрос")
+        row = session.get(UserQuestion, payload.question_id)
+        if row is None or row.project_id != project.id:
+            raise HTTPException(status_code=404, detail="Вопрос не найден")
+
+        row.status = (UserQuestionStatus.rejected if payload.action == "reject"
+                      else UserQuestionStatus.done)
+        row.ended_at = utcnow()
+        session.add(row)
+        session.commit()
+        _record_action(session, identity, f"question_{payload.action}",
+                       f"Вопрос людям: {payload.action}", project_id=project.id)
+    return {"ok": True}
+
+
+def _project_by_inbound_token(session, project_id: int, authorization: str | None):
+    """
+    Общая проверка токена машины для публичных входов продукта. Вынесена,
+    чтобы вопросы/ответы и отметки о выкатке не разошлись в том, как
+    проверяют доступ.
+    """
+    from app import accounts
+
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужен заголовок Authorization: Bearer <токен>")
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    stored_hash = (project.settings_json or {}).get(INBOUND_TOKEN_KEY)
+    if not stored_hash or not accounts.verify_password(token, stored_hash):
+        raise HTTPException(status_code=401, detail="Неверный токен")
+    return project
+
+
+class AnswerIn(BaseModel):
+    question_id: int
+    user_key: str
+    text: str
+
+
+@router.get("/api/public/projects/{project_id}/questions")
+async def public_questions(project_id: int, authorization: str | None = Header(default=None)):
+    """
+    Что продукту спросить у своих людей (задача R14).
+
+    Направление именно такое -- продукт ЗАБИРАЕТ вопрос, а не платформа
+    рассылает: у аналитика нет доступа к людям и не должно быть (принцип
+    приватности). Кто такой `u_febdae54` в телеграме, знает только сам
+    продукт; он же решает, кому из своих соответствует сегмент.
+
+    Отдаём только разрешённые к показу вопросы: на уровне автономии 1
+    владелец сначала нажимает кнопку, и до этого продукт вопроса не видит.
+    """
+    from app.models import UserAnswer, UserQuestion, UserQuestionStatus, utcnow
+
+    with get_session() as session:
+        _project_by_inbound_token(session, project_id, authorization)
+        rows = session.exec(
+            select(UserQuestion)
+            .where(UserQuestion.project_id == project_id)
+            .where(UserQuestion.status == UserQuestionStatus.asking)
+            .order_by(UserQuestion.created_at.desc())
+        ).all()
+
+        out = []
+        for q in rows:
+            collected = len(session.exec(
+                select(UserAnswer).where(UserAnswer.question_id == q.id)
+            ).all())
+            # Набрали достаточно -- вопрос закрываем сами, чтобы продукт не
+            # продолжал спрашивать людей без нужды.
+            if collected >= q.target_answers:
+                q.status = UserQuestionStatus.done
+                q.ended_at = utcnow()
+                session.add(q)
+                continue
+            out.append({
+                "id": q.id, "segment": q.segment, "question": q.question,
+                "answers_collected": collected, "answers_needed": q.target_answers,
+            })
+        session.commit()
+
+    return {"ok": True, "questions": out}
+
+
+@router.post("/api/public/projects/{project_id}/answers")
+async def public_answers(project_id: int, payload: AnswerIn,
+                         authorization: str | None = Header(default=None)):
+    """Ответ живого человека из продукта. Текст сохраняется как есть."""
+    from app.models import UserAnswer, UserQuestion
+
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой ответ")
+    user_key = (payload.user_key or "").strip()
+    if not user_key:
+        raise HTTPException(status_code=400, detail="Нужен анонимный user_key")
+
+    with get_session() as session:
+        _project_by_inbound_token(session, project_id, authorization)
+        question = session.get(UserQuestion, payload.question_id)
+        if question is None or question.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Вопрос не найден")
+
+        # Один человек -- один ответ на вопрос: иначе пять реплик одного
+        # разговорчивого пользователя выглядели бы как пять мнений.
+        existing = session.exec(
+            select(UserAnswer)
+            .where(UserAnswer.question_id == question.id)
+            .where(UserAnswer.user_key == user_key)
+        ).first()
+        if existing is not None:
+            return {"ok": True, "duplicate": True}
+
+        session.add(UserAnswer(project_id=project_id, question_id=question.id,
+                               user_key=user_key, text=text[:2000]))
+        session.commit()
+    return {"ok": True, "duplicate": False}
+
+
 @router.get("/api/projects/{project_id}/changes", dependencies=[Depends(require_admin)])
 async def list_project_changes(project_id: int, identity=Depends(require_admin)):
     from app.models import ProjectChangeEvent

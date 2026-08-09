@@ -35,10 +35,16 @@ class TestStalledProduct:
         assert "деньги" in c.headline.lower()
         assert "не заплатил" in c.action or "заплатили" in c.action
 
-    def test_action_is_about_talking_to_users_not_features(self):
-        """Путь к PMF — разговоры с пользователями, не новая кнопка."""
+    def test_action_does_not_send_the_founder_to_interview_people(self):
+        """
+        Возражение владельца (R14): «сходите и поговорите с пятью людьми» --
+        это ручной труд фаундера, ровно то, чего платформа должна его
+        избавить. Спрашивает продукт, а не человек с блокнотом.
+        """
         c = assess(STALLED_MONTH)
-        assert "разговор" in c.action.lower() or "вопрос" in c.action.lower()
+        low = c.action.lower()
+        assert "сам продукт" in low or "задаст" in low
+        assert "поговорите" not in low and "разговоры" not in low
 
     def test_weekly_numbers_are_shown_as_series(self):
         """«16 → 14 → 18 → 17» убедительнее слова «стоит»."""
@@ -55,7 +61,7 @@ class TestStalledProduct:
     def test_general_stall_demands_a_product_level_hypothesis(self):
         c = assess([{"signup": 30, "payment_success": 5}] * 4)
         assert c.stalled
-        assert "гипотезу уровня продукта" in c.action
+        assert "гипотеза уровня продукта" in c.action
 
 
 class TestDeadEndGuard:
