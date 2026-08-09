@@ -523,6 +523,7 @@ async def fetch_ad_group_report(
     max_retries: int = DEFAULT_MAX_RETRIES,
     date_from_override: Optional[str] = None,
     date_to_override: Optional[str] = None,
+    goal_ids: Optional[list] = None,
 ) -> dict:
     """
     Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
@@ -551,7 +552,7 @@ async def fetch_ad_group_report(
         date_from, date_to = date_from_override, date_to_override
     else:
         date_from, date_to = _period_to_dates(period_hours)
-    report_definition = _build_ad_group_report_definition(campaign_ids, date_from, date_to)
+    report_definition = _build_ad_group_report_definition(campaign_ids, date_from, date_to, goal_ids)
 
     text, attempt_statuses = await _execute_report_request(
         report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
@@ -566,6 +567,7 @@ async def fetch_ad_group_report(
             "campaign_name": row.get("CampaignName", ""),
             "ad_group_id": row.get("AdGroupId", ""),
             "ad_group_name": row.get("AdGroupName", ""),
+            "conversions": _conversions_from_row(row),
             **metrics,
         })
 
@@ -590,6 +592,7 @@ async def fetch_search_query_report(
     max_retries: int = DEFAULT_MAX_RETRIES,
     date_from_override: Optional[str] = None,
     date_to_override: Optional[str] = None,
+    goal_ids: Optional[list] = None,
 ) -> dict:
     """
     Возвращает dict: {"rows": [{"campaign_id", "campaign_name", "ad_group_id",
@@ -611,7 +614,7 @@ async def fetch_search_query_report(
         date_from, date_to = date_from_override, date_to_override
     else:
         date_from, date_to = _period_to_dates(period_hours)
-    report_definition = _build_search_query_report_definition(campaign_ids, date_from, date_to)
+    report_definition = _build_search_query_report_definition(campaign_ids, date_from, date_to, goal_ids)
 
     text, attempt_statuses = await _execute_report_request(
         report_definition, oauth_token, client_login, sandbox, timeout_seconds, max_retries,
@@ -633,6 +636,10 @@ async def fetch_search_query_report(
             "ad_group_id": row.get("AdGroupId", ""),
             "ad_group_name": row.get("AdGroupName", ""),
             "query": query,
+            # Конверсии по целям ({goal_id: count}) появляются, только если
+            # запрос шёл с goal_ids -- иначе пустой dict, и вызывающий код
+            # честно не знает про регистрации, а не видит нули.
+            "conversions": _conversions_from_row(row),
             **metrics,
         })
 

@@ -731,6 +731,18 @@
       <div class="report" id="deep-body" style="margin-top:12px"></div>
     </div>
 
+    <!-- Кто вас ищет (R13): та же глубокая проверка, но другой вопрос.
+         Минус-фразы отвечают «что вырезать», эта карточка — «кто мой
+         человек»: запросы-победители в ключевые фразы, слова, приводящие
+         регистрации, и слова, съедающие бюджет впустую. -->
+    <div class="card">
+      <h2>Кто вас ищет<span class="spacer"></span><span class="muted" id="sq-when"></span></h2>
+      <p class="purpose" style="margin-top:0">Зачем: реклама отвечает не только «сколько стоит
+        регистрация», но и «какими словами ищут те, кому вы нужны». Победители — готовые
+        ключевые фразы; слова-транжиры — кандидаты в минус-слова.</p>
+      <div id="sq-body"><p class="muted" style="margin:0">Загрузка…</p></div>
+    </div>
+
     <!-- Готовый список минус-фраз. Аналитик его НЕ применяет: правки
          рекламы делает человек своими руками -- это сознательное
          ограничение продукта. -->
@@ -2269,6 +2281,65 @@ function plural(n, one, few, many) {
   return many;
 }
 
+// «Кто вас ищет» — портрет спроса по поисковым запросам Директа (R13).
+async function loadSearchQueries() {
+  const box = $('sq-body');
+  if (!box) return;
+  try {
+    const r = await api('/api/ads/search-queries');
+    if (!r.ok) {
+      box.innerHTML = `<p class="muted" style="margin:0">${esc(r.hint || 'Данных пока нет.')}</p>`;
+      $('sq-when').textContent = '';
+      return;
+    }
+    $('sq-when').textContent = r.period_label ? `за ${r.period_label}` : '';
+    const p = r.portrait || {};
+    const parts = [];
+
+    if ((p.keyword_candidates || []).length) {
+      parts.push(`<p style="margin:0 0 6px"><b>Запросы, которые приводят людей</b>
+        <span class="muted">— добавьте их ключевыми фразами в Директ:</span></p>
+        <table class="stack"><tbody>${p.keyword_candidates.map(k => `<tr>
+          <td><b>${esc(k.query)}</b></td>
+          <td class="muted" style="white-space:nowrap">${nf(k.registrations)} рег. · ${nf(k.cost)} ₽</td>
+        </tr>`).join('')}</tbody></table>`);
+    }
+    if ((p.converting_words || []).length) {
+      parts.push(`<p style="margin:12px 0 6px"><b>Слова людей, которые регистрируются:</b></p>
+        <p style="margin:0">${p.converting_words.map(w =>
+          `<span class="tag good" style="margin:0 6px 6px 0">${esc(w.word)} · ${nf(w.registrations)}</span>`).join('')}</p>`);
+    }
+    if ((p.wasting_words || []).length) {
+      parts.push(`<p style="margin:12px 0 6px"><b>Слова, на которые деньги уходят впустую</b>
+        <span class="muted">— кандидаты в минус-слова:</span></p>
+        <p style="margin:0">${p.wasting_words.map(w =>
+          `<span class="tag warning" style="margin:0 6px 6px 0">${esc(w.word)} · ${nf(w.cost)} ₽</span>`).join('')}</p>`);
+    }
+    if ((r.watch || []).length) {
+      parts.push(`<p style="margin:12px 0 6px"><b>Под наблюдением</b>
+        <span class="muted">— расход есть, для вывода данных мало:</span></p>
+        <table class="stack"><tbody>${r.watch.slice(0, 5).map(w => `<tr>
+          <td>${esc(w.query)}</td>
+          <td class="muted" style="white-space:nowrap">${nf(w.cost)} ₽ · ${nf(w.clicks)} ${plural(w.clicks || 0, 'клик', 'клика', 'кликов')}</td>
+        </tr>`).join('')}</tbody></table>`);
+    }
+    if (!parts.length) {
+      parts.push(`<p class="muted" style="margin:0">Запросы разобраны (${nf(r.total_queries)}),
+        но ни победителей, ни явных транжир пока не видно — обычно это значит, что данных мало.</p>`);
+    }
+    // Честность про атрибуцию — в конце, но обязательно: без неё «слова
+    // людей, которые регистрируются» строить не из чего.
+    if (!r.has_attribution) {
+      parts.push(`<p class="muted" style="margin:12px 0 0;color:var(--serious)">
+        Регистрации по запросам аналитик пока достоверно не видит${
+        r.attribution_note ? ' — ' + esc(r.attribution_note) : ''} Поэтому здесь только
+        семантика: явный мусор и спорные запросы, без «слов, которые приводят людей».</p>`);
+    }
+    box.innerHTML = parts.join('');
+  } catch (e) { if (e.message !== 'unauthorized') box.innerHTML =
+    `<p class="error-text">${esc(e.message)}</p>`; }
+}
+
 async function loadNegatives() {
   const box = $('neg-body');
   box.innerHTML = skelLines(3);
@@ -2433,6 +2504,7 @@ function renderAdEconomics(e) {
 
 async function loadMarketer() {
   loadNegatives();
+  loadSearchQueries();
   loadSources();
   showSkeleton('ads-kpis', skelKpis(5));
   $('ads-table').tBodies[0].innerHTML = `<tr><td>${skelLines(4)}</td></tr>`;
@@ -2510,6 +2582,9 @@ $('deep-btn').onclick = async () => {
     $('deep-status').textContent = r.ok ? 'Готово' : (r.timeout ? 'Директ не успел ответить' : 'Не получилось');
     $('deep-body').innerHTML = r.text ? renderReport(r.text)
       : `<span class="muted">${esc(r.error || 'Отчёт пуст')}</span>`;
+    // Свежая проверка меняет и «Кто вас ищет», и минус-фразы — обновляем
+    // обе карточки, иначе на экране остаются числа прошлого запуска.
+    if (r.ok) { loadSearchQueries(); loadNegatives(); }
   } catch (e) {
     $('deep-status').textContent = e.message;
   } finally { $('deep-btn').disabled = false; }

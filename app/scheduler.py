@@ -957,12 +957,17 @@ async def run_direct_intelligence_for_project(
             date_from_override, date_to_override,
         )
 
-    # Direct Reports API не поддерживает per-goal разбивку конверсий в
-    # SEARCH_QUERY_PERFORMANCE_REPORT. Поэтому registration_attribution="none"
-    # всегда -- winner/safe-negative строятся только на семантике запросов,
-    # не на данных конверсий из Директа.
-    # registration_goal_id используется только как метаданные для будущей
-    # интеграции с другими источниками (backend truth).
+    # Per-goal конверсии в SEARCH_QUERY_PERFORMANCE_REPORT доступны через
+    # Goals + AttributionModels В КОРНЕ params (задача R11) -- колонки
+    # Conversions_<GoalId>_<Модель>. Старое убеждение «API этого не умеет»
+    # родилось из запроса, который клал Goals внутрь SelectionCriteria, где
+    # API молча их игнорирует. Из-за него winner-классификация месяц жила
+    # на одной семантике, а владелец справедливо говорил «ноль анализа».
+    # Цель регистрации: явная настройка Директа, иначе -- та же цель signup,
+    # что уже настроена для Метрики (это один и тот же счётчик).
+    registration_goal_id = settings.direct_registration_goal_id or (
+        (settings.metrika_goal_ids or {}).get("signup")
+    )
     try:
         raw_report = await _run_with_timeout(
             direct_connector.fetch_search_query_report(
@@ -973,6 +978,7 @@ async def run_direct_intelligence_for_project(
                 sandbox=settings.direct_sandbox,
                 date_from_override=date_from_override,
                 date_to_override=date_to_override,
+                goal_ids=[registration_goal_id] if registration_goal_id else None,
             ),
             CONNECTOR_CALL_TIMEOUT_SECONDS,
             "Direct Intelligence (search query)",
@@ -987,6 +993,13 @@ async def run_direct_intelligence_for_project(
         return {"status": "error", "result": None, "error": str(exc)}
 
     rows = raw_report.get("rows", [])
+    # Конверсии цели регистрации -> поле registrations каждой строки: именно
+    # его читает классификатор. Ключи в conversions -- строки (имена колонок
+    # TSV), поэтому goal_id приводится к str.
+    if registration_goal_id:
+        goal_key = str(registration_goal_id)
+        for row in rows:
+            row["registrations"] = (row.get("conversions") or {}).get(goal_key)
     period_label = f"{date_from_override} — {date_to_override}" if date_from_override else f"{period_hours // 24}д"
 
     # Spend Gate данные: берём из payment_path_data если переданы
@@ -1007,7 +1020,7 @@ async def run_direct_intelligence_for_project(
     di_result = classify_search_queries(
         query_rows=rows,
         period_label=period_label,
-        registration_goal_id=None,   # Direct API не даёт per-goal attribution в SEARCH_QUERY
+        registration_goal_id=registration_goal_id,
         spend_gate_data=spend_gate_data,
     )
 

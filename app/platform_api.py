@@ -2353,6 +2353,57 @@ async def negative_keywords(identity=Depends(require_admin)):
     }
 
 
+@router.get("/api/ads/search-queries", dependencies=[Depends(require_admin)])
+async def search_queries(identity=Depends(require_admin)):
+    """
+    Кто вас ищет: разбор поисковых запросов Директа (задача R13).
+
+    Тот же кэш глубокой проверки, что и у минус-фраз, но другой вопрос:
+    минус-фразы отвечают «что вырезать», этот экран — «кто мой человек»:
+    запросы-победители (готовые ключевые фразы), слова, которые приводят
+    регистрации, и слова, на которые деньги уходят впустую.
+    """
+    from app.query_classifier import build_search_portrait
+    from app.service import DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY, get_cached_diagnostics
+
+    with get_session() as session:
+        project = _active_project(session, identity)
+        cached = get_cached_diagnostics(
+            session, project.id, DIRECT_INTELLIGENCE_CACHE_PERIOD_KEY
+        )
+
+    if cached is None or not cached.ok:
+        return {
+            "ok": False,
+            "hint": "Разбора запросов ещё не было. Нажмите «Проверить глубже» — "
+                    "аналитик заберёт поисковые запросы из Директа и разложит их: "
+                    "кто приносит регистрации, а кто тратит деньги впустую.",
+        }
+
+    data = dict(cached.result_json or {})
+    portrait = build_search_portrait(data)
+    watch_rows = sorted(
+        (data.get("watch") or []), key=lambda r: float(r.get("cost") or 0), reverse=True,
+    )[:10]
+    return {
+        "ok": True,
+        "period_label": data.get("period_label"),
+        "total_queries": data.get("total_queries_analyzed"),
+        "total_spend": data.get("total_spend"),
+        "checked_at": cached.created_at.isoformat() if cached.created_at else None,
+        "portrait": portrait,
+        # Спорные запросы с расходом: человек должен видеть, куда идут
+        # деньги, даже когда алгоритм честно не берётся судить.
+        "watch": [
+            {"query": r.get("query"), "cost": r.get("cost"), "clicks": r.get("clicks"),
+             "registrations": r.get("registrations")}
+            for r in watch_rows
+        ],
+        "attribution_note": data.get("registration_attribution_note") or "",
+        "has_attribution": bool(data.get("has_registration_attribution")),
+    }
+
+
 # ---------------------------------------------------------------------------
 # История решений: что предлагали, что приняли, чем кончилось
 # ---------------------------------------------------------------------------

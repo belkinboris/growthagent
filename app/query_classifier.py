@@ -789,3 +789,106 @@ def classify_search_queries(
                 result.action_items.append(ai)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Портрет спроса: кто и с какими словами ищет (задача R13)
+# ---------------------------------------------------------------------------
+#
+# Жалоба владельца, из которой родился этот блок: «за 100 регистраций
+# аналитик столько выводов мог бы сделать — кто ищет, какие минус-слова и
+# ключевые слова вносить, — а у нас ноль анализа». Классификация выше
+# отвечает по-запросно; портрет складывает те же строки в картину НА УРОВНЕ
+# СЛОВ: какие слова встречаются в запросах, приносящих регистрации, и какие
+# — в запросах, съевших деньги впустую. Слово устойчивее запроса: сам запрос
+# «нейросеть для постов в телеграм канал» может больше не повториться
+# никогда, а слова из него — будут.
+
+# Слова, которые не говорят о человеке ничего (предлоги, союзы, местоимения,
+# служебная лексика поиска). Не пытаемся стеммить и лемматизировать: это
+# частотный портрет для человека, а не NLP-пайплайн.
+_PORTRAIT_STOP_WORDS: frozenset = frozenset([
+    "в", "во", "на", "и", "с", "со", "по", "к", "у", "о", "об", "от", "до",
+    "за", "из", "под", "над", "при", "без", "про", "не", "ли", "же", "бы",
+    "как", "что", "это", "для", "или", "а", "но", "то", "их", "мой", "моя",
+    "свой", "какой", "какая", "какие", "где", "когда", "можно", "нужно",
+    "есть", "чем", "через", "самый", "самая", "лучший", "лучшая", "лучшие",
+    "топ", "top", "the", "a", "an", "of", "for", "in", "on", "to", "и.",
+    "скачать", "бесплатно", "онлайн",  # частотный мусор поиска, не портрет
+])
+
+_WORD_RE = re.compile(r"[a-zа-яё0-9+]{2,}", re.IGNORECASE)
+
+
+def _portrait_words(query: str) -> list:
+    return [w for w in _WORD_RE.findall(query.lower())
+            if w not in _PORTRAIT_STOP_WORDS]
+
+
+def build_search_portrait(result_dict: dict, top_n: int = 8) -> dict:
+    """
+    Складывает классифицированные запросы (to_dict()-форма
+    DirectIntelligenceResult) в портрет спроса.
+
+    Возвращает:
+      converting_words -- [{word, registrations, queries}] слова запросов,
+          принёсших регистрации (только при надёжной атрибуции: без неё
+          список пуст, а не построен на догадке);
+      wasting_words -- [{word, cost, queries}] слова запросов без результата,
+          на которые ушли деньги. Без атрибуции считаем только по заведомому
+          мусору (safe_negatives): у него нерелевантность доказана семантикой;
+      keyword_candidates -- готовые фразы в ключевые слова (запросы-победители);
+      has_attribution -- на чём построен портрет, честно.
+    """
+    has_attribution = bool(result_dict.get("has_registration_attribution"))
+    all_rows = []
+    for bucket in ("winners", "watch", "do_not_touch", "safe_negatives"):
+        all_rows.extend(result_dict.get(bucket) or [])
+
+    converting: dict = {}
+    wasting: dict = {}
+
+    for row in all_rows:
+        words = set(_portrait_words(row.get("query") or ""))
+        if not words:
+            continue
+        regs = row.get("registrations")
+        cost = float(row.get("cost") or 0)
+        if has_attribution and regs:
+            for w in words:
+                slot = converting.setdefault(w, {"word": w, "registrations": 0, "queries": 0})
+                slot["registrations"] += int(regs)
+                slot["queries"] += 1
+        elif cost > 0 and (
+            (has_attribution and not regs)
+            or row.get("label") == "safe_negative"
+        ):
+            for w in words:
+                slot = wasting.setdefault(w, {"word": w, "cost": 0.0, "queries": 0})
+                slot["cost"] += cost
+                slot["queries"] += 1
+
+    # Слово, которое приносит регистрации, не может быть «кандидатом в
+    # минус-слова», даже если оно же встречается в пустых запросах:
+    # заминусовав «нейросеть» из-за одного неудачного запроса, владелец
+    # отрежет и запросы-победители с этим словом.
+    wasting = {w: slot for w, slot in wasting.items() if w not in converting}
+
+    converting_words = sorted(converting.values(),
+                              key=lambda s: s["registrations"], reverse=True)[:top_n]
+    wasting_words = sorted(wasting.values(), key=lambda s: s["cost"], reverse=True)[:top_n]
+    for slot in wasting_words:
+        slot["cost"] = round(slot["cost"], 2)
+
+    keyword_candidates = [
+        {"query": r.get("query"), "registrations": r.get("registrations"),
+         "cost": r.get("cost"), "clicks": r.get("clicks")}
+        for r in (result_dict.get("winners") or [])
+    ]
+
+    return {
+        "has_attribution": has_attribution,
+        "converting_words": converting_words,
+        "wasting_words": wasting_words,
+        "keyword_candidates": keyword_candidates,
+    }
