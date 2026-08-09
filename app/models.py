@@ -686,6 +686,11 @@ class AgentActionStatus(str, Enum):
     applied = "applied"                       # применено (агентом или владельцем)
     rejected = "rejected"                     # владелец отклонил
     blocked_not_configured = "blocked_not_configured"  # хотел применить сам, но запись не настроена
+    # Откачено (задача A1). Новое ЗНАЧЕНИЕ в существующей строковой
+    # колонке -- схема не меняется, ALTER TABLE не нужен. Время и текст
+    # отката кладём в payload_json по той же причине: добавить колонку в
+    # уже живущую таблицу нельзя, create_all() её не создаст.
+    reverted = "reverted"
 
 
 class AgentAction(SQLModel, table=True):

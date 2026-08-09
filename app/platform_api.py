@@ -900,6 +900,7 @@ AGENT_ACTION_STATUS_LABELS = {
     "applied": "применено само",
     "rejected": "отклонено",
     "blocked_not_configured": "не настроено",
+    "reverted": "откачено",
 }
 
 
@@ -911,7 +912,19 @@ def _agent_action_to_dict(a) -> dict:
         "status_label": AGENT_ACTION_STATUS_LABELS.get(a.status, a.status),
         "created_at": a.created_at.isoformat(),
         "applied_at": a.applied_at.isoformat() if a.applied_at else None,
+        # Можно ли вернуть как было -- владельцу важно видеть это ДО того,
+        # как он согласится, а не после (задача A1).
+        "cost_of_error": _reversibility(a.domain).cost_of_error,
+        "revertible": (a.status == "applied"
+                       and _reversibility(a.domain).auto_revertible),
+        "reversibility_note": _reversibility(a.domain).explanation,
     }
+
+
+def _reversibility(domain: str):
+    from app.reversible import reversibility_of
+
+    return reversibility_of(domain)
 
 
 @router.get("/api/dashboard", dependencies=[Depends(require_admin)])
@@ -1048,6 +1061,28 @@ async def agent_action_decide(action_id: int, decision: str, identity=Depends(re
     """Решение владельца по предложению агента (не по тому, что агент уже
     применил сам -- те статусы менять поздно, действие уже сделано)."""
     from app.models import AgentAction, AgentActionStatus, utcnow
+
+    if decision == "revert":
+        # Откат применённого действия (задача A1). Отдельная ветка: тут
+        # реально дёргается write-клиент, поэтому и проверки другие --
+        # откатывать можно только применённое, а не предложенное.
+        from app import reversible
+        from app.config import get_settings
+
+        with get_session() as session:
+            action = session.get(AgentAction, action_id)
+            if action is None:
+                raise HTTPException(status_code=404, detail="Действие не найдено")
+            _require_own_project_id(session, action.project_id, identity)
+            project = session.get(Project, action.project_id)
+            result = await reversible.revert_action(
+                session, action, get_settings(), project,
+            )
+            if result.ok:
+                _record_action(session, identity, "agent_action_reverted",
+                               f"Откатил: {action.reasoning[:120]}",
+                               project_id=action.project_id)
+        return {"ok": result.ok, "message": result.message}
 
     if decision not in ("apply", "reject"):
         raise HTTPException(status_code=404, detail="Неизвестное действие")

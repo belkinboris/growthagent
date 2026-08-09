@@ -1679,13 +1679,21 @@ function renderAgentActions(actions) {
         <button class="btn sm" onclick="decideAgentAction(${a.id},'apply')">Сделаю сам</button>
         <button class="btn sm" onclick="decideAgentAction(${a.id},'reject')">Не буду</button>
       </div>` : ''}
+      ${a.revertible ? `<div class="row" style="margin-top:9px">
+        <button class="btn sm" onclick="decideAgentAction(${a.id},'revert')">Вернуть как было</button>
+        <span class="muted" style="font-size:12px">${esc(a.reversibility_note || '')}</span>
+      </div>` : ''}
     </div>`;
   }).join('');
 }
 window.decideAgentAction = async (id, decision) => {
   try {
-    await api(`/api/agent-actions/${id}/${decision}`, {method: 'POST'});
-    toast(decision === 'apply' ? 'Отмечено как сделанное' : 'Предложение отклонено', 'ok');
+    const r = await api(`/api/agent-actions/${id}/${decision}`, {method: 'POST'});
+    // Откат может честно не получиться (не настроен токен, Директ отказал).
+    // Показать это надо как ошибку, а не бодрым «готово»: иначе владелец
+    // будет уверен, что настройки вернулись, а они остались.
+    if (decision === 'revert') toast(r.message || 'Готово', r.ok ? 'ok' : 'error');
+    else toast(decision === 'apply' ? 'Отмечено как сделанное' : 'Предложение отклонено', 'ok');
     loadDashboardProblems();
   } catch (e) { if (e.message !== 'unauthorized') toast(e.message, 'error'); }
 };

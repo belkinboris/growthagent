@@ -148,3 +148,27 @@ def _extract_error(resp: httpx.Response) -> str:
         return f"Ошибка Метрики: HTTP {resp.status_code}"
     msg = data.get("message") or data.get("errors")
     return f"Ошибка Метрики: {msg}" if msg else f"Ошибка Метрики: HTTP {resp.status_code}"
+
+
+async def delete_goal(project, goal_id: int, timeout_seconds: float = 15.0) -> None:
+    """
+    Удаляет цель счётчика (задача A1: обратимость).
+
+    Нужно, чтобы созданную агентом цель можно было убрать, если проверка
+    не подтвердила пользу. Цели, созданные не нами, этим путём не
+    удаляются: вызывающий код (app/reversible.py) отменяет только те
+    действия, которые сам же и записал в журнал.
+    """
+    if not is_configured(project):
+        raise MetrikaWriteError(
+            "Запись в Метрику не настроена: нужен metrika_management_token "
+            "с правом «Управление счётчиками» и metrika_counter_id у проекта."
+        )
+    url = f"{MANAGEMENT_API_URL}/counter/{_counter_id(project)}/goal/{int(goal_id)}"
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        try:
+            resp = await client.delete(url, headers=_headers(project))
+        except httpx.HTTPError as exc:
+            raise MetrikaWriteError(f"Не удалось обратиться к Метрике: {exc}") from exc
+    if resp.status_code >= 400:
+        raise MetrikaWriteError(_extract_error(resp))

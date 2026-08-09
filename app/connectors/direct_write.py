@@ -231,3 +231,42 @@ async def add_negative_keywords(settings, ad_group_id: str, phrases: list[str]) 
     out.applied.extend(to_add)
     out.warnings.extend(api_out.warnings)
     return out
+
+
+async def remove_negative_keywords(settings, ad_group_id: str, phrases: list[str]) -> DirectWriteResult:
+    """
+    Убирает из группы ровно перечисленные минус-фразы, не трогая остальные
+    (задача A1: обратимость).
+
+    Почему нельзя просто записать сохранённый прежний список целиком:
+    между нашей правкой и откатом владелец мог добавить свои фразы руками.
+    Затерев список «как было», мы стёрли бы его решения — а чужие решения
+    агент отменять не вправе. Поэтому вычитаем только то, что добавили мы.
+    """
+    targets = {p.strip().lower() for p in phrases if p and p.strip()}
+    out = DirectWriteResult()
+    if not targets:
+        out.warnings.append("Нечего убирать: список пуст")
+        return out
+
+    existing = await get_ad_group_negative_keywords(settings, ad_group_id)
+    kept = [e for e in existing if e.strip().lower() not in targets]
+    removed = [e for e in existing if e.strip().lower() in targets]
+
+    if not removed:
+        out.warnings.append("Этих фраз в группе уже нет — откатывать нечего")
+        return out
+
+    result = await _call(settings, "adgroups", "update", {
+        "AdGroups": [{"Id": int(ad_group_id), "NegativeKeywords": {"Items": kept}}],
+    })
+    api_out = _collect_object_errors(
+        result.get("UpdateResults") or [],
+        lambda i, item: f"группа {ad_group_id}",
+    )
+    if api_out.skipped:
+        out.skipped.extend(api_out.skipped)
+        return out
+    out.applied.extend(removed)
+    out.warnings.extend(api_out.warnings)
+    return out

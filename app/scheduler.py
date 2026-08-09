@@ -2213,6 +2213,38 @@ async def send_daily_board(
 # Growth Loop: тик после каждого обновления payment_path + уведомления
 # ---------------------------------------------------------------------------
 
+async def _revert_after_lost_experiment(project, settings, recommendation_id) -> list[str]:
+    """
+    Откатывает изменения, сделанные агентом ради проигравшей проверки
+    (задача A2). Возвращает короткие строки для вердикта владельцу.
+
+    Ошибка отката не должна ронять цикл сбора: не смогли вернуть --
+    честно пишем об этом в журнал и в вердикт, а не молчим. Молчаливый
+    провал отката хуже отсутствия отката: владелец будет уверен, что
+    настройки вернулись, а они остались.
+    """
+    from app import reversible
+
+    if recommendation_id is None:
+        return []
+    notes: list[str] = []
+    with get_session() as session:
+        db_project = session.get(Project, project.id)
+        if db_project is None:
+            return []
+        actions = reversible.revertible_actions(session, db_project.id, recommendation_id)
+        for action in actions:
+            try:
+                result = await reversible.revert_action(session, action, settings, db_project)
+            except Exception as exc:  # noqa: BLE001 -- откат не валит сбор данных
+                logger.exception("Автооткат не удался (action=%s)", action.id)
+                notes.append(f"не смог вернуть «{action.domain}»: {exc}")
+                continue
+            notes.append(result.message if result.ok
+                         else f"не смог вернуть «{action.domain}»: {result.message}")
+    return notes
+
+
 async def growth_loop_tick_and_notify(
     project: "Project",
     settings,
@@ -2261,6 +2293,8 @@ async def growth_loop_tick_and_notify(
                     "title": finished.title,
                     "verdict": finished.verdict,
                     "summary": finished.result_summary,
+                    "status": finished.status.value,
+                    "recommendation_id": finished.recommendation_id,
                 }
             rec_payload = None
             if new_rec is not None:
@@ -2273,6 +2307,18 @@ async def growth_loop_tick_and_notify(
             # Адресат -- у проекта свой (B8): вердикт по проекту клиента
             # не должен уходить владельцу платформы.
             chat_ids, no_recipients_reason = project_chat_ids(session, db_project, settings)
+
+        # Замыкаем цикл (задача A2). До этого вердикт ПИСАЛ словами
+        # «откатить изменение» -- и на этом всё заканчивалось: правки,
+        # сделанные агентом ради проверки, оставались жить, хотя проверка
+        # их не подтвердила. Теперь проигравшая проверка откатывает ровно
+        # свои изменения; чужие и ручные не трогаются (см. reversible.py).
+        if finished_payload is not None and finished_payload["status"] == "lost":
+            reverted_notes = await _revert_after_lost_experiment(
+                project, settings, finished_payload["recommendation_id"],
+            )
+            if reverted_notes:
+                finished_payload["summary"] += "\n\nОткат: " + "; ".join(reverted_notes)
 
         if not chat_ids and (finished_payload is not None or rec_payload is not None):
             logger.info("Growth Loop: уведомление не отправлено (project=%s): %s",
